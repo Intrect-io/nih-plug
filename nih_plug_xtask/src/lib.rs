@@ -53,6 +53,10 @@ struct AuPackageConfig {
     subtype: String,
     /// Four-character manufacturer code.
     manufacturer: String,
+    /// Human-readable manufacturer name shown in host plugin browsers (e.g. "Intrect").
+    /// Falls back to the four-character `manufacturer` code if not set.
+    #[serde(default)]
+    manufacturer_name: Option<String>,
     /// Optional human-readable description shown by some hosts.
     #[serde(default)]
     description: Option<String>,
@@ -883,7 +887,11 @@ fn create_au_bundle_metadata(
         .description
         .clone()
         .unwrap_or_else(|| format!("{display_name} (NIH-plug)"));
-    let component_name = format!("{}: {display_name}", config.manufacturer);
+    let mfr_display = config
+        .manufacturer_name
+        .as_deref()
+        .unwrap_or(&config.manufacturer);
+    let component_name = format!("{mfr_display}: {display_name}");
 
     fs::create_dir_all(bundle_home.join("Contents")).context("Could not create Contents/")?;
     fs::write(
