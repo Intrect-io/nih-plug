@@ -26,8 +26,11 @@
 #include <stdatomic.h>
 
 /* Provided by wrapper.rs via extern "C" */
-extern void nih_plug_au_cocoaui_spawn(void *parent_ns_view, void *spawn_raw);
-extern void nih_plug_au_cocoaui_close_view(void *container_ns_view);
+/* Returns the handle_slot pointer so the container can store it for dealloc. */
+extern void *nih_plug_au_cocoaui_spawn(void *parent_ns_view, void *pending_raw);
+extern void  nih_plug_au_cocoaui_close_view(void *container_ns_view, void *handle_slot);
+
+@class NihPlugAuContainerView;
 
 /*
  * Global pending spawn pointer — set by wrapper.rs immediately before
@@ -58,7 +61,7 @@ _Atomic(uint32_t) nih_plug_au_editor_height = 0;
  * The strong reference is cleared when the Rust side calls
  * nih_plug_au_release_container (from close_view).
  */
-static NSView *g_containerView = nil;
+static NihPlugAuContainerView *g_containerView = nil;
 static NSObject *g_containerLock = nil;
 
 __attribute__((constructor))
@@ -69,13 +72,17 @@ static void _init_container_lock(void) {
 /* ── Container NSView — overrides dealloc to drop the Rust editor handle ── */
 
 @interface NihPlugAuContainerView : NSView
+/// Opaque pointer to the Wrapper's GuiHandleSlot, set by uiViewForAudioUnit:.
+@property (nonatomic, assign) void *handleSlot;
 @end
 
 @implementation NihPlugAuContainerView
 
 - (void)dealloc {
+#ifdef DEBUG
     NSLog(@"[nih-plug AU] NihPlugAuContainerView dealloc: %p", (__bridge void *)self);
-    nih_plug_au_cocoaui_close_view((__bridge void *)self);
+#endif
+    nih_plug_au_cocoaui_close_view((__bridge void *)self, self.handleSlot);
 }
 
 @end
@@ -88,18 +95,18 @@ static void _init_container_lock(void) {
 @implementation NIH_PLUG_AU_VIEW_CLASS
 
 - (unsigned)interfaceVersion {
-    NSLog(@"[nih-plug AU] interfaceVersion called");
     return 0;
 }
 
 - (NSView *)uiViewForAudioUnit:(AudioUnit)au withSize:(NSSize)preferredSize {
+#ifdef DEBUG
     NSLog(@"[nih-plug AU] uiViewForAudioUnit:withSize: au=%p size=%.0fx%.0f",
           (void *)au, preferredSize.width, preferredSize.height);
+#endif
 
     /* Atomically take the pending spawn closure — prevents double-open. */
     void *spawn_raw = atomic_exchange(&nih_plug_au_pending_spawn_raw, (void *)NULL);
     if (!spawn_raw) {
-        NSLog(@"[nih-plug AU] uiViewForAudioUnit: no pending spawn (already consumed or none set)");
         return nil;
     }
 
@@ -111,13 +118,10 @@ static void _init_container_lock(void) {
               : (preferredSize.width  > 0 ? preferredSize.width  : 800);
     CGFloat h = eh > 0 ? (CGFloat)eh
               : (preferredSize.height > 0 ? preferredSize.height : 600);
-    NSLog(@"[nih-plug AU] uiViewForAudioUnit: using size=%.0fx%.0f (plugin=%ux%u preferred=%.0fx%.0f)",
-          w, h, ew, eh, preferredSize.width, preferredSize.height);
     NSRect frame = NSMakeRect(0, 0, w, h);
 
     NihPlugAuContainerView *container = [[NihPlugAuContainerView alloc] initWithFrame:frame];
     if (!container) {
-        NSLog(@"[nih-plug AU] uiViewForAudioUnit: container alloc failed — leaking spawn closure");
         return nil;
     }
 
@@ -130,17 +134,24 @@ static void _init_container_lock(void) {
      */
     @synchronized(g_containerLock) {
         if (g_containerView) {
-            /* Stale container from a previous open that was not cleanly closed. */
+#ifdef DEBUG
             NSLog(@"[nih-plug AU] uiViewForAudioUnit: replacing stale container=%p",
                   (__bridge void *)g_containerView);
-            nih_plug_au_cocoaui_close_view((__bridge void *)g_containerView);
+#endif
+            nih_plug_au_cocoaui_close_view((__bridge void *)g_containerView,
+                                           g_containerView.handleSlot);
         }
         g_containerView = container;
     }
 
+#ifdef DEBUG
     NSLog(@"[nih-plug AU] uiViewForAudioUnit: container=%p, spawning editor", (__bridge void *)container);
-    nih_plug_au_cocoaui_spawn((__bridge void *)container, spawn_raw);
+#endif
+    void *handle_slot = nih_plug_au_cocoaui_spawn((__bridge void *)container, spawn_raw);
+    container.handleSlot = handle_slot;
+#ifdef DEBUG
     NSLog(@"[nih-plug AU] uiViewForAudioUnit: done, returning container");
+#endif
     return container;
 }
 
@@ -152,7 +163,7 @@ static void _init_container_lock(void) {
  */
 void nih_plug_au_release_container(void *container_ns_view) {
     @synchronized(g_containerLock) {
-        if (g_containerView == (__bridge NihPlugAuContainerView *)container_ns_view) {
+        if ((__bridge void *)g_containerView == container_ns_view) {
             g_containerView = nil;
         }
     }
