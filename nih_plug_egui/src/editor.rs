@@ -111,8 +111,23 @@ where
                 if let Some(new_size) = egui_state.requested_size.swap(None) {
                     // Ask the plugin host to resize to self.size()
                     if context.request_resize() {
-                        // Resize the content of egui window
-                        queue.resize(PhySize::new(new_size.0, new_size.1));
+                        // new_size 는 논리 픽셀. baseview window.resize() 와
+                        // egui screen_rect 둘 다 갱신해야 한다.
+                        //
+                        // macOS standalone 에서는 NSWindow::setContentSize_ 로 OS 창은
+                        // 커지지만 WindowEvent::Resized 가 backing-property 변경 때만
+                        // 발생해 egui 의 physical_size/screen_rect 가 갱신되지 않는다
+                        // (커진 창의 좌상단 옛 크기 영역에만 GUI, 나머지 빈 배경).
+                        //
+                        // 그래서 queue.resize(PhySize) 로 egui 의 physical_size 를
+                        // 직접 갱신한다. physical_size 는 물리 픽셀이므로 DPI 배율을
+                        // 곱한다. ViewportCommand::InnerSize(논리) 는 baseview 의
+                        // window.resize() 를 호출해 OS 창 자체를 리사이즈한다.
+                        let ppp = egui_ctx.pixels_per_point();
+                        queue.resize(PhySize::new(
+                            (new_size.0 as f32 * ppp).round() as u32,
+                            (new_size.1 as f32 * ppp).round() as u32,
+                        ));
                         egui_ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
                             new_size.0 as f32,
                             new_size.1 as f32,
