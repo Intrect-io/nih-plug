@@ -947,7 +947,7 @@ fn create_au_bundle_metadata(
         <key>version</key>
         <integer>{version_int}</integer>
         <key>sandboxSafe</key>
-        <true/>
+        <false/>
       </dict>
     </array>
   </dict>
