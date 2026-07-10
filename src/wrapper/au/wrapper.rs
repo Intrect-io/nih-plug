@@ -1510,6 +1510,38 @@ impl<P: AuPlugin> Wrapper<P> {
             }
         }
 
+        // ── 2b) Null-mData outputs (INT-2566). Some hosts (notably Logic Pro)
+        // hand us `io_data` buffers with `mData == NULL`, expecting the AU to
+        // supply the backing storage itself. Point each such buffer at our
+        // persistent per-channel input scratch — which already holds the
+        // pulled input — so `process()` reads it and overwrites in place, and
+        // the host reads the output back through `mData`. Without this the slot
+        // wired below stays empty (`&mut []`) and the host receives silence.
+        // Non-null (host-allocated) buffers are left untouched.
+        for i in 0..n_buffers.min(rs.input_scratch.len()) {
+            let buf = unsafe { &mut *buffers_ptr.add(i) };
+            if buf.mData.is_null() {
+                let scratch = &mut rs.input_scratch[i];
+                if scratch.len() < n_frames {
+                    // Host asked for more frames than `provision()` sized the
+                    // scratch for (maxFramesPerSlice violation). Leave the
+                    // buffer null — the slot below degrades to `&mut []`
+                    // (silence) instead of an out-of-bounds host read.
+                    continue;
+                }
+                if !pulled_from_callback {
+                    // No upstream input was pulled → present silence rather
+                    // than stale scratch left over from a previous render.
+                    scratch[..n_frames].fill(0.0);
+                }
+                buf.mData = scratch.as_mut_ptr() as *mut c_void;
+                buf.mDataByteSize = (n_frames * mem::size_of::<f32>()) as au::UInt32;
+                if buf.mNumberChannels == 0 {
+                    buf.mNumberChannels = 1;
+                }
+            }
+        }
+
         // Rewrite the persistent Buffer's slot vector. The slot count was
         // pre-grown in `provision()`, so this is purely in-place writes.
         // SAFETY: each slice points to host-owned memory that remains valid
