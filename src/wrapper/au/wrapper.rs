@@ -586,6 +586,8 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn close(self_ptr: *mut c_void) -> au::OSStatus {
         // Drop editor handle before the wrapper is destroyed.
         let this = unsafe { Self::from_ptr(self_ptr) };
+        let instance = this.instance.swap(0, Ordering::AcqRel) as usize as *mut c_void;
+        cocoaui::close_audio_unit_view(instance);
         this.editor_handle.clear();
         unsafe {
             let _ = Box::from_raw(self_ptr as *mut Self);
@@ -1943,12 +1945,13 @@ pub use Wrapper as AuWrapper;
 // build.rs + cc crate) which declares `@interface ... : NSObject <AUCocoaUIBase>`.
 // This generates proper protocol conformance metadata at compile time.
 //
-// The shim calls back into Rust via two C-ABI functions:
-//   nih_plug_au_cocoaui_take_spawn(key) -> *mut ()   — takes the spawn closure
+// The shim calls back into Rust via C-ABI functions that look up a reusable
+// editor-spawn template by the host's AudioUnit handle.
 mod cocoaui {
+    use std::collections::HashMap;
     use std::ffi::c_void;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::atomic::Ordering as AtomicOrdering;
 
     use au_sys as au;
 
@@ -1957,7 +1960,7 @@ mod cocoaui {
 
     use super::{GuiHandleSlot, Wrapper};
 
-    type SpawnFn = Box<dyn FnOnce(ParentWindowHandle) -> Box<dyn std::any::Any + Send> + Send>;
+    type SpawnFn = Box<dyn Fn(ParentWindowHandle) -> Box<dyn std::any::Any + Send> + Send + Sync>;
 
     // ── Debug logging (debug builds only) ─────────────────────────────────────
 
@@ -1980,61 +1983,100 @@ mod cocoaui {
     }
 
     // ── Globals defined in cocoaui.m ───────────────────────────────────────────
-    //
-    // Single definition in C; Rust references via extern to avoid duplicate
-    // symbol errors when -force_load links both translation units.
     extern "C" {
-        static nih_plug_au_pending_spawn_raw: AtomicPtr<c_void>;
-        static nih_plug_au_editor_width:  AtomicU32;
-        static nih_plug_au_editor_height: AtomicU32;
         fn nih_plug_au_release_container(container_ns_view: *mut c_void);
+        fn nih_plug_au_cocoaui_close_audio_unit_view(audio_unit: *mut c_void);
     }
 
-    // ── Pending-spawn packet ───────────────────────────────────────────────────
+    // ── Per-AU editor spawn templates ─────────────────────────────────────────
     //
-    // Stored atomically in nih_plug_au_pending_spawn_raw.  Bundles the spawn
-    // closure with a pointer to the Wrapper's GuiHandle and a type-erased
-    // close function so the C-ABI callbacks can update the Wrapper without
-    // being generic over P.
-    struct PendingSpawn {
+    // An AU host can cache the `AUCocoaUIBase` factory obtained during the
+    // first open and invoke it again without asking `kAudioUnitProperty_CocoaUI`
+    // a second time. Keep one reusable template per live AU instance rather
+    // than consuming a one-shot closure on the first factory call.
+    struct SpawnTemplate {
         /// Pointer to `Wrapper<P>::editor_handle` (a `Mutex<Option<…>>`).
         /// Type-erased so the C-ABI callbacks don't need to be generic.
         handle_slot: *const GuiHandleSlot,
+        editor_width: u32,
+        editor_height: u32,
         spawn_fn: SpawnFn,
     }
-    unsafe impl Send for PendingSpawn {}
+    // `handle_slot` points into a live Wrapper. The template is registered by
+    // that Wrapper and removed in Wrapper::close before its allocation dies.
+    unsafe impl Send for SpawnTemplate {}
+    unsafe impl Sync for SpawnTemplate {}
 
-    /// Atomically take the pending spawn packet (returns None if already consumed).
-    unsafe fn take_pending_spawn() -> Option<Box<PendingSpawn>> {
-        let ptr = unsafe {
-            nih_plug_au_pending_spawn_raw.swap(std::ptr::null_mut(), AtomicOrdering::AcqRel)
+    fn spawn_templates() -> &'static Mutex<HashMap<u64, Arc<SpawnTemplate>>> {
+        static SPAWN_TEMPLATES: OnceLock<Mutex<HashMap<u64, Arc<SpawnTemplate>>>> = OnceLock::new();
+        SPAWN_TEMPLATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn nih_plug_au_cocoaui_editor_size_for_audio_unit(
+        audio_unit: *mut c_void,
+        out_width: *mut u32,
+        out_height: *mut u32,
+    ) -> bool {
+        let key = audio_unit as usize as u64;
+        let template = spawn_templates()
+            .lock()
+            .expect("AU CocoaUI pending-spawn mutex poisoned")
+            .get(&key)
+            .cloned();
+        let Some(template) = template else {
+            return false;
         };
-        if ptr.is_null() { None } else { Some(unsafe { Box::from_raw(ptr as *mut PendingSpawn) }) }
+
+        if !out_width.is_null() {
+            unsafe { *out_width = template.editor_width };
+        }
+        if !out_height.is_null() {
+            unsafe { *out_height = template.editor_height };
+        }
+        true
+    }
+
+    /// Spawn a new editor from the reusable template for this AudioUnit.
+    #[no_mangle]
+    pub unsafe extern "C" fn nih_plug_au_cocoaui_spawn_for_audio_unit(
+        parent_ns_view: *mut c_void,
+        audio_unit: *mut c_void,
+    ) -> *mut c_void {
+        if parent_ns_view.is_null() || audio_unit.is_null() {
+            return std::ptr::null_mut();
+        }
+        let key = audio_unit as usize as u64;
+        let template = spawn_templates()
+            .lock()
+            .expect("AU CocoaUI pending-spawn mutex poisoned")
+            .get(&key)
+            .cloned();
+        let Some(template) = template else {
+            return std::ptr::null_mut();
+        };
+
+        let parent = ParentWindowHandle::AppKitNsView(parent_ns_view);
+        let handle = (template.spawn_fn)(parent);
+        let handle_slot = template.handle_slot;
+        // SAFETY: see SpawnTemplate's Send/Sync contract above.
+        unsafe { (*handle_slot).set(handle) };
+        handle_slot as *mut c_void
+    }
+
+    pub fn close_audio_unit_view(audio_unit: *mut c_void) {
+        if audio_unit.is_null() {
+            return;
+        }
+        let key = audio_unit as usize as u64;
+        spawn_templates()
+            .lock()
+            .expect("AU CocoaUI pending-spawn mutex poisoned")
+            .remove(&key);
+        unsafe { nih_plug_au_cocoaui_close_audio_unit_view(audio_unit) };
     }
 
     // ── C-ABI callbacks called by the ObjC shim ────────────────────────────────
-
-    /// Called by the ObjC shim after it creates the container NSView.
-    /// Returns the `handle_slot` pointer so the container can store it for dealloc.
-    #[no_mangle]
-    pub unsafe extern "C" fn nih_plug_au_cocoaui_spawn(
-        parent_ns_view: *mut c_void,
-        pending_raw: *mut c_void,
-    ) -> *mut c_void {
-        au_log!("[nih-plug AU] cocoaui_spawn: view={:?}", parent_ns_view);
-        if pending_raw.is_null() || parent_ns_view.is_null() {
-            return std::ptr::null_mut();
-        }
-        let pending = unsafe { *Box::from_raw(pending_raw as *mut PendingSpawn) };
-        let handle_slot = pending.handle_slot;
-        let parent = ParentWindowHandle::AppKitNsView(parent_ns_view);
-        let handle = (pending.spawn_fn)(parent);
-        // SAFETY: handle_slot points into a live Wrapper<P>; the Wrapper
-        // outlives the GUI (host destroys component after closing GUI).
-        unsafe { (*handle_slot).set(handle) };
-        au_log!("[nih-plug AU] cocoaui_spawn: editor handle stored in wrapper");
-        handle_slot as *mut c_void
-    }
 
     /// Called from NihPlugAuContainerView's -dealloc when the host closes the GUI.
     #[no_mangle]
@@ -2059,42 +2101,49 @@ mod cocoaui {
         let editor = this.editor.as_ref()?;
         let gui_ctx_inner = this.gui_context_inner.as_ref()?;
 
-        // Store editor size for the ObjC shim (Ableton passes preferredSize={0,0}).
+        // Store editor size in the pending packet (Ableton passes preferredSize={0,0}).
         let (ew, eh) = editor.lock().unwrap().size();
-        unsafe {
-            nih_plug_au_editor_width .store(ew, AtomicOrdering::Release);
-            nih_plug_au_editor_height.store(eh, AtomicOrdering::Release);
-        }
         au_log!("[nih-plug AU] cocoaui_view_info: editor_size={}x{}", ew, eh);
+
+        let instance = this.instance.load(AtomicOrdering::Acquire);
+        if instance == 0 {
+            // A factory call without `Open` cannot be associated with an AU
+            // instance safely. Returning no CocoaUI lets the host retry after
+            // normal component setup instead of routing the editor to another
+            // instance's pending request.
+            au_log!("[nih-plug AU] cocoaui_view_info: no opened AudioUnit instance");
+            return None;
+        }
 
         let editor_clone = editor.clone();
         let inner_clone = gui_ctx_inner.clone();
-        let pending = Box::new(PendingSpawn {
+        let template = Arc::new(SpawnTemplate {
             handle_slot: &this.editor_handle as *const GuiHandleSlot,
+            editor_width: ew,
+            editor_height: eh,
             spawn_fn: Box::new(move |parent_handle| {
                 let gui_ctx: Arc<dyn crate::context::gui::GuiContext> =
                     Arc::new(crate::wrapper::au::context::AuGuiContext::<P> {
-                        inner: inner_clone,
+                        inner: inner_clone.clone(),
                         _marker: std::marker::PhantomData,
                     });
                 editor_clone.lock().unwrap().spawn(parent_handle, gui_ctx)
             }),
         });
-        let pending_raw = Box::into_raw(pending) as *mut c_void;
-
-        // Swap in the new packet, dropping any previously unconsumed one.
-        let old = unsafe {
-            nih_plug_au_pending_spawn_raw.swap(pending_raw, AtomicOrdering::AcqRel)
-        };
-        if !old.is_null() {
-            drop(unsafe { Box::from_raw(old as *mut PendingSpawn) });
-        }
-        au_log!("[nih-plug AU] cocoaui_view_info: pending_raw={:?} stored", pending_raw);
+        let key = instance as usize as u64;
+        spawn_templates()
+            .lock()
+            .expect("AU CocoaUI pending-spawn mutex poisoned")
+            .insert(key, template);
+        au_log!("[nih-plug AU] cocoaui_view_info: spawn template stored for AU={:#x}", key);
 
         let bundle_url_ref = match unsafe { bundle_cf_url() } {
             Ok(r) => r,
             Err(()) => {
-                unsafe { take_pending_spawn() };
+                spawn_templates()
+                    .lock()
+                    .expect("AU CocoaUI pending-spawn mutex poisoned")
+                    .remove(&key);
                 au_log!("[nih-plug AU] cocoaui_view_info: bundle_cf_url failed");
                 return None;
             }
@@ -2104,8 +2153,11 @@ mod cocoaui {
         if class_name_ref.is_null() {
             unsafe {
                 au::cf_release(bundle_url_ref as *mut c_void);
-                take_pending_spawn();
             }
+            spawn_templates()
+                .lock()
+                .expect("AU CocoaUI pending-spawn mutex poisoned")
+                .remove(&key);
             return None;
         }
 
