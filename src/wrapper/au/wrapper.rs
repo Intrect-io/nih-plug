@@ -348,6 +348,7 @@ unsafe impl Sync for Listener {}
 const NOTIFY_LATENCY: u32 = 1 << 0;
 const NOTIFY_STREAM_FORMAT: u32 = 1 << 1;
 const NOTIFY_BYPASS_EFFECT: u32 = 1 << 2;
+const NOTIFY_MAX_FRAMES_PER_SLICE: u32 = 1 << 3;
 
 /// `Send` + `Sync` justification:
 ///
@@ -546,6 +547,12 @@ impl<P: AuPlugin> Wrapper<P> {
         }
         if pending & NOTIFY_BYPASS_EFFECT != 0 {
             fire(au::kAudioUnitProperty_BypassEffect, au::kAudioUnitScope_Global);
+        }
+        if pending & NOTIFY_MAX_FRAMES_PER_SLICE != 0 {
+            fire(
+                au::kAudioUnitProperty_MaximumFramesPerSlice,
+                au::kAudioUnitScope_Global,
+            );
         }
     }
 
@@ -1226,7 +1233,10 @@ impl<P: AuPlugin> Wrapper<P> {
                 if v == 0 {
                     return au::kAudioUnitErr_InvalidPropertyValue;
                 }
-                this.max_frames_per_slice.store(v, Ordering::Release);
+                let prev = this.max_frames_per_slice.swap(v, Ordering::AcqRel);
+                if prev != v {
+                    this.mark_pending(NOTIFY_MAX_FRAMES_PER_SLICE);
+                }
                 au::noErr
             }
             au::kAudioUnitProperty_BypassEffect => {
