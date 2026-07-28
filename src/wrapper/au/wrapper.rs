@@ -917,6 +917,15 @@ impl<P: AuPlugin> Wrapper<P> {
                     au::kAudioUnitErr_InvalidProperty
                 }
             }
+            // We don't expose AU-native factory presets (plugins manage their own
+            // preset browser), so this is read-only: report a "custom, not a
+            // factory preset" state rather than leaving it unimplemented. Hosts
+            // that support a custom Cocoa UI (`kAudioUnitProperty_CocoaUI` above)
+            // query this during validation to confirm the UI can reflect preset
+            // state; leaving it unanswered fails that check (AUD-731).
+            au::kAudioUnitProperty_PresentPreset if scope == au::kAudioUnitScope_Global => {
+                respond(std::mem::size_of::<au::AUPreset>() as u32, false)
+            }
             _ => au::kAudioUnitErr_InvalidProperty,
         }
     }
@@ -1139,6 +1148,28 @@ impl<P: AuPlugin> Wrapper<P> {
                     }
                     None => au::kAudioUnitErr_InvalidProperty,
                 }
+            }
+            au::kAudioUnitProperty_PresentPreset if scope == au::kAudioUnitScope_Global => {
+                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<au::AUPreset>() {
+                    return au::kAudioUnitErr_InvalidPropertyValue;
+                }
+                // -1 is the standard AU convention for "current state doesn't
+                // correspond to a stored factory preset" (we don't implement
+                // kAudioUnitProperty_FactoryPresets). The name is caller-owned
+                // per AU's Create Rule, same as the CocoaUI/ClassInfo replies
+                // above.
+                let preset_name = unsafe { au::cf_string_create("") };
+                if preset_name.is_null() {
+                    return au::kAudioUnitErr_InvalidProperty;
+                }
+                unsafe {
+                    *(out_data as *mut au::AUPreset) = au::AUPreset {
+                        presetNumber: -1,
+                        presetName: preset_name,
+                    };
+                    *io_data_size = std::mem::size_of::<au::AUPreset>() as u32;
+                }
+                au::noErr
             }
             _ => au::kAudioUnitErr_InvalidProperty,
         }
