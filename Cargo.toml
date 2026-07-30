@@ -164,5 +164,12 @@ strip = "none"
 # an AU host calls uiViewForAudioUnit:withSize: on a parent view that is
 # already attached to a window: addSubview: fires viewWillMoveToWindow which
 # calls makeFirstResponder before WindowState has been stored in the ivar.
+#
+# Pinned by commit rather than to the vendor/baseview gitlink: that gitlink had
+# no .gitmodules entry and its only remote was a local cargo cache directory,
+# so cargo could not fetch this repo as a git dependency at all
+# ("no URL configured for submodule 'vendor/baseview'"). The fork now carries
+# the same patch in a form any clone can resolve. AUD-660's 60 Hz frame-clock
+# retune rides on the same commit.
 [patch."https://github.com/RustAudio/baseview.git"]
-baseview = { path = "vendor/baseview" }
+baseview = { git = "https://github.com/Intrect-io/baseview.git", rev = "11cb5d195309a3d76bde73c31da984445f175d19" }
