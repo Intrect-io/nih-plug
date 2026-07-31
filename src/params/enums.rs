@@ -67,6 +67,10 @@ pub trait Enum {
     fn from_index(index: usize) -> Self;
 }
 
+/// Used in place of an empty [`Enum::variants()`] result. Every lookup in [`EnumParamInner`] indexes
+/// into the variants, so there needs to be at least one of them.
+const FALLBACK_VARIANTS: &[&str] = &["<invalid>"];
+
 /// An [`IntParam`]-backed categorical parameter that allows convenient conversion to and from a
 /// simple enum. This enum must derive the re-exported [Enum] trait. Check the trait's documentation
 /// for more information on how this works.
@@ -102,11 +106,7 @@ impl<T: Enum + PartialEq> Display for EnumParam<T> {
 
 impl Display for EnumParamInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.variants[self.inner.modulated_plain_value() as usize]
-        )
+        write!(f, "{}", self.variant_name(self.inner.modulated_plain_value()))
     }
 }
 
@@ -254,7 +254,7 @@ impl Param for EnumParamInner {
     }
 
     fn step_count(&self) -> Option<usize> {
-        Some(self.len() - 1)
+        Some(self.len().saturating_sub(1))
     }
 
     fn previous_step(&self, from: Self::Plain, finer: bool) -> Self::Plain {
@@ -266,8 +266,7 @@ impl Param for EnumParamInner {
     }
 
     fn normalized_value_to_string(&self, normalized: f32, _include_unit: bool) -> String {
-        let index = self.preview_plain(normalized);
-        self.variants[index as usize].to_string()
+        self.variant_name(self.preview_plain(normalized)).to_string()
     }
 
     fn string_to_normalized_value(&self, string: &str) -> Option<f32> {
@@ -337,14 +336,48 @@ impl<T: Enum + PartialEq + 'static> EnumParam<T> {
     /// Build a new [Self]. Use the other associated functions to modify the behavior of the
     /// parameter.
     pub fn new(name: impl Into<String>, default: T) -> Self {
-        let variants = T::variants();
-        let ids = T::ids();
+        // `Enum` is a public trait, so a manual implementation can return metadata that doesn't hold
+        // up. Everything below indexes into the variants, and the backing `IntRange` would span
+        // `0..-1` for an empty slice.
+        let mut variants = T::variants();
+        let mut ids = T::ids();
+
+        nih_debug_assert!(
+            !variants.is_empty(),
+            "`Enum::variants()` needs to return at least one variant"
+        );
+        if variants.is_empty() {
+            variants = FALLBACK_VARIANTS;
+            ids = None;
+        }
+
+        let ids_match_variants = !ids.is_some_and(|ids| ids.len() != variants.len());
+        nih_debug_assert!(
+            ids_match_variants,
+            "`Enum::ids()` needs to return exactly one ID per variant"
+        );
+        if !ids_match_variants {
+            // Indexing `ids` with a variant index would panic, so the IDs cannot be used at all.
+            // State then falls back to variant indices, which does break existing presets for a
+            // plugin that previously shipped working IDs — but there is no correct mapping left to
+            // recover, and the debug assertion above flags the cause.
+            ids = None;
+        }
+
+        let default_index = T::to_index(default);
+        nih_debug_assert!(
+            default_index < variants.len(),
+            "`Enum::to_index()` returned an out of range index ({}) for {} variant(s)",
+            default_index,
+            variants.len()
+        );
+        let default_index = default_index.min(variants.len() - 1);
 
         Self {
             inner: EnumParamInner {
                 inner: IntParam::new(
                     name,
-                    T::to_index(default) as i32,
+                    default_index as i32,
                     IntRange::Linear {
                         min: 0,
                         max: variants.len() as i32 - 1,
@@ -422,14 +455,27 @@ impl EnumParamInner {
         self.variants.len()
     }
 
+    /// The display name for a variant index. `EnumParam::new()` makes sure there is at least one
+    /// variant and the backing range keeps values within bounds, so this only guards against a
+    /// panic if either of those invariants is somehow broken.
+    fn variant_name(&self, index: i32) -> &'static str {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.variants.get(index))
+            .copied()
+            .unwrap_or(FALLBACK_VARIANTS[0])
+    }
+
     /// Get the stable ID for the parameter's current value according to
     /// [`unmodulated_plain_value()`][Param::unmodulated_plain_value()]. Returns `None` if this enum
     /// parameter doesn't have any stable IDs.
     pub fn unmodulated_plain_id(&self) -> Option<&'static str> {
-        let ids = &self.ids?;
+        let ids = self.ids?;
 
-        // The `Enum` trait is supposed to make sure this contains enough values
-        Some(ids[self.unmodulated_plain_value() as usize])
+        // `EnumParam::new()` makes sure this contains one ID per variant, and the backing range
+        // keeps the value within those bounds
+        let index = usize::try_from(self.unmodulated_plain_value()).ok()?;
+        ids.get(index).copied()
     }
 
     /// Set the parameter based on a serialized stable string identifier. Return whether the ID was

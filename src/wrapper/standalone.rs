@@ -199,5 +199,8 @@ fn print_error(error: WrapperError) {
         WrapperError::InitializationFailed => {
             nih_error!("The plugin failed to initialize");
         }
+        WrapperError::ProcessingFailed => {
+            nih_error!("The plugin returned an error while processing audio");
+        }
     }
 }

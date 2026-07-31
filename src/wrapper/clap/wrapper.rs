@@ -85,7 +85,7 @@ use crate::midi::MidiResult;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, ClapPlugin, Editor, MidiConfig,
     NoteEvent, ParamFlags, ParamPtr, Params, ParentWindowHandle, Plugin, PluginNoteEvent,
-    ProcessMode, ProcessStatus, SysExMessage, TaskExecutor, Transport,
+    ProcessMode, ProcessStatus, TaskExecutor, Transport,
 };
 use crate::util::permit_alloc;
 use crate::wrapper::clap::context::RemoteControlPages;
@@ -671,13 +671,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             host_voice_info: AtomicRefCell::new(None),
             current_voice_capacity: AtomicU32::new(
                 P::CLAP_POLY_MODULATION_CONFIG
-                    .map(|c| {
-                        nih_debug_assert!(
-                            c.max_voice_capacity >= 1,
-                            "The maximum voice capacity cannot be zero"
-                        );
-                        c.max_voice_capacity
-                    })
+                    .map(|c| c.effective_max_voice_capacity())
                     .unwrap_or(1),
             ),
 
@@ -1348,9 +1342,9 @@ impl<P: ClapPlugin> Wrapper<P> {
                     if P::MIDI_OUTPUT >= MidiConfig::Basic =>
                 {
                     // SysEx is supported on the basic MIDI config so this is separate
-                    let (padded_sysex_buffer, length) = message.to_buffer();
+                    let (padded_sysex_buffer, length) =
+                        crate::midi::sysex::to_buffer_checked(message);
                     let padded_sysex_buffer = padded_sysex_buffer.borrow();
-                    nih_debug_assert!(padded_sysex_buffer.len() >= length);
                     let sysex_buffer = &padded_sysex_buffer[..length];
 
                     let event = clap_event_midi_sysex {
@@ -1405,6 +1399,24 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         let raw_event = &*event;
 
+        /// Reinterpret the event as a specific event struct, but only after checking that the host
+        /// actually sent that many bytes. Only the generic header has been validated at this point,
+        /// so a malformed event containing just a header would otherwise be read out of bounds.
+        macro_rules! event_as {
+            ($ty:ty) => {{
+                if (raw_event.size as usize) < mem::size_of::<$ty>() {
+                    nih_debug_assert_failure!(
+                        "The host sent a {} byte event for a {} byte event type",
+                        raw_event.size,
+                        mem::size_of::<$ty>()
+                    );
+                    return;
+                }
+
+                &*(event as *const $ty)
+            }};
+        }
+
         // Out of bounds events are clamped to the buffer's size
         let timing = clamp_input_event_timing(
             raw_event.time - current_sample_idx as u32,
@@ -1413,7 +1425,7 @@ impl<P: ClapPlugin> Wrapper<P> {
 
         match (raw_event.space_id, raw_event.type_) {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE) => {
-                let event = &*(event as *const clap_event_param_value);
+                let event = event_as!(clap_event_param_value);
                 self.update_plain_value_by_hash(
                     event.param_id,
                     ClapParamUpdate::PlainValueSet(event.value),
@@ -1439,7 +1451,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_MOD) => {
-                let event = &*(event as *const clap_event_param_mod);
+                let event = event_as!(clap_event_param_mod);
 
                 if event.note_id != -1 && P::MIDI_INPUT >= MidiConfig::Basic {
                     match self.poly_mod_ids_by_hash.get(&event.param_id) {
@@ -1476,14 +1488,14 @@ impl<P: ClapPlugin> Wrapper<P> {
                 );
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_TRANSPORT) => {
-                let event = &*(event as *const clap_event_transport);
+                let event = event_as!(clap_event_transport);
                 if let Some(transport_info) = transport_info {
                     *transport_info = event;
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_ON) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
-                    let event = &*(event as *const clap_event_note);
+                    let event = event_as!(clap_event_note);
                     input_events.push_back(NoteEvent::NoteOn {
                         // When splitting up the buffer for sample accurate automation all events
                         // should be relative to the block
@@ -1501,7 +1513,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
-                    let event = &*(event as *const clap_event_note);
+                    let event = event_as!(clap_event_note);
                     input_events.push_back(NoteEvent::NoteOff {
                         timing,
                         voice_id: if event.note_id != -1 {
@@ -1517,7 +1529,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_CHOKE) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
-                    let event = &*(event as *const clap_event_note);
+                    let event = event_as!(clap_event_note);
                     input_events.push_back(NoteEvent::Choke {
                         timing,
                         voice_id: if event.note_id != -1 {
@@ -1534,7 +1546,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_EXPRESSION) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     // TODO: Add support for the other expression types
-                    let event = &*(event as *const clap_event_note_expression);
+                    let event = event_as!(clap_event_note_expression);
                     match event.expression_id {
                         CLAP_NOTE_EXPRESSION_PRESSURE => {
                             input_events.push_back(NoteEvent::PolyPressure {
@@ -1636,7 +1648,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 // In the Basic note port type, we'll still handle note on, note off, and polyphonic
                 // pressure events if the host sents us those. But we'll throw away any other MIDI
                 // messages to stay consistent with the VST3 wrapper.
-                let event = &*(event as *const clap_event_midi);
+                let event = event_as!(clap_event_midi);
 
                 match NoteEvent::from_midi(timing, &event.data) {
                     Ok(
@@ -1656,11 +1668,15 @@ impl<P: ClapPlugin> Wrapper<P> {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI_SYSEX)
                 if P::MIDI_INPUT >= MidiConfig::Basic =>
             {
-                let event = &*(event as *const clap_event_midi_sysex);
+                let event = event_as!(clap_event_midi_sysex);
 
                 // `NoteEvent::from_midi` prints some tracing if parsing fails, which is not
                 // necessarily an error
-                assert!(!event.buffer.is_null());
+                if event.buffer.is_null() {
+                    // Panicking here would take down the host from its audio thread
+                    nih_debug_assert_failure!("The host sent a SysEx event without a buffer");
+                    return;
+                }
                 let sysex_buffer = std::slice::from_raw_parts(event.buffer, event.size as usize);
                 if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
                     input_events.push_back(note_event);
@@ -1748,7 +1764,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     pub fn set_current_voice_capacity(&self, capacity: u32) {
         match P::CLAP_POLY_MODULATION_CONFIG {
             Some(config) => {
-                let clamped_capacity = capacity.clamp(1, config.max_voice_capacity);
+                let clamped_capacity = capacity.clamp(1, config.effective_max_voice_capacity());
                 nih_debug_assert_eq!(
                     capacity,
                     clamped_capacity,
@@ -1998,6 +2014,14 @@ impl<P: ClapPlugin> Wrapper<P> {
                                     (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE)
                                     | (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_TRANSPORT) => true,
                                     (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_MOD) => {
+                                        // Same as in `handle_in_event()`: only the generic header
+                                        // has been validated, so the host's size has to cover the
+                                        // event specific struct before it can be cast
+                                        if ((*next_event).size as usize)
+                                            < mem::size_of::<clap_event_param_mod>()
+                                        {
+                                            return false;
+                                        }
                                         let next_event =
                                             &*(next_event as *const clap_event_param_mod);
 
@@ -2080,7 +2104,9 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                // An index equal to the bus count is already one past the end of
+                                // the host's array
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2104,7 +2130,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                // See the auxiliary inputs above
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 
@@ -3153,14 +3180,28 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
         let length = u64::from_le_bytes(length_bytes);
 
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
+        // This prefix comes straight from the host's stream and is used to size the allocation
+        // below, so a truncated or crafted stream must not be able to request arbitrary amounts of
+        // memory. The cast would also silently truncate on 32-bit targets.
+        let length = match usize::try_from(length) {
+            Ok(length) if length as u64 <= state::MAX_STATE_SIZE => length,
+            _ => {
+                nih_debug_assert_failure!(
+                    "The state length prefix ({} bytes) exceeds the maximum supported size",
+                    length
+                );
+                return false;
+            }
+        };
+
+        let mut read_buffer: Vec<u8> = Vec::with_capacity(length);
         if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
             nih_debug_assert_failure!(
                 "Error or end of stream while reading the state buffer from the stream."
             );
             return false;
         }
-        read_buffer.set_len(length as usize);
+        read_buffer.set_len(length);
 
         match state::deserialize_json(&read_buffer) {
             Some(mut state) => {
@@ -3197,7 +3238,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(config) => {
                 *info = clap_voice_info {
                     voice_count: wrapper.current_voice_capacity.load(Ordering::Relaxed),
-                    voice_capacity: config.max_voice_capacity,
+                    voice_capacity: config.effective_max_voice_capacity(),
                     flags: if config.supports_overlapping_voices {
                         CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES
                     } else {

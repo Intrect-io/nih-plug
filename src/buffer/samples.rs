@@ -172,7 +172,9 @@ impl<'slice, 'sample> ChannelSamples<'slice, 'sample> {
     where
         LaneCount<LANES>: SupportedLaneCount,
     {
-        let used_lanes = self.len().max(LANES);
+        // The vector is `LANES` channels wide, but the buffer may contain fewer channels than that.
+        // Any remaining lanes stay zeroed, as documented above.
+        let used_lanes = self.len().min(LANES);
         let mut values = [0.0; LANES];
         for (channel_idx, value) in values.iter_mut().enumerate().take(used_lanes) {
             *value = unsafe {
@@ -216,7 +218,8 @@ impl<'slice, 'sample> ChannelSamples<'slice, 'sample> {
     where
         LaneCount<LANES>: SupportedLaneCount,
     {
-        let used_lanes = self.len().max(LANES);
+        // See `to_simd()`, lanes past the buffer's channel count are dropped
+        let used_lanes = self.len().min(LANES);
         let values = vector.to_array();
         for (channel_idx, value) in values.into_iter().enumerate().take(used_lanes) {
             *unsafe {
@@ -246,5 +249,38 @@ impl<'slice, 'sample> ChannelSamples<'slice, 'sample> {
                 .get_unchecked_mut(channel_idx)
                 .get_unchecked_mut(self.current_sample) = value;
         }
+    }
+}
+
+#[cfg(all(test, feature = "simd"))]
+mod tests {
+    use super::*;
+
+    /// Vectors wider than the buffer's channel count must be zero padded, not read from or written
+    /// to channels that don't exist.
+    #[test]
+    fn simd_is_padded_to_the_channel_count() {
+        let mut real_buffers = vec![vec![0.0f32; 8]; 2];
+        let (first_channel, other_channels) = real_buffers.split_at_mut(1);
+        let mut slices: Vec<&mut [f32]> = vec![
+            first_channel[0].as_mut_slice(),
+            other_channels[0].as_mut_slice(),
+        ];
+
+        let mut channel_samples = ChannelSamples {
+            buffers: slices.as_mut_slice(),
+            current_sample: 0,
+            _marker: PhantomData,
+        };
+        assert_eq!(channel_samples.len(), 2);
+
+        assert_eq!(channel_samples.to_simd::<4>().to_array(), [0.0; 4]);
+
+        // The two lanes past the channel count must be dropped instead of writing out of bounds
+        channel_samples.from_simd::<4>(Simd::splat(1.0));
+        assert_eq!(
+            channel_samples.to_simd::<4>().to_array(),
+            [1.0, 1.0, 0.0, 0.0]
+        );
     }
 }

@@ -45,6 +45,14 @@ impl<'slice, 'sample> Iterator for BlocksIter<'slice, 'sample> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        // A zero block size would produce empty blocks without ever advancing `current_block_start`,
+        // turning this into an infinite iterator. `Buffer::iter_blocks()` documents that the block
+        // size must be positive and asserts this in debug builds, so yield nothing instead of
+        // hanging the (potentially real-time) caller in release builds
+        if self.max_block_size == 0 {
+            return None;
+        }
+
         let buffer_len = unsafe { (*self.buffers).first().map(|b| b.len()).unwrap_or(0) };
         if self.current_block_start < buffer_len {
             let current_block_start = self.current_block_start;
@@ -68,7 +76,13 @@ impl<'slice, 'sample> Iterator for BlocksIter<'slice, 'sample> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let buffer_len = unsafe { (*self.buffers).first().map(|b| b.len()).unwrap_or(0) };
-        let remaining = (buffer_len as f32 / self.max_block_size as f32).ceil() as usize;
+        // This must count the blocks that are still left to yield, not the total number of blocks,
+        // or the `ExactSizeIterator` implementation below would be incorrect after the first `next()`
+        if self.max_block_size == 0 || self.current_block_start >= buffer_len {
+            return (0, Some(0));
+        }
+
+        let remaining = (buffer_len - self.current_block_start).div_ceil(self.max_block_size);
 
         (remaining, Some(remaining))
     }
@@ -230,11 +244,13 @@ impl<'slice, 'sample> Block<'slice, 'sample> {
     where
         LaneCount<LANES>: SupportedLaneCount,
     {
-        if sample_index > self.samples() {
+        if sample_index >= self.samples() {
             return None;
         }
 
-        let used_lanes = self.samples().max(LANES);
+        // The vector is `LANES` channels wide, but the buffer may contain fewer channels than that.
+        // Any remaining lanes stay zeroed, as documented above.
+        let used_lanes = self.channels().min(LANES);
         let mut values = [0.0; LANES];
         for (channel_idx, value) in values.iter_mut().enumerate().take(used_lanes) {
             *value = unsafe {
@@ -288,11 +304,12 @@ impl<'slice, 'sample> Block<'slice, 'sample> {
     where
         LaneCount<LANES>: SupportedLaneCount,
     {
-        if sample_index > self.samples() {
+        if sample_index >= self.samples() {
             return false;
         }
 
-        let used_lanes = self.samples().max(LANES);
+        // See `to_channel_simd()`, lanes past the buffer's channel count are dropped
+        let used_lanes = self.channels().min(LANES);
         let values = vector.to_array();
         for (channel_idx, value) in values.into_iter().enumerate().take(used_lanes) {
             *unsafe {
@@ -327,6 +344,82 @@ impl<'slice, 'sample> Block<'slice, 'sample> {
             *(&mut (*self.buffers))
                 .get_unchecked_mut(channel_idx)
                 .get_unchecked_mut(self.current_block_start + sample_index) = value;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Buffer::iter_blocks()` debug-asserts that the block size is positive, so this constructs the
+    /// iterator directly to check the release-build behavior: yielding nothing instead of looping
+    /// forever.
+    #[test]
+    fn zero_block_size_yields_nothing() {
+        let mut real_buffers = vec![vec![0.0f32; 32]; 2];
+        let (first_channel, other_channels) = real_buffers.split_at_mut(1);
+        let mut slices: Vec<&mut [f32]> =
+            vec![first_channel[0].as_mut_slice(), other_channels[0].as_mut_slice()];
+
+        let mut blocks = BlocksIter {
+            buffers: slices.as_mut_slice(),
+            max_block_size: 0,
+            current_block_start: 0,
+            _marker: PhantomData,
+        };
+
+        assert_eq!(blocks.size_hint(), (0, Some(0)));
+        assert!(blocks.next().is_none());
+    }
+
+    #[cfg(feature = "simd")]
+    mod simd {
+        use super::*;
+
+        fn with_block(f: impl FnOnce(&mut Block)) {
+            let mut real_buffers = vec![vec![0.0f32; 8]; 2];
+            let (first_channel, other_channels) = real_buffers.split_at_mut(1);
+            let mut slices: Vec<&mut [f32]> = vec![
+                first_channel[0].as_mut_slice(),
+                other_channels[0].as_mut_slice(),
+            ];
+
+            let mut block = Block {
+                buffers: slices.as_mut_slice(),
+                current_block_start: 0,
+                current_block_end: 4,
+                _marker: PhantomData,
+            };
+            f(&mut block);
+        }
+
+        /// The last valid sample index is `samples() - 1`, an index equal to the block length used
+        /// to read one sample past the end of the block.
+        #[test]
+        fn channel_simd_rejects_out_of_bounds_sample_indices() {
+            with_block(|block| {
+                assert!(block.to_channel_simd::<2>(block.samples() - 1).is_some());
+                assert!(block.to_channel_simd::<2>(block.samples()).is_none());
+                assert!(!block.from_channel_simd::<2>(block.samples(), Simd::splat(1.0)));
+            });
+        }
+
+        /// Vectors wider than the block's channel count must be zero padded, not read from channels
+        /// that don't exist.
+        #[test]
+        fn channel_simd_is_padded_to_the_channel_count() {
+            with_block(|block| {
+                assert_eq!(block.channels(), 2);
+
+                let vector = block.to_channel_simd::<4>(0).unwrap();
+                assert_eq!(vector.to_array(), [0.0; 4]);
+
+                // The two lanes past the channel count must be dropped instead of writing out of
+                // bounds
+                assert!(block.from_channel_simd::<4>(0, Simd::splat(1.0)));
+                assert_eq!(block.to_channel_simd::<4>(0).unwrap().to_array(), [1.0, 1.0, 0.0, 0.0]);
+            });
         }
     }
 }

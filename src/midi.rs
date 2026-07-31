@@ -610,7 +610,7 @@ impl<S: SysExMessage> NoteEvent<S> {
             // `message` is serialized and written to `sysex_buffer`, and the result contains the
             // message's actual length
             NoteEvent::MidiSysEx { timing: _, message } => {
-                let (padded_sysex_buffer, length) = message.to_buffer();
+                let (padded_sysex_buffer, length) = sysex::to_buffer_checked(message);
                 Some(MidiResult::SysEx(padded_sysex_buffer, length))
             }
             NoteEvent::Choke { .. }

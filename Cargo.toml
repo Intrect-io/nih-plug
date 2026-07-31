@@ -124,7 +124,8 @@ zstd = { version = "0.12.3", optional = true }
 [dev-dependencies]
 approx = "0.5.1"
 
-[target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies]
+# Used for the Linux event loop, and by the standalone wrapper's SIGINT handling on all Unices
+[target.'cfg(target_family = "unix")'.dependencies]
 libc = "0.2.124"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -146,6 +147,7 @@ features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Console",
   "Win32_System_LibraryLoader",
   "Win32_System_Performance",
 ]

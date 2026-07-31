@@ -1,7 +1,7 @@
 //! Special handling for note expressions, because VST3 makes this a lot more complicated than it
 //! needs to be. We only support the predefined expressions.
 
-use vst3_sys::vst::{NoteExpressionValueEvent, NoteOnEvent};
+use vst3_sys::vst::{NoteExpressionValueEvent, NoteOffEvent, NoteOnEvent};
 
 use crate::prelude::{NoteEvent, SysExMessage};
 
@@ -9,8 +9,21 @@ type MidiNote = u8;
 type MidiChannel = u8;
 type NoteId = i32;
 
-/// The number of notes we'll keep track of for mapping note IDs to channel+note combinations.
-const NOTE_IDS_LEN: usize = 32;
+/// A note ID registered by a note on event, along with the note and channel it maps back to.
+#[derive(Clone, Copy, Debug)]
+struct NoteMapping {
+    note_id: NoteId,
+    note: MidiNote,
+    channel: MidiChannel,
+    /// Set on note off. Released notes still resolve, because hosts may keep sending expressions
+    /// during a note's release phase, but their slots are the first ones reused.
+    released: bool,
+}
+
+/// How many note ID mappings we can track at once. Released mappings are reused before any live one
+/// is overwritten, so this bounds the number of simultaneously sounding notes rather than the number
+/// of notes played in a session.
+const NOTE_IDS_LEN: usize = 128;
 
 /// `kVolumeTypeID`
 pub const VOLUME_EXPRESSION_ID: u32 = 0;
@@ -65,14 +78,27 @@ pub const KNOWN_NOTE_EXPRESSIONS: [NoteExpressionInfo; 6] = [
 /// expressions are identified only with a note ID. To account for that, we'll keep track of the
 /// most recent note IDs we've encountered so we can later map those IDs back to a note and channel
 /// combination.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NoteExpressionController {
-    /// The last 32 note IDs we've seen. We'll do a linear search every time we receive a note
-    /// expression value event to find the matching note and channel.
-    note_ids: [(NoteId, MidiNote, MidiChannel); NOTE_IDS_LEN],
-    /// The index in the `note_ids` ring buffer the next event should be inserted at, wraps back
-    /// around to 0 when reaching the end.
+    /// The note IDs that are currently sounding. We'll do a linear search every time we receive a
+    /// note expression value event to find the matching note and channel.
+    ///
+    /// `None` marks a free slot. Distinguishing free slots from used ones matters: with a plain
+    /// zero initialized array, an expression for note ID 0 would match an unused entry and be
+    /// attributed to note 0 on channel 0.
+    note_ids: [Option<NoteMapping>; NOTE_IDS_LEN],
+    /// The index in the `note_ids` ring buffer the next event should be inserted at when every slot
+    /// is occupied, wraps back around to 0 when reaching the end.
     note_ids_idx: usize,
+}
+
+impl Default for NoteExpressionController {
+    fn default() -> Self {
+        Self {
+            note_ids: [None; NOTE_IDS_LEN],
+            note_ids_idx: 0,
+        }
+    }
 }
 
 /// This is used to register a (predefined) note expression in the `INoteExpressionController`. The
@@ -93,8 +119,56 @@ impl NoteExpressionController {
     /// Register the note ID from a note on event so it can later be retrieved when handling a note
     /// expression value event.
     pub fn register_note(&mut self, event: &NoteOnEvent) {
-        self.note_ids[self.note_ids_idx] = (event.note_id, event.pitch as u8, event.channel as u8);
-        self.note_ids_idx = (self.note_ids_idx + 1) % NOTE_IDS_LEN;
+        let mapping = NoteMapping {
+            note_id: event.note_id,
+            note: event.pitch as u8,
+            channel: event.channel as u8,
+            released: false,
+        };
+
+        // Reuse this note ID's own slot if the host restarted the note without a note off in
+        // between, then a never used slot, then one belonging to an already released note. Only
+        // when every slot holds a sounding note does this fall back to overwriting the oldest
+        // entry, which is what loses expressions for a note that is still playing.
+        let slot_idx = self
+            .note_ids
+            .iter()
+            .position(|slot| matches!(slot, Some(m) if m.note_id == event.note_id))
+            .or_else(|| self.note_ids.iter().position(Option::is_none))
+            .or_else(|| {
+                self.note_ids
+                    .iter()
+                    .position(|slot| matches!(slot, Some(m) if m.released))
+            });
+
+        match slot_idx {
+            Some(slot_idx) => self.note_ids[slot_idx] = Some(mapping),
+            None => {
+                nih_debug_assert_failure!(
+                    "More than {} notes are sounding, note expressions for the oldest note will \
+                     be lost",
+                    NOTE_IDS_LEN
+                );
+
+                self.note_ids[self.note_ids_idx] = Some(mapping);
+                self.note_ids_idx = (self.note_ids_idx + 1) % NOTE_IDS_LEN;
+            }
+        }
+    }
+
+    /// Mark a note ID as released so its slot can be reused.
+    ///
+    /// The mapping is deliberately kept resolvable: hosts may keep sending expressions during a
+    /// note's release phase, and dropping them here would silently lose that modulation.
+    pub fn unregister_note(&mut self, event: &NoteOffEvent) {
+        if let Some(mapping) = self
+            .note_ids
+            .iter_mut()
+            .flatten()
+            .find(|mapping| mapping.note_id == event.note_id)
+        {
+            mapping.released = true;
+        }
     }
 
     /// Translate the note expression value event into an internal NIH-plug event, if we handle the
@@ -106,10 +180,16 @@ impl NoteExpressionController {
         event: &NoteExpressionValueEvent,
     ) -> Option<NoteEvent<S>> {
         // We're calling it a voice ID, VST3 (and CLAP) calls it a note ID
-        let (note_id, note, channel) = *self
+        let NoteMapping {
+            note_id,
+            note,
+            channel,
+            ..
+        } = *self
             .note_ids
             .iter()
-            .find(|(note_id, _, _)| *note_id == event.note_id)?;
+            .flatten()
+            .find(|mapping| mapping.note_id == event.note_id)?;
 
         match event.type_id {
             VOLUME_EXPRESSION_ID => Some(NoteEvent::PolyVolume {
@@ -203,5 +283,126 @@ impl NoteExpressionController {
             }),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note_on(note_id: NoteId, pitch: i16, channel: i16) -> NoteOnEvent {
+        NoteOnEvent {
+            note_id,
+            pitch,
+            channel,
+            ..Default::default()
+        }
+    }
+
+    fn note_off(note_id: NoteId) -> NoteOffEvent {
+        NoteOffEvent {
+            note_id,
+            ..Default::default()
+        }
+    }
+
+    /// Resolve a note ID through a volume expression, returning the note and channel it mapped to.
+    fn resolve(controller: &NoteExpressionController, note_id: NoteId) -> Option<(MidiNote, MidiChannel)> {
+        let event = NoteExpressionValueEvent {
+            type_id: VOLUME_EXPRESSION_ID,
+            note_id,
+            value: 0.25,
+        };
+
+        match controller.translate_event::<()>(0, &event)? {
+            NoteEvent::PolyVolume { note, channel, .. } => Some((note, channel)),
+            event => panic!("Unexpected event: {event:?}"),
+        }
+    }
+
+    /// The zero initialized entries used to make note ID 0 resolve to note 0 on channel 0 before any
+    /// note was registered.
+    #[test]
+    fn unregistered_note_ids_do_not_resolve() {
+        let controller = NoteExpressionController::default();
+
+        assert_eq!(resolve(&controller, 0), None);
+        assert_eq!(resolve(&controller, 42), None);
+    }
+
+    /// Released notes must keep resolving: hosts may send expressions during the release phase, and
+    /// dropping them at note off would silently lose that modulation.
+    #[test]
+    fn released_notes_still_resolve() {
+        let mut controller = NoteExpressionController::default();
+        controller.register_note(&note_on(7, 60, 3));
+
+        assert_eq!(resolve(&controller, 7), Some((60, 3)));
+
+        controller.unregister_note(&note_off(7));
+        assert_eq!(resolve(&controller, 7), Some((60, 3)));
+    }
+
+    /// Every note that fits must keep its mapping. The old 32 entry overwrite-only ring silently
+    /// dropped expressions for older notes well before that.
+    #[test]
+    fn all_simultaneous_notes_keep_their_mapping() {
+        let mut controller = NoteExpressionController::default();
+        for note_id in 0..NOTE_IDS_LEN as NoteId {
+            controller.register_note(&note_on(note_id, (note_id % 128) as i16, 0));
+        }
+
+        for note_id in 0..NOTE_IDS_LEN as NoteId {
+            assert_eq!(
+                resolve(&controller, note_id),
+                Some(((note_id % 128) as MidiNote, 0)),
+                "note ID {note_id}"
+            );
+        }
+    }
+
+    /// Released slots are recycled before any sounding note is overwritten, so a long session never
+    /// falls back to the overwrite-only ring.
+    #[test]
+    fn released_slots_are_reused_before_sounding_ones() {
+        let mut controller = NoteExpressionController::default();
+
+        // Hold one note for the whole run. It must never lose its mapping to the churn below.
+        const HELD: NoteId = 9999;
+        controller.register_note(&note_on(HELD, 24, 2));
+
+        for note_id in 0..(NOTE_IDS_LEN as NoteId * 4) {
+            controller.register_note(&note_on(note_id, 60, 0));
+            assert_eq!(
+                resolve(&controller, note_id),
+                Some((60, 0)),
+                "note ID {note_id}"
+            );
+            controller.unregister_note(&note_off(note_id));
+
+            assert_eq!(resolve(&controller, HELD), Some((24, 2)), "note ID {note_id}");
+        }
+    }
+
+    #[test]
+    fn restarted_note_ids_reuse_their_slot() {
+        let mut controller = NoteExpressionController::default();
+        controller.register_note(&note_on(1, 60, 0));
+        controller.register_note(&note_on(1, 72, 1));
+
+        // The second note on must overwrite the first rather than adding a duplicate entry
+        assert_eq!(resolve(&controller, 1), Some((72, 1)));
+
+        // Occupy every remaining slot with a sounding note, then release note 1 and register one
+        // more. Its slot is the only one that may be taken, which only holds if note ID 1 never
+        // had a second entry.
+        for note_id in 2..=NOTE_IDS_LEN as NoteId {
+            controller.register_note(&note_on(note_id, 60, 0));
+        }
+        controller.unregister_note(&note_off(1));
+        controller.register_note(&note_on(1000, 36, 0));
+
+        assert_eq!(resolve(&controller, 1), None);
+        assert_eq!(resolve(&controller, 1000), Some((36, 0)));
     }
 }

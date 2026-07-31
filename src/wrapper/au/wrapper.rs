@@ -782,12 +782,22 @@ impl<P: AuPlugin> Wrapper<P> {
             return au::kAudioUnitErr_InvalidPropertyValue;
         }
 
+        // The host hands this over as an untyped pointer. Reinterpreting some other CoreFoundation
+        // object as a `CFDictionary` would pass a wrong-typed object to the CF APIs below, which
+        // crashes the host process instead of failing the property set.
+        let value = unsafe { CFType::wrap_under_get_rule(dict_ptr as _) };
+        if !value.instance_of::<CFDictionary<CFString, CFType>>() {
+            return au::kAudioUnitErr_InvalidPropertyValue;
+        }
         let dict = unsafe { CFDictionary::<CFString, CFType>::wrap_under_get_rule(dict_ptr as _) };
 
         let data_key = CFString::from_static_string("data");
         let data = match dict.find(&data_key) {
-            Some(d) => unsafe { CFData::wrap_under_get_rule(d.as_CFTypeRef() as _) },
-            None => return au::kAudioUnitErr_InvalidPropertyValue,
+            // Same for the payload: the AU spec says this is a `CFData`, but nothing enforces it
+            Some(d) if d.instance_of::<CFData>() => unsafe {
+                CFData::wrap_under_get_rule(d.as_CFTypeRef() as _)
+            },
+            _ => return au::kAudioUnitErr_InvalidPropertyValue,
         };
 
         let mut state: PluginState = match serde_json::from_slice(data.bytes()) {
@@ -1198,11 +1208,19 @@ impl<P: AuPlugin> Wrapper<P> {
         in_data: *const c_void,
         in_data_size: au::UInt32,
     ) -> au::OSStatus {
-        match id {
-            au::kAudioUnitProperty_SampleRate => {
-                if (in_data_size as usize) < std::mem::size_of::<au::Float64>() {
+        /// Validate a property payload before it is dereferenced. This is called across the C ABI,
+        /// so a host can pass a null pointer alongside a nominally valid size.
+        macro_rules! payload {
+            ($ty:ty) => {
+                if in_data.is_null() || (in_data_size as usize) < std::mem::size_of::<$ty>() {
                     return au::kAudioUnitErr_InvalidPropertyValue;
                 }
+            };
+        }
+
+        match id {
+            au::kAudioUnitProperty_SampleRate => {
+                payload!(au::Float64);
                 if this.is_initialized() {
                     return au::kAudioUnitErr_Initialized;
                 }
@@ -1214,11 +1232,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_StreamFormat => {
-                if (in_data_size as usize)
-                    < std::mem::size_of::<au::AudioStreamBasicDescription>()
-                {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                payload!(au::AudioStreamBasicDescription);
                 // AU spec: StreamFormat may not change while initialized.
                 if this.is_initialized() {
                     return au::kAudioUnitErr_Initialized;
@@ -1254,9 +1268,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_MaximumFramesPerSlice => {
-                if (in_data_size as usize) < std::mem::size_of::<au::UInt32>() {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                payload!(au::UInt32);
                 if this.is_initialized() {
                     return au::kAudioUnitErr_Initialized;
                 }
@@ -1271,9 +1283,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_BypassEffect => {
-                if (in_data_size as usize) < std::mem::size_of::<au::UInt32>() {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                payload!(au::UInt32);
                 let v = unsafe { *(in_data as *const au::UInt32) };
                 let on = v != 0;
                 let prev = this.bypass.swap(on, Ordering::AcqRel);
@@ -1295,9 +1305,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_SetRenderCallback => {
-                if (in_data_size as usize) < std::mem::size_of::<au::AURenderCallbackStruct>() {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                payload!(au::AURenderCallbackStruct);
                 let cb = unsafe { *(in_data as *const au::AURenderCallbackStruct) };
                 let new_cb = if cb.inputProc.is_some() { Some(cb) } else { None };
                 if element == 0 {
@@ -1317,16 +1325,12 @@ impl<P: AuPlugin> Wrapper<P> {
             }
             au::kAudioUnitProperty_InPlaceProcessing => au::noErr,
             au::kAudioUnitProperty_ClassInfo if scope == au::kAudioUnitScope_Global => {
-                if (in_data_size as usize) < std::mem::size_of::<*mut c_void>() {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                payload!(*mut c_void);
                 let dict = unsafe { *(in_data as *const *mut c_void) };
                 this.set_class_info(dict)
             }
             au::kAudioUnitProperty_HostCallbacks if scope == au::kAudioUnitScope_Global => {
-                if (in_data_size as usize) < std::mem::size_of::<au::HostCallbackInfo>() {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                payload!(au::HostCallbackInfo);
                 let cb = unsafe { ptr::read(in_data as *const au::HostCallbackInfo) };
                 if let Ok(mut guard) = this.host_callbacks.lock() {
                     *guard = Some(cb);
@@ -1542,7 +1546,7 @@ impl<P: AuPlugin> Wrapper<P> {
         if pulled_from_callback {
             for i in 0..n_buffers.min(rs.input_scratch.len()) {
                 let buf = unsafe { &mut *buffers_ptr.add(i) };
-                if buf.mData.is_null() {
+                if buf.mData.is_null() || !buffer_fits_frames(buf, n_frames) {
                     continue;
                 }
                 let dst = unsafe {
@@ -1596,7 +1600,11 @@ impl<P: AuPlugin> Wrapper<P> {
                 let n = slots.len().min(n_buffers);
                 for i in 0..n {
                     let buf = &mut *buffers_ptr.add(i);
-                    if buf.mData.is_null() {
+                    // A host that reports fewer valid bytes than `in_number_frames` would make the
+                    // slice below read and write past the end of its own buffer. Leave that
+                    // channel's slot empty so the plugin does not touch it at all; whatever the
+                    // host left in its own buffer is its own business.
+                    if buf.mData.is_null() || !buffer_fits_frames(buf, n_frames) {
                         slots[i] = &mut [];
                         continue;
                     }
@@ -2280,7 +2288,89 @@ unsafe fn zero_buffer_list(bl: *mut au::AudioBufferList, n_frames: au::UInt32) {
             continue;
         }
         let n_samples = n_frames as usize * buf.mNumberChannels as usize;
+        // The host's frame count and its buffer size have to agree, or this writes past the end of
+        // `mData`. See `buffer_fits_frames()` for why a zero size is not treated as a mismatch.
+        if !buffer_fits_frames(buf, n_samples) {
+            continue;
+        }
         unsafe { ptr::write_bytes(buf.mData as *mut f32, 0, n_samples) };
+    }
+}
+
+/// Whether `buf` reports enough bytes to hold `n_samples` `f32`s.
+///
+/// `mDataByteSize` is the host's declaration of how much of `mData` is valid, and the render path
+/// derives its slice lengths from `inNumberFrames` instead. A host that disagrees with itself would
+/// otherwise cause out of bounds accesses across the C ABI. A reported size of zero is treated as
+/// "unspecified" rather than as a mismatch, because hosts commonly leave it unset on output buffers.
+#[inline]
+fn buffer_fits_frames(buf: &au::AudioBuffer, n_samples: usize) -> bool {
+    let reported_bytes = buf.mDataByteSize as usize;
+
+    // Dividing instead of multiplying keeps a host supplied frame count times channel count from
+    // overflowing `usize` before the comparison
+    reported_bytes == 0 || reported_bytes / mem::size_of::<f32>() >= n_samples
+}
+
+#[cfg(test)]
+mod buffer_list_tests {
+    use super::*;
+
+    const FRAMES: usize = 8;
+
+    fn buffer(byte_size: usize, data: *mut f32) -> au::AudioBuffer {
+        au::AudioBuffer {
+            mNumberChannels: 1,
+            mDataByteSize: byte_size as au::UInt32,
+            mData: data as *mut c_void,
+        }
+    }
+
+    /// A host that reports fewer valid bytes than the render call's frame count would otherwise be
+    /// written past the end of its own buffer.
+    #[test]
+    fn zero_buffer_list_respects_reported_sizes() {
+        let mut storage = vec![0u64; bl_byte_size(3).div_ceil(mem::size_of::<u64>())];
+        let bl_ptr = storage.as_mut_ptr() as *mut au::AudioBufferList;
+
+        let mut well_formed = vec![1.0f32; FRAMES];
+        let mut undersized = vec![1.0f32; FRAMES];
+
+        unsafe {
+            (*bl_ptr).mNumberBuffers = 3;
+
+            let header_offset = mem::offset_of!(au::AudioBufferList, mBuffers);
+            let buffers_ptr = (bl_ptr as *mut u8).add(header_offset) as *mut au::AudioBuffer;
+
+            *buffers_ptr.add(0) = buffer(
+                FRAMES * mem::size_of::<f32>(),
+                well_formed.as_mut_ptr(),
+            );
+            // Only claims a single sample's worth of storage
+            *buffers_ptr.add(1) = buffer(mem::size_of::<f32>(), undersized.as_mut_ptr());
+            // A null payload must be skipped entirely
+            *buffers_ptr.add(2) = buffer(FRAMES * mem::size_of::<f32>(), ptr::null_mut());
+
+            zero_buffer_list(bl_ptr, FRAMES as au::UInt32);
+        }
+
+        assert_eq!(well_formed, vec![0.0; FRAMES]);
+        assert_eq!(undersized, vec![1.0; FRAMES]);
+    }
+
+    #[test]
+    fn zero_buffer_list_ignores_null_lists() {
+        unsafe { zero_buffer_list(ptr::null_mut(), FRAMES as au::UInt32) };
+    }
+
+    #[test]
+    fn buffer_fits_frames_treats_zero_as_unspecified() {
+        // Hosts commonly leave `mDataByteSize` unset on output buffers
+        assert!(buffer_fits_frames(&buffer(0, ptr::null_mut()), 512));
+
+        let one_sample = buffer(mem::size_of::<f32>(), ptr::null_mut());
+        assert!(buffer_fits_frames(&one_sample, 1));
+        assert!(!buffer_fits_frames(&one_sample, 2));
     }
 }
 

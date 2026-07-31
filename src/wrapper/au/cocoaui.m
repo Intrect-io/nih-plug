@@ -148,14 +148,24 @@ static void _init_container_lock(void) {
             return nil;
         }
         container.audioUnit = (void *)au;
-        g_containerViews[key] = container;
 
 #ifdef DEBUG
         NSLog(@"[nih-plug AU] uiViewForAudioUnit: container=%p, spawning editor", (__bridge void *)container);
 #endif
         void *handle_slot = nih_plug_au_cocoaui_spawn_for_audio_unit(
             (__bridge void *)container, (void *)au);
+        if (!handle_slot) {
+            /* The editor was not spawned, so this container hosts nothing. Caching it would
+             * make every later factory call for this AudioUnit return the same permanently
+             * blank view, so report the failure and let the host retry instead. */
+#ifdef DEBUG
+            NSLog(@"[nih-plug AU] uiViewForAudioUnit: editor spawn failed, discarding container");
+#endif
+            return nil;
+        }
+
         container.handleSlot = handle_slot;
+        g_containerViews[key] = container;
 #ifdef DEBUG
         NSLog(@"[nih-plug AU] uiViewForAudioUnit: done, returning container");
 #endif

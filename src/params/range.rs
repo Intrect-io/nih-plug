@@ -60,13 +60,40 @@ impl FloatRange {
         0.5f32.log((middle_gain - min_gain) / (max_gain - min_gain))
     }
 
+    /// Clamp a plain value to the range's bounds.
+    ///
+    /// [`f32::clamp()`] panics when `min > max` or when either bound is NaN. `FloatRange`'s fields
+    /// are public, so a plugin can construct such a range. [`assert_validity()`][Self::
+    /// assert_validity()] flags this during development; this keeps release builds from panicking
+    /// during a parameter conversion.
+    #[inline]
+    fn clamp_to_bounds(plain: f32, min: f32, max: f32) -> f32 {
+        if min <= max {
+            plain.clamp(min, max)
+        } else {
+            min
+        }
+    }
+
+    /// The range's lower bound, unwrapping any adapters. Used as a fallback for degenerate ranges.
+    fn min_value(&self) -> f32 {
+        match self {
+            FloatRange::Linear { min, .. }
+            | FloatRange::Skewed { min, .. }
+            | FloatRange::SymmetricalSkewed { min, .. } => *min,
+            FloatRange::Reversed(range) => range.min_value(),
+        }
+    }
+
     /// Normalize a plain, unnormalized value. Will be clamped to the bounds of the range if the
     /// normalized value exceeds `[0, 1]`.
     pub fn normalize(&self, plain: f32) -> f32 {
-        match self {
-            FloatRange::Linear { min, max } => (plain.clamp(*min, *max) - min) / (max - min),
+        let normalized = match self {
+            FloatRange::Linear { min, max } => {
+                (Self::clamp_to_bounds(plain, *min, *max) - min) / (max - min)
+            }
             FloatRange::Skewed { min, max, factor } => {
-                ((plain.clamp(*min, *max) - min) / (max - min)).powf(*factor)
+                ((Self::clamp_to_bounds(plain, *min, *max) - min) / (max - min)).powf(*factor)
             }
             FloatRange::SymmetricalSkewed {
                 min,
@@ -76,7 +103,8 @@ impl FloatRange {
             } => {
                 // There's probably a much faster equivalent way to write this. Also, I have no clue
                 // how I managed to implement this correctly on the first try.
-                let unscaled_proportion = (plain.clamp(*min, *max) - min) / (max - min);
+                let unscaled_proportion = (Self::clamp_to_bounds(plain, *min, *max) - min)
+                    / (max - min);
                 let center_proportion = (center - min) / (max - min);
                 if unscaled_proportion > center_proportion {
                     // The part above the center gets normalized to a [0, 1] range, skewed, and then
@@ -95,14 +123,19 @@ impl FloatRange {
                 }
             }
             FloatRange::Reversed(range) => 1.0 - range.normalize(plain),
-        }
+        };
+
+        // A zero width range, non-finite bounds, or an invalid skew factor would produce NaN or
+        // infinity above. `assert_validity()` flags those during development, but hosts must never
+        // be handed a non-normalized value.
+        sanitize_normalized(normalized)
     }
 
     /// Unnormalize a normalized value. Will be clamped to `[0, 1]` if the plain, unnormalized value
     /// would exceed that range.
     pub fn unnormalize(&self, normalized: f32) -> f32 {
-        let normalized = normalized.clamp(0.0, 1.0);
-        match self {
+        let normalized = sanitize_normalized(normalized);
+        let plain = match self {
             FloatRange::Linear { min, max } => (normalized * (max - min)) + min,
             FloatRange::Skewed { min, max, factor } => {
                 (normalized.powf(factor.recip()) * (max - min)) + min
@@ -127,6 +160,18 @@ impl FloatRange {
                 (skewed_proportion * (max - min)) + min
             }
             FloatRange::Reversed(range) => range.unnormalize(1.0 - normalized),
+        };
+
+        // See `normalize()`
+        if plain.is_finite() {
+            plain
+        } else {
+            let min = self.min_value();
+            if min.is_finite() {
+                min
+            } else {
+                0.0
+            }
         }
     }
 
@@ -145,15 +190,16 @@ impl FloatRange {
                 let naive_step =
                     self.unnormalize(self.normalize(from) - normalized_naive_step_size);
 
-                match step_size {
+                let stepped = match step_size {
                     // Use the naive step size if it is larger than the configured step size
                     Some(step_size) if (naive_step - from).abs() > step_size => {
                         self.snap_to_step(naive_step, step_size)
                     }
                     Some(step_size) => from - step_size,
                     None => naive_step,
-                }
-                .clamp(*min, *max)
+                };
+
+                Self::clamp_to_bounds(stepped, *min, *max)
             }
             FloatRange::Reversed(range) => range.next_step(from, step_size, finer),
         }
@@ -171,14 +217,15 @@ impl FloatRange {
                 let naive_step =
                     self.unnormalize(self.normalize(from) + normalized_naive_step_size);
 
-                match step_size {
+                let stepped = match step_size {
                     Some(step_size) if (naive_step - from).abs() > step_size => {
                         self.snap_to_step(naive_step, step_size)
                     }
                     Some(step_size) => from + step_size,
                     None => naive_step,
-                }
-                .clamp(*min, *max)
+                };
+
+                Self::clamp_to_bounds(stepped, *min, *max)
             }
             FloatRange::Reversed(range) => range.previous_step(from, step_size, finer),
         }
@@ -190,23 +237,47 @@ impl FloatRange {
             FloatRange::Linear { min, max }
             | FloatRange::Skewed { min, max, .. }
             | FloatRange::SymmetricalSkewed { min, max, .. } => {
-                ((value / step_size).round() * step_size).clamp(*min, *max)
+                // There is nothing to snap to for a zero, negative, or non-finite step size. The
+                // parameter types assert on this, this keeps the division from producing NaN.
+                let snapped = if step_size > 0.0 && step_size.is_finite() {
+                    (value / step_size).round() * step_size
+                } else {
+                    value
+                };
+
+                Self::clamp_to_bounds(snapped, *min, *max)
             }
             FloatRange::Reversed(range) => range.snap_to_step(value, step_size),
         }
     }
 
-    /// Emits debug assertions to make sure that range minima are always less than the maxima and
-    /// that they are not equal.
+    /// Emits debug assertions to make sure that the range is usable: the bounds need to be finite
+    /// and ordered, skew factors need to be positive and finite, and a symmetrical skew's center
+    /// needs to lie strictly between the bounds.
     pub(super) fn assert_validity(&self) {
         match self {
-            FloatRange::Linear { min, max }
-            | FloatRange::Skewed { min, max, .. }
-            | FloatRange::SymmetricalSkewed { min, max, .. } => {
+            FloatRange::Linear { min, max } => Self::assert_bounds_validity(*min, *max),
+            FloatRange::Skewed { min, max, factor } => {
+                Self::assert_bounds_validity(*min, *max);
+                Self::assert_skew_factor_validity(*factor);
+            }
+            FloatRange::SymmetricalSkewed {
+                min,
+                max,
+                factor,
+                center,
+            } => {
+                Self::assert_bounds_validity(*min, *max);
+                Self::assert_skew_factor_validity(*factor);
+
+                // The center is normalized against the range's bounds, and the proportions on
+                // either side of it are divided by. A center on one of the bounds would make one of
+                // those divisors zero.
                 nih_debug_assert!(
-                    min < max,
-                    "The range minimum ({}) needs to be less than the range maximum ({}) and they \
-                     cannot be equal",
+                    *min < *center && *center < *max,
+                    "The symmetrical skew's center ({}) needs to lie strictly between the range \
+                     minimum ({}) and maximum ({})",
+                    center,
                     min,
                     max
                 );
@@ -214,25 +285,94 @@ impl FloatRange {
             FloatRange::Reversed(range) => range.assert_validity(),
         }
     }
+
+    fn assert_bounds_validity(min: f32, max: f32) {
+        nih_debug_assert!(
+            min.is_finite() && max.is_finite(),
+            "The range bounds ({}, {}) need to be finite numbers",
+            min,
+            max
+        );
+        nih_debug_assert!(
+            min < max,
+            "The range minimum ({}) needs to be less than the range maximum ({}) and they \
+             cannot be equal",
+            min,
+            max
+        );
+    }
+
+    fn assert_skew_factor_validity(factor: f32) {
+        // The factor is used as an exponent on a `[0, 1]` proportion and its reciprocal is taken
+        // when unnormalizing, so zero and negative factors do not describe a usable curve
+        nih_debug_assert!(
+            factor > 0.0 && factor.is_finite(),
+            "The skew factor ({}) needs to be a positive, finite number",
+            factor
+        );
+    }
+}
+
+/// Constrain a normalized value to `[0, 1]`, mapping non-finite values to `0.0`. [`f32::clamp()`]
+/// propagates NaN, and hosts do not expect to receive it.
+#[inline]
+fn sanitize_normalized(normalized: f32) -> f32 {
+    if normalized.is_finite() {
+        normalized.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 impl IntRange {
+    /// Clamp a plain value to the range's bounds. See
+    /// [`FloatRange::clamp_to_bounds()`][FloatRange::clamp_to_bounds()] for why this doesn't use
+    /// [`Ord::clamp()`] directly.
+    #[inline]
+    fn clamp_to_bounds(plain: i32, min: i32, max: i32) -> i32 {
+        if min <= max {
+            plain.clamp(min, max)
+        } else {
+            min
+        }
+    }
+
     /// Normalize a plain, unnormalized value. Will be clamped to the bounds of the range if the
     /// normalized value exceeds `[0, 1]`.
     pub fn normalize(&self, plain: i32) -> f32 {
-        match self {
-            IntRange::Linear { min, max } => (plain - min) as f32 / (max - min) as f32,
+        let normalized = match self {
+            // These are widened to `i64` because the difference between two `i32`s does not
+            // necessarily fit in an `i32`
+            IntRange::Linear { min, max } => {
+                (plain as i64 - *min as i64) as f32 / (*max as i64 - *min as i64) as f32
+            }
             IntRange::Reversed(range) => 1.0 - range.normalize(plain),
-        }
-        .clamp(0.0, 1.0)
+        };
+
+        // A zero width range would produce NaN above. `assert_validity()` flags that during
+        // development, but hosts must never be handed a non-normalized value.
+        sanitize_normalized(normalized)
     }
 
     /// Unnormalize a normalized value. Will be clamped to `[0, 1]` if the plain, unnormalized value
     /// would exceed that range.
     pub fn unnormalize(&self, normalized: f32) -> i32 {
-        let normalized = normalized.clamp(0.0, 1.0);
+        let normalized = sanitize_normalized(normalized);
         match self {
-            IntRange::Linear { min, max } => (normalized * (max - min) as f32).round() as i32 + min,
+            IntRange::Linear { min, max } => {
+                // See `normalize()` for why the range width is widened to `i64`. The multiplication
+                // itself stays in `f32`: rounding a half-step lands on a different side in `f64`,
+                // which would silently move every host written value that sits exactly between two
+                // steps (e.g. 0.35 in a `0..=10` range).
+                let plain = (normalized * (*max as i64 - *min as i64) as f32).round() as i64
+                    + *min as i64;
+
+                Self::clamp_to_bounds(
+                    plain.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                    *min,
+                    *max,
+                )
+            }
             IntRange::Reversed(range) => range.unnormalize(1.0 - normalized),
         }
     }
@@ -240,7 +380,7 @@ impl IntRange {
     /// The range's previous discrete step from a certain value.
     pub fn previous_step(&self, from: i32) -> i32 {
         match self {
-            IntRange::Linear { min, max } => (from - 1).clamp(*min, *max),
+            IntRange::Linear { min, max } => Self::clamp_to_bounds(from.saturating_sub(1), *min, *max),
             IntRange::Reversed(range) => range.next_step(from),
         }
     }
@@ -248,7 +388,7 @@ impl IntRange {
     /// The range's next discrete step from a certain value.
     pub fn next_step(&self, from: i32) -> i32 {
         match self {
-            IntRange::Linear { min, max } => (from + 1).clamp(*min, *max),
+            IntRange::Linear { min, max } => Self::clamp_to_bounds(from.saturating_add(1), *min, *max),
             IntRange::Reversed(range) => range.previous_step(from),
         }
     }
@@ -256,7 +396,8 @@ impl IntRange {
     /// The number of steps in this range. Used for the host's generic UI.
     pub fn step_count(&self) -> usize {
         match self {
-            IntRange::Linear { min, max } => (max - min) as usize,
+            // A reversed range would otherwise wrap around to an enormous step count
+            IntRange::Linear { min, max } => (*max as i64 - *min as i64).max(0) as usize,
             IntRange::Reversed(range) => range.step_count(),
         }
     }
@@ -366,6 +507,21 @@ mod tests {
             let range = make_linear_int_range();
             assert_eq!(range.unnormalize(0.73), 5);
         }
+
+        /// Values that land exactly between two steps have to keep rounding the way they always
+        /// have. Widening the multiplication to `f64` moves these to the next step down, which
+        /// silently changes where every host written value snaps to.
+        #[test]
+        fn range_unnormalize_int_half_step_rounding() {
+            let range = IntRange::Linear { min: 0, max: 10 };
+            assert_eq!(range.unnormalize(0.35), 4);
+            assert_eq!(range.unnormalize(0.45), 5);
+            assert_eq!(range.unnormalize(0.65), 7);
+            assert_eq!(range.unnormalize(0.95), 10);
+
+            let range = IntRange::Linear { min: 0, max: 100 };
+            assert_eq!(range.unnormalize(0.005), 1);
+        }
     }
 
     mod skewed {
@@ -439,6 +595,140 @@ mod tests {
             const WRAPPED_RANGE: IntRange = make_linear_int_range();
             let range = IntRange::Reversed(&WRAPPED_RANGE);
             assert_eq!(range.unnormalize(1.0 - 0.73), 5);
+        }
+    }
+
+    /// `assert_validity()` flags these configurations during development, but since the range types
+    /// have public fields a release build can still end up with them. None of the conversions may
+    /// panic or produce NaN when that happens.
+    mod invalid_configurations {
+        use super::*;
+
+        fn assert_is_normalized(normalized: f32, context: &str) {
+            assert!(
+                normalized.is_finite() && (0.0..=1.0).contains(&normalized),
+                "{context}: {normalized}"
+            );
+        }
+
+        #[test]
+        fn zero_width_float_range() {
+            let range = FloatRange::Linear {
+                min: 5.0,
+                max: 5.0,
+            };
+
+            assert_is_normalized(range.normalize(5.0), "zero width");
+            assert!(range.unnormalize(0.5).is_finite());
+        }
+
+        #[test]
+        fn reversed_float_bounds() {
+            let range = FloatRange::Linear {
+                min: 20.0,
+                max: 10.0,
+            };
+
+            assert_is_normalized(range.normalize(15.0), "reversed bounds");
+            assert!(range.unnormalize(0.5).is_finite());
+            assert!(range.snap_to_step(15.0, 1.0).is_finite());
+            assert!(range.next_step(15.0, Some(1.0), false).is_finite());
+            assert!(range.previous_step(15.0, Some(1.0), false).is_finite());
+        }
+
+        #[test]
+        fn non_finite_float_bounds() {
+            for (min, max) in [(f32::NAN, 10.0), (0.0, f32::NAN), (0.0, f32::INFINITY)] {
+                let range = FloatRange::Linear { min, max };
+
+                assert_is_normalized(range.normalize(5.0), "non-finite bounds");
+                assert!(range.unnormalize(0.5).is_finite(), "{min} - {max}");
+            }
+        }
+
+        #[test]
+        fn invalid_skew_factors() {
+            for factor in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+                let range = make_skewed_float_range(factor);
+
+                assert_is_normalized(range.normalize(15.0), &format!("factor {factor}"));
+                assert!(range.unnormalize(0.5).is_finite(), "factor {factor}");
+            }
+        }
+
+        #[test]
+        fn symmetrical_skew_center_outside_of_the_range() {
+            // 10.0 and 20.0 are the range's own bounds, where the proportion on one side of the
+            // center collapses to zero and gets divided by
+            for center in [5.0, 10.0, 20.0, 25.0] {
+                let range = FloatRange::SymmetricalSkewed {
+                    min: 10.0,
+                    max: 20.0,
+                    factor: 1.0,
+                    center,
+                };
+
+                for plain in [10.0, 15.0, 20.0] {
+                    assert_is_normalized(
+                        range.normalize(plain),
+                        &format!("center {center}, plain {plain}"),
+                    );
+                }
+                for normalized in [0.0, 0.5, 1.0] {
+                    assert!(
+                        range.unnormalize(normalized).is_finite(),
+                        "center {center}, normalized {normalized}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_step_sizes() {
+            let range = make_linear_float_range();
+            for step_size in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+                assert!(
+                    range.snap_to_step(15.0, step_size).is_finite(),
+                    "step size {step_size}"
+                );
+            }
+        }
+
+        #[test]
+        fn zero_width_int_range() {
+            let range = IntRange::Linear { min: 5, max: 5 };
+
+            assert_is_normalized(range.normalize(5), "zero width");
+            assert_eq!(range.unnormalize(0.5), 5);
+            assert_eq!(range.step_count(), 0);
+        }
+
+        #[test]
+        fn reversed_int_bounds() {
+            let range = IntRange::Linear { min: 10, max: 0 };
+
+            assert_is_normalized(range.normalize(5), "reversed bounds");
+            assert_eq!(range.unnormalize(0.5), 10);
+            assert_eq!(range.previous_step(5), 10);
+            assert_eq!(range.next_step(5), 10);
+            assert_eq!(range.step_count(), 0);
+        }
+
+        /// The difference between two `i32`s does not fit in an `i32`.
+        #[test]
+        fn full_width_int_range() {
+            let range = IntRange::Linear {
+                min: i32::MIN,
+                max: i32::MAX,
+            };
+
+            assert_eq!(range.normalize(i32::MIN), 0.0);
+            assert_eq!(range.normalize(i32::MAX), 1.0);
+            assert_eq!(range.unnormalize(0.0), i32::MIN);
+            assert_eq!(range.unnormalize(1.0), i32::MAX);
+            assert_eq!(range.next_step(i32::MAX), i32::MAX);
+            assert_eq!(range.previous_step(i32::MIN), i32::MIN);
+            assert_eq!(range.step_count(), u32::MAX as usize);
         }
     }
 

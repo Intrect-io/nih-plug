@@ -367,8 +367,22 @@ impl FloatParam {
     /// this is set and a [`value_to_string`][Self::with_value_to_string()] function is not set,
     /// then this is also used when formatting the parameter. This must be a positive, nonzero
     /// number.
+    ///
+    /// Zero, negative, and non-finite step sizes are ignored. They cannot be snapped to, and
+    /// [`FloatRange::snap_to_step()`][crate::prelude::FloatRange::snap_to_step()] would divide by
+    /// them.
     pub fn with_step_size(mut self, step_size: f32) -> Self {
-        self.step_size = Some(step_size);
+        nih_debug_assert!(
+            step_size > 0.0 && step_size.is_finite(),
+            "The step size ({}) needs to be a positive, finite number",
+            step_size
+        );
+
+        self.step_size = if step_size > 0.0 && step_size.is_finite() {
+            Some(step_size)
+        } else {
+            None
+        };
         self
     }
 

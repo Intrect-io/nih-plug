@@ -5,6 +5,7 @@ use crossbeam::channel;
 use std::ffi::{c_void, CString};
 use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Weak;
 use std::thread::{self, ThreadId};
 use windows::core::PCSTR;
@@ -32,6 +33,14 @@ const NOTIFY_MESSAGE_ID: u32 = WM_USER;
 /// This needs to be double boxed when passed to the function since fat pointers cannot be directly
 /// casted from a regular pointer.
 type PollCallback = Box<dyn Fn()>;
+
+/// Disambiguates window class names for instances created within the same performance counter tick.
+/// See [`WindowsEventLoop::new_and_spawn()`].
+static CLASS_NAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// How many window class names to try before giving up. Every attempt uses a new counter value, so
+/// this only needs to cover collisions with class names registered by another copy of this crate.
+const CLASS_NAME_ATTEMPTS: usize = 64;
 
 /// See [`EventLoop`][super::EventLoop].
 pub(crate) struct WindowsEventLoop<T, E> {
@@ -68,22 +77,38 @@ where
         let (tasks_sender, tasks_receiver) = channel::bounded(super::TASK_QUEUE_CAPACITY);
 
         // Window classes need to have unique names or else multiple plugins loaded into the same
-        // process will end up calling the other plugin's callbacks
+        // process will end up calling the other plugin's callbacks. The performance counter on its
+        // own is not enough for that: two instances created in quick succession can read the same
+        // tick count, and the registration would then fail for the second one. Adding a
+        // process-wide counter makes the name unique within this copy of the crate, and retrying
+        // covers collisions with class names registered by another copy of it.
         let mut ticks = 0i64;
         assert!(unsafe { QueryPerformanceCounter(&mut ticks).as_bool() });
-        let class_name = CString::new(format!("nih-event-loop-{ticks}"))
-            .expect("Where did these null bytes come from?");
-        let class_name_ptr = PCSTR(class_name.as_bytes_with_nul().as_ptr());
+        let hinstance = unsafe { GetModuleHandleA(PCSTR(ptr::null())) }
+            .expect("Could not get the current module's handle");
 
-        let class = WNDCLASSEXA {
-            cbSize: mem::size_of::<WNDCLASSEXA>() as u32,
-            lpfnWndProc: Some(window_proc),
-            hInstance: unsafe { GetModuleHandleA(PCSTR(ptr::null())) }
-                .expect("Could not get the current module's handle"),
-            lpszClassName: class_name_ptr,
-            ..Default::default()
-        };
-        assert_ne!(unsafe { RegisterClassExA(&class) }, 0);
+        let mut registered_class_name = None;
+        for _ in 0..CLASS_NAME_ATTEMPTS {
+            let counter = CLASS_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let class_name = CString::new(format!("nih-event-loop-{ticks}-{counter}"))
+                .expect("Where did these null bytes come from?");
+
+            let class = WNDCLASSEXA {
+                cbSize: mem::size_of::<WNDCLASSEXA>() as u32,
+                lpfnWndProc: Some(window_proc),
+                hInstance: hinstance,
+                lpszClassName: PCSTR(class_name.as_bytes_with_nul().as_ptr()),
+                ..Default::default()
+            };
+            if unsafe { RegisterClassExA(&class) } != 0 {
+                registered_class_name = Some(class_name);
+                break;
+            }
+        }
+
+        let class_name = registered_class_name
+            .expect("Could not register a unique window class for the event loop");
+        let class_name_ptr = PCSTR(class_name.as_bytes_with_nul().as_ptr());
 
         // This will be called by the hidden event loop when it gets woken up to process events. We
         // can't pass the tasks queue and the executor to it directly, so this is a simple type
@@ -147,16 +172,22 @@ where
 
             true
         } else {
-            let success = self.tasks_sender.try_send(task).is_ok();
-            if success {
-                // Instead of polling on a timer, we can just wake up the window whenever there's a
-                // new message.
-                unsafe {
-                    PostMessageA(self.message_window, NOTIFY_MESSAGE_ID, WPARAM(0), LPARAM(0))
-                };
+            if self.tasks_sender.try_send(task).is_err() {
+                return false;
             }
 
-            success
+            // Instead of polling on a timer, we can just wake up the window whenever there's a new
+            // message. A failure here is worth flagging — the task then sits in the queue until an
+            // unrelated notification drains it — but the return value still has to report that the
+            // task was accepted. Reporting failure would invite the caller to schedule it a second
+            // time, and it would then run twice.
+            let posted = unsafe {
+                PostMessageA(self.message_window, NOTIFY_MESSAGE_ID, WPARAM(0), LPARAM(0))
+            }
+            .as_bool();
+            nih_debug_assert!(posted, "Could not post a message to the event loop window");
+
+            true
         }
     }
 

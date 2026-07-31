@@ -17,13 +17,16 @@ use crate::util;
 /// negative zero values to make sure string->value->string roundtrips work correctly. Otherwise
 /// `-0.001` rounded to two digits would result in `-0.00`.
 pub fn v2s_f32_rounded(digits: usize) -> Arc<dyn Fn(f32) -> String + Send + Sync> {
-    let rounding_multiplier = 10u32.pow(digits as u32) as f32;
     Arc::new(move |value| {
-        // See above
-        if (value * rounding_multiplier).round() / rounding_multiplier == 0.0 {
-            format!("{:.digits$}", 0.0)
-        } else {
-            format!("{value:.digits$}")
+        let formatted = format!("{value:.digits$}");
+
+        // See above. Formatting first and then inspecting the result avoids computing a rounding
+        // multiplier, which would overflow for larger `digits` values.
+        match formatted.strip_prefix('-') {
+            Some(unsigned) if unsigned.bytes().all(|b| b == b'0' || b == b'.') => {
+                unsigned.to_owned()
+            }
+            _ => formatted,
         }
     })
 }
@@ -272,7 +275,9 @@ pub fn s2v_i32_power_of_two() -> Arc<dyn Fn(&str) -> Option<i32> + Send + Sync> 
 pub fn v2s_i32_note_formatter() -> Arc<dyn Fn(i32) -> String + Send + Sync> {
     Arc::new(move |value| {
         let note_name = util::NOTES[value.rem_euclid(12) as usize];
-        let octave = (value / 12) - 1;
+        // This needs to be a Euclidean division to match `rem_euclid()` above, as truncating
+        // division would round negative note numbers towards zero and break roundtripping
+        let octave = value.div_euclid(12) - 1;
         format!("{note_name}{octave}")
     })
 }
@@ -350,6 +355,41 @@ mod tests {
         // Sanity check
         assert_eq!("-0.01", v2s(-0.009));
         assert_eq!("0.01", v2s(0.009));
+    }
+
+    /// Precisions of ten and up used to overflow the `u32` rounding multiplier.
+    #[test]
+    fn v2s_f32_rounded_high_precision() {
+        let v2s = v2s_f32_rounded(12);
+
+        assert_eq!("0.000000000000", v2s(-0.0));
+        assert_eq!("1.500000000000", v2s(1.5));
+        assert_eq!("-1.500000000000", v2s(-1.5));
+    }
+
+    #[test]
+    fn v2s_f32_rounded_non_finite() {
+        let v2s = v2s_f32_rounded(2);
+
+        assert_eq!("-inf", v2s(f32::NEG_INFINITY));
+        assert_eq!("inf", v2s(f32::INFINITY));
+    }
+
+    /// Negative note numbers used to format with a truncated octave, which then parsed back to a
+    /// different note number.
+    #[test]
+    fn i32_note_name_roundtrip() {
+        let v2s = v2s_i32_note_formatter();
+        let s2v = s2v_i32_note_formatter();
+
+        for note in -12..=127 {
+            let string = v2s(note);
+            assert_eq!(s2v(&string), Some(note), "Unexpected: {note} -> {string}");
+        }
+
+        assert_eq!("C-1", v2s(0));
+        assert_eq!("B-2", v2s(-1));
+        assert_eq!("C4", v2s(60));
     }
 
     // More of these validators could use tests, but this one in particular is tricky and I noticed
