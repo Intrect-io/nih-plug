@@ -1636,16 +1636,20 @@ impl<P: AuPlugin> Wrapper<P> {
                 let mut flags: au::AudioUnitRenderActionFlags = 0;
                 let status = match input_source {
                     InputSource::Callback(cb) => {
-                        // Unchanged from the callback-only implementation: a
-                        // zeroed timestamp. Hosts installing a callback drive
-                        // it from their own clock.
-                        let ts: au::AudioTimeStamp = unsafe { mem::zeroed() };
+                        // Forward this block's real timestamp, exactly as
+                        // AUBase's PullInput does. The zeroed timestamp this
+                        // used to pass (mFlags = 0, no valid fields) is a spec
+                        // violation a host is entitled to answer with silence
+                        // and noErr — Logic Pro does exactly that, which
+                        // rendered every nih-plug AU silent there while
+                        // Ableton, whose callback ignores the timestamp,
+                        // worked fine (AUD-831).
                         let proc = cb.inputProc.unwrap();
                         unsafe {
                             proc(
                                 cb.inputProcRefCon,
                                 &mut flags,
-                                &ts,
+                                in_time_stamp,
                                 0,
                                 in_number_frames,
                                 bl_ptr,
@@ -1669,6 +1673,27 @@ impl<P: AuPlugin> Wrapper<P> {
                 };
                 if status == au::noErr {
                     pulled_input = true;
+                    // The callback is allowed to *replace* the mData pointers
+                    // with its own buffers instead of filling the ones we
+                    // provided — a zero-copy pull AUBase explicitly supports
+                    // by reading input back through the BufferList after the
+                    // call. Logic Pro does exactly this; reading our scratch
+                    // directly therefore saw only the zeros we put there,
+                    // which kept every nih-plug AU silent in Logic while
+                    // hosts that copy into the caller's buffers (Ableton,
+                    // the QC harnesses) worked (AUD-831). Copy back whenever
+                    // the pointer moved so everything downstream can keep
+                    // reading scratch.
+                    for ch in 0..n_ch {
+                        let b = unsafe { &*buffers_ptr.add(ch) };
+                        let src = b.mData as *const f32;
+                        let dst = rs.input_scratch[ch].as_mut_ptr();
+                        if !src.is_null() && src != dst as *const f32 {
+                            let frames = n_frames
+                                .min(b.mDataByteSize as usize / mem::size_of::<f32>());
+                            unsafe { ptr::copy_nonoverlapping(src, dst, frames) };
+                        }
+                    }
                 }
             }
         }
@@ -1873,7 +1898,8 @@ impl<P: AuPlugin> Wrapper<P> {
                             };
                         }
                     }
-                    let ts: au::AudioTimeStamp = unsafe { mem::zeroed() };
+                    // Real timestamp, same as the main input: a zeroed one is
+                    // a spec violation Logic answers with silence (AUD-831).
                     let mut flags: au::AudioUnitRenderActionFlags = 0;
                     let proc = cb.inputProc.unwrap();
                     // element = aux_idx + 1 (element 0 is main)
@@ -1881,12 +1907,26 @@ impl<P: AuPlugin> Wrapper<P> {
                         proc(
                             cb.inputProcRefCon,
                             &mut flags,
-                            &ts,
+                            in_time_stamp,
                             (aux_idx + 1) as au::UInt32,
                             in_number_frames,
                             bl_ptr,
                         )
                     };
+                    // Same zero-copy contract as the main input: the callback
+                    // may have swapped mData to its own buffers (AUD-831).
+                    if _status == au::noErr {
+                        for ch in 0..n_ch {
+                            let b = unsafe { &*buffers_ptr.add(ch) };
+                            let src = b.mData as *const f32;
+                            let dst = rs.aux_input_scratch[aux_idx][ch].as_mut_ptr();
+                            if !src.is_null() && src != dst as *const f32 {
+                                let frames = n_frames
+                                    .min(b.mDataByteSize as usize / mem::size_of::<f32>());
+                                unsafe { ptr::copy_nonoverlapping(src, dst, frames) };
+                            }
+                        }
+                    }
                     // Wire scratch into the aux Buffer's slots.
                     unsafe {
                         rs.aux_buffers[aux_idx].set_slices(n_frames, |slots| {
