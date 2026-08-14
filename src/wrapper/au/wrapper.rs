@@ -62,6 +62,53 @@ use crate::wrapper::state::{self, PluginState};
 use super::context::{AUParameter, AUParameterListenerNotify, AuGuiContextInner, AuInitContext, AuProcessContext, ContextSink};
 use super::factory::fourcc;
 
+/// Payload of `kAudioUnitProperty_MakeConnection`.
+///
+/// AU v2 gives a host two ways to feed an effect's input bus: install a render
+/// callback (`kAudioUnitProperty_SetRenderCallback`), or wire a source unit
+/// directly with this property. Logic Pro uses the latter; Ableton Live and
+/// most other hosts use the former. Supporting only callbacks therefore looks
+/// correct everywhere except Logic, where the input bus is never connected and
+/// the plug-in renders silence while reporting no error at all.
+///
+/// `au_sys` 0.1.1 defines the property ID but not this struct, so the
+/// AudioToolbox layout is mirrored here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AudioUnitConnection {
+    source_audio_unit: au::AudioUnit,
+    source_output_number: au::UInt32,
+    dest_input_number: au::UInt32,
+}
+
+// The pointer field is why this needs a manual `Send`. The host owns the
+// source unit and must disconnect before disposing it, so the pointer stays
+// valid for as long as we hold the connection; calling `AudioUnitRender` on it
+// from the audio thread is precisely the contract AU defines for a connection.
+unsafe impl Send for AudioUnitConnection {}
+
+#[link(name = "AudioToolbox", kind = "framework")]
+extern "C" {
+    /// Pull audio from a connected source unit. Not bound by `au_sys`, which
+    /// models the plug-in side — normally only ever called *into*. A connected
+    /// input is the one case where the wrapper has to call back out.
+    fn AudioUnitRender(
+        in_unit: au::AudioUnit,
+        io_action_flags: *mut au::AudioUnitRenderActionFlags,
+        in_time_stamp: *const au::AudioTimeStamp,
+        in_output_bus_number: au::UInt32,
+        in_number_frames: au::UInt32,
+        io_data: *mut au::AudioBufferList,
+    ) -> au::OSStatus;
+}
+
+/// Where `render` pulls main input from for this block.
+#[derive(Clone, Copy)]
+enum InputSource {
+    Callback(au::AURenderCallbackStruct),
+    Connection(AudioUnitConnection),
+}
+
 /// Type-erased slot that holds (or clears) the active GUI editor handle.
 ///
 /// The CocoaUI C-ABI callbacks (`nih_plug_au_cocoaui_spawn` /
@@ -171,6 +218,18 @@ pub struct Wrapper<P: AuPlugin> {
     /// `AURenderCallbackStruct` is `Copy`. Audio thread snapshots out under
     /// the mutex at the start of render and releases immediately.
     input_callback: Mutex<Option<au::AURenderCallbackStruct>>,
+
+    /// Source unit wired into the main input by the host via
+    /// `kAudioUnitProperty_MakeConnection` (element 0). Mutually exclusive
+    /// with `input_callback`: whichever the host installed last wins, and
+    /// clearing one clears the other so a stale wiring can never be pulled
+    /// after the host meant to replace it.
+    ///
+    /// Swapping the two is not atomic — they are separate mutexes, so a render
+    /// landing between the two updates uses the previous wiring for that one
+    /// block. That is harmless: the host is mid-reconnect, and both wirings
+    /// produce valid audio; the next block picks up the new one.
+    input_connection: Mutex<Option<AudioUnitConnection>>,
 
     /// Per-aux-input-port render callbacks (elements 1, 2, … of Input scope).
     /// Length equals `P::AUDIO_IO_LAYOUTS` max `aux_input_ports.len()`.
@@ -442,6 +501,7 @@ impl<P: AuPlugin> Wrapper<P> {
             _params_arc: params_arc,
             sink: ContextSink::new(),
             input_callback: Mutex::new(None),
+            input_connection: Mutex::new(None),
             aux_input_callbacks: {
                 let n_aux = P::AUDIO_IO_LAYOUTS
                     .iter()
@@ -899,6 +959,9 @@ impl<P: AuPlugin> Wrapper<P> {
             {
                 respond(std::mem::size_of::<au::AUChannelInfo>() as u32, false)
             }
+            au::kAudioUnitProperty_MakeConnection if scope == au::kAudioUnitScope_Input => {
+                respond(std::mem::size_of::<AudioUnitConnection>() as u32, true)
+            }
             au::kAudioUnitProperty_BypassEffect if scope == au::kAudioUnitScope_Global => {
                 respond(std::mem::size_of::<au::UInt32>() as u32, true)
             }
@@ -1304,6 +1367,39 @@ impl<P: AuPlugin> Wrapper<P> {
                 }
                 au::noErr
             }
+            au::kAudioUnitProperty_MakeConnection if scope == au::kAudioUnitScope_Input => {
+                payload!(AudioUnitConnection);
+                // Only the main input is connectable; aux inputs keep using
+                // callbacks. Saying so explicitly beats accepting a wiring we
+                // would then never pull from.
+                if element != 0 {
+                    return au::kAudioUnitErr_InvalidElement;
+                }
+                let conn = unsafe { *(in_data as *const AudioUnitConnection) };
+                // `conn.dest_input_number` is deliberately not consulted: AU's
+                // convention is that the property's element *is* the
+                // destination input, and that is what every caller sets. A
+                // host disagreeing with itself would be a host bug, and
+                // trusting the element keeps this consistent with how
+                // SetRenderCallback is dispatched right below.
+                //
+                // A null source unit means "disconnect".
+                let new_conn = if conn.source_audio_unit.is_null() {
+                    None
+                } else {
+                    Some(conn)
+                };
+                if let Ok(mut guard) = this.input_connection.lock() {
+                    *guard = new_conn;
+                }
+                // A connection replaces any callback the host installed
+                // earlier — and a disconnect must not silently fall back to
+                // one either.
+                if let Ok(mut guard) = this.input_callback.lock() {
+                    *guard = None;
+                }
+                au::noErr
+            }
             au::kAudioUnitProperty_SetRenderCallback => {
                 payload!(au::AURenderCallbackStruct);
                 let cb = unsafe { *(in_data as *const au::AURenderCallbackStruct) };
@@ -1311,6 +1407,11 @@ impl<P: AuPlugin> Wrapper<P> {
                 if element == 0 {
                     if let Ok(mut guard) = this.input_callback.lock() {
                         *guard = new_cb;
+                    }
+                    // Symmetric with MakeConnection above: installing a
+                    // callback supersedes a connected source.
+                    if let Ok(mut guard) = this.input_connection.lock() {
+                        *guard = None;
                     }
                 } else {
                     // elements 1+ are aux inputs
@@ -1475,15 +1576,30 @@ impl<P: AuPlugin> Wrapper<P> {
         // Snapshot the input callback under the mutex (cheap struct copy).
         // Released immediately so main-thread updates don't block render
         // for long. Lock-free swap is tracked in AUD-337.
-        let callback_snapshot = this.input_callback.lock().ok().and_then(|g| *g);
+        // The two wirings are kept mutually exclusive when the host sets them,
+        // so at most one of these is ever populated; the callback is preferred
+        // if both somehow are.
+        let input_source = this
+            .input_callback
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(InputSource::Callback)
+            .or_else(|| {
+                this.input_connection
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(InputSource::Connection)
+            });
 
         // SAFETY: render is not re-entered; we are the sole owner of
         // RenderState for the duration of this call.
         let rs = unsafe { this.render_state_mut() };
 
-        // ── 1) Pull input via host render callback (if registered). ──────
-        let mut pulled_from_callback = false;
-        if let Some(cb) = callback_snapshot {
+        // ── 1) Pull main input from whichever wiring the host installed. ──
+        let mut pulled_input = false;
+        if let Some(input_source) = input_source {
             let n_ch = rs.input_scratch.len();
             // Verify our pre-allocated BufferList scratch is big enough.
             // Should always hold since `provision` sized it for n_ch and
@@ -1517,21 +1633,42 @@ impl<P: AuPlugin> Wrapper<P> {
                     }
                 }
 
-                let ts: au::AudioTimeStamp = unsafe { mem::zeroed() };
                 let mut flags: au::AudioUnitRenderActionFlags = 0;
-                let proc = cb.inputProc.unwrap();
-                let status = unsafe {
-                    proc(
-                        cb.inputProcRefCon,
-                        &mut flags,
-                        &ts,
-                        0,
-                        in_number_frames,
-                        bl_ptr,
-                    )
+                let status = match input_source {
+                    InputSource::Callback(cb) => {
+                        // Unchanged from the callback-only implementation: a
+                        // zeroed timestamp. Hosts installing a callback drive
+                        // it from their own clock.
+                        let ts: au::AudioTimeStamp = unsafe { mem::zeroed() };
+                        let proc = cb.inputProc.unwrap();
+                        unsafe {
+                            proc(
+                                cb.inputProcRefCon,
+                                &mut flags,
+                                &ts,
+                                0,
+                                in_number_frames,
+                                bl_ptr,
+                            )
+                        }
+                    }
+                    // A connected source is a real AU, so it gets this block's
+                    // actual timestamp — anything reading `mSampleTime`
+                    // (generators, meters, tempo-synced sources) would
+                    // misbehave on a zeroed one.
+                    InputSource::Connection(conn) => unsafe {
+                        AudioUnitRender(
+                            conn.source_audio_unit,
+                            &mut flags,
+                            in_time_stamp,
+                            conn.source_output_number,
+                            in_number_frames,
+                            bl_ptr,
+                        )
+                    },
                 };
                 if status == au::noErr {
-                    pulled_from_callback = true;
+                    pulled_input = true;
                 }
             }
         }
@@ -1543,7 +1680,7 @@ impl<P: AuPlugin> Wrapper<P> {
 
         // If we pulled via callback, copy scratch → io_data so process()
         // sees the input audio.
-        if pulled_from_callback {
+        if pulled_input {
             for i in 0..n_buffers.min(rs.input_scratch.len()) {
                 let buf = unsafe { &mut *buffers_ptr.add(i) };
                 if buf.mData.is_null() || !buffer_fits_frames(buf, n_frames) {
@@ -1576,7 +1713,7 @@ impl<P: AuPlugin> Wrapper<P> {
                     // (silence) instead of an out-of-bounds host read.
                     continue;
                 }
-                if !pulled_from_callback {
+                if !pulled_input {
                     // No upstream input was pulled → present silence rather
                     // than stale scratch left over from a previous render.
                     scratch[..n_frames].fill(0.0);
