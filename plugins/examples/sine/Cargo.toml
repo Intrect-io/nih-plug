@@ -8,5 +8,9 @@ license = "ISC"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["au"]
+au = ["nih_plug/au"]
+
 [dependencies]
 nih_plug = { path = "../../../", features = ["assert_process_allocs"] }

@@ -1,5 +1,6 @@
 //! Minimal `InitContext` / `ProcessContext` / `GuiContext` impls for the AU wrapper.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -10,8 +11,8 @@ use crate::context::init::InitContext;
 use crate::context::process::{ProcessContext, Transport};
 use crate::context::PluginApi;
 use crate::params::internals::ParamPtr;
-use crate::prelude::PluginNoteEvent;
 use crate::plugin::Plugin;
+use crate::prelude::PluginNoteEvent;
 use crate::wrapper::state::PluginState;
 
 /// Cell shared between the wrapper and its `InitContext` / `ProcessContext`
@@ -52,13 +53,15 @@ impl<P: Plugin> InitContext<P> for AuInitContext<P> {
     }
 }
 
-pub(super) struct AuProcessContext<P: Plugin> {
+pub(super) struct AuProcessContext<'a, P: Plugin> {
     pub sink: Arc<ContextSink>,
     pub transport: Transport,
+    pub input_events: &'a mut VecDeque<PluginNoteEvent<P>>,
+    pub output_events: &'a mut VecDeque<PluginNoteEvent<P>>,
     pub _marker: std::marker::PhantomData<P>,
 }
 
-impl<P: Plugin> ProcessContext<P> for AuProcessContext<P> {
+impl<P: Plugin> ProcessContext<P> for AuProcessContext<'_, P> {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Au
     }
@@ -72,10 +75,16 @@ impl<P: Plugin> ProcessContext<P> for AuProcessContext<P> {
     }
 
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {
-        None
+        self.input_events.pop_front()
     }
 
-    fn send_event(&mut self, _event: PluginNoteEvent<P>) {}
+    fn send_event(&mut self, event: PluginNoteEvent<P>) {
+        if self.output_events.len() < self.output_events.capacity() {
+            self.output_events.push_back(event);
+        } else {
+            nih_debug_assert_failure!("The AU MIDI output queue is full, dropping event");
+        }
+    }
 
     fn set_latency_samples(&self, samples: u32) {
         self.sink.latency_samples.store(samples, Ordering::Relaxed);
@@ -136,8 +145,11 @@ impl<P: Plugin> GuiContext for AuGuiContext<P> {
             .find(|(p, _)| *p == param)
             .map(|(_, id)| id)
         {
-            let instance = self.inner.instance_bits.load(std::sync::atomic::Ordering::Acquire)
-                as usize as au::AudioUnit;
+            let instance = self
+                .inner
+                .instance_bits
+                .load(std::sync::atomic::Ordering::Acquire) as usize
+                as au::AudioUnit;
             let au_param = AUParameter {
                 mAudioUnit: instance,
                 mParameterID: param_id,
@@ -145,7 +157,9 @@ impl<P: Plugin> GuiContext for AuGuiContext<P> {
                 mElement: 0,
             };
             // SAFETY: AUParameterListenerNotify is safe from any thread.
-            unsafe { AUParameterListenerNotify(std::ptr::null_mut(), std::ptr::null_mut(), &au_param) };
+            unsafe {
+                AUParameterListenerNotify(std::ptr::null_mut(), std::ptr::null_mut(), &au_param)
+            };
         }
     }
 
@@ -159,9 +173,7 @@ impl<P: Plugin> GuiContext for AuGuiContext<P> {
         unsafe {
             crate::wrapper::state::serialize_object::<P>(
                 params_arc.clone(),
-                param_map
-                    .iter()
-                    .map(|(id_str, ptr, _group)| (id_str, *ptr)),
+                param_map.iter().map(|(id_str, ptr, _group)| (id_str, *ptr)),
             )
         }
     }
@@ -176,12 +188,7 @@ impl<P: Plugin> GuiContext for AuGuiContext<P> {
                 .map(|(_, ptr, _)| *ptr)
         };
         unsafe {
-            crate::wrapper::state::deserialize_object::<P>(
-                &mut state,
-                params_arc,
-                getter,
-                None,
-            );
+            crate::wrapper::state::deserialize_object::<P>(&mut state, params_arc, getter, None);
         }
     }
 }

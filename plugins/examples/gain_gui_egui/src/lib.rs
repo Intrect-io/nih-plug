@@ -241,7 +241,7 @@ impl Vst3Plugin for Gain {
         &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
 }
 
-#[cfg(feature = "au")]
+#[cfg(all(feature = "au", target_os = "macos"))]
 impl AuPlugin for Gain {
     const AU_TYPE: [u8; 4] = *b"aufx";
     const AU_SUBTYPE: [u8; 4] = *b"GnEG";
@@ -250,5 +250,5 @@ impl AuPlugin for Gain {
 
 nih_export_clap!(Gain);
 nih_export_vst3!(Gain);
-#[cfg(feature = "au")]
+#[cfg(all(feature = "au", target_os = "macos"))]
 nih_export_au!(Gain);

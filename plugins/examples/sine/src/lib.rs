@@ -120,6 +120,7 @@ impl Plugin for Sine {
     ];
 
     const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+    const MIDI_OUTPUT: MidiConfig = MidiConfig::Basic;
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
@@ -165,6 +166,10 @@ impl Plugin for Sine {
                     if event.timing() > sample_id as u32 {
                         break;
                     }
+
+                    // Echo the input so this example also exercises plugins with MIDI output.
+                    // The AU smoke test validates the host callback and sample offset end to end.
+                    context.send_event(event);
 
                     match event {
                         NoteEvent::NoteOn { note, velocity, .. } => {
@@ -226,5 +231,15 @@ impl Vst3Plugin for Sine {
     ];
 }
 
+#[cfg(all(feature = "au", target_os = "macos"))]
+impl AuPlugin for Sine {
+    // Music device with no audio input bus. These values match bundler.toml.
+    const AU_TYPE: [u8; 4] = *b"aumu";
+    const AU_SUBTYPE: [u8; 4] = *b"MPsn";
+    const AU_MANUFACTURER: [u8; 4] = *b"MoiP";
+}
+
 nih_export_clap!(Sine);
 nih_export_vst3!(Sine);
+#[cfg(all(feature = "au", target_os = "macos"))]
+nih_export_au!(Sine);

@@ -7,6 +7,7 @@
 
 mod context;
 mod factory;
+mod midi;
 mod wrapper;
 
 pub use factory::fourcc;
