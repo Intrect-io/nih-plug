@@ -8,7 +8,7 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use au_sys as au;
@@ -89,49 +89,105 @@ unsafe impl Sync for AuMidiOutputCallbackStruct {}
 
 /// Lock-free render-side storage for the host's MIDI output callback.
 ///
-/// Property writes happen on a control thread and may allocate. Each installed
-/// record remains owned by `records` until the AudioUnit is destroyed, so the
-/// render thread can atomically load and copy a stable record without a mutex,
-/// reference-count operation, or reclamation race. Hosts retain responsibility
-/// for keeping the opaque `user_data` target alive while callbacks may be in
-/// flight, as required by the AU callback contract.
+/// Property writes happen on a control thread and may allocate or wait. The
+/// render thread announces the brief pointer-copy section with a reader count,
+/// and the serialized writer only reclaims the replaced immutable record once
+/// that count reaches zero. The render path therefore never locks, allocates,
+/// waits, or performs reference counting. Hosts retain responsibility for
+/// keeping the opaque `user_data` target alive while callbacks may be in flight,
+/// as required by the AU callback contract.
+struct MidiOutputCallbackRecord {
+    callback: AuMidiOutputCallbackStruct,
+    #[cfg(test)]
+    live_records: std::sync::Arc<AtomicUsize>,
+}
+
+impl Drop for MidiOutputCallbackRecord {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.live_records.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub(super) struct MidiOutputCallbackSlot {
-    current: AtomicPtr<AuMidiOutputCallbackStruct>,
-    records: Mutex<Vec<Box<AuMidiOutputCallbackStruct>>>,
+    current: AtomicPtr<MidiOutputCallbackRecord>,
+    readers: AtomicUsize,
+    writer: Mutex<()>,
+    #[cfg(test)]
+    live_records: std::sync::Arc<AtomicUsize>,
 }
 
 impl MidiOutputCallbackSlot {
     pub fn new() -> Self {
         Self {
             current: AtomicPtr::new(std::ptr::null_mut()),
-            records: Mutex::new(Vec::new()),
+            readers: AtomicUsize::new(0),
+            writer: Mutex::new(()),
+            #[cfg(test)]
+            live_records: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn store(&self, callback: Option<AuMidiOutputCallbackStruct>) -> Result<(), ()> {
-        let Some(callback) = callback.filter(|callback| callback.callback.is_some()) else {
-            self.current.store(std::ptr::null_mut(), Ordering::Release);
-            return Ok(());
+        let _writer = self.writer.lock().map_err(|_| ())?;
+        let replacement = match callback.filter(|callback| callback.callback.is_some()) {
+            Some(callback) => {
+                let record = Box::new(MidiOutputCallbackRecord {
+                    callback,
+                    #[cfg(test)]
+                    live_records: self.live_records.clone(),
+                });
+                #[cfg(test)]
+                self.live_records.fetch_add(1, Ordering::SeqCst);
+                Box::into_raw(record)
+            }
+            None => std::ptr::null_mut(),
         };
 
-        let record = Box::new(callback);
-        let record_ptr =
-            record.as_ref() as *const AuMidiOutputCallbackStruct as *mut AuMidiOutputCallbackStruct;
-        let mut records = self.records.lock().map_err(|_| ())?;
-        records.push(record);
-        self.current.store(record_ptr, Ordering::Release);
+        let retired = self.current.swap(replacement, Ordering::SeqCst);
+        while self.readers.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+
+        if !retired.is_null() {
+            // SAFETY: writers are serialized, and the reader count reached
+            // zero after this record stopped being current. A later reader can
+            // therefore only observe `replacement`.
+            unsafe { drop(Box::from_raw(retired)) };
+        }
+
         Ok(())
     }
 
     #[inline]
     pub fn load(&self) -> Option<AuMidiOutputCallbackStruct> {
-        let record = self.current.load(Ordering::Acquire);
-        if record.is_null() {
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        let record = self.current.load(Ordering::SeqCst);
+        let callback = if record.is_null() {
             None
         } else {
-            // SAFETY: records are never mutated or reclaimed until this slot is
-            // dropped, and AU teardown is serialized against render.
-            Some(unsafe { *record })
+            // SAFETY: the reader count prevents the writer from reclaiming the
+            // immutable record until after this copy has completed.
+            Some(unsafe { (*record).callback })
+        };
+        self.readers.fetch_sub(1, Ordering::SeqCst);
+        callback
+    }
+
+    #[cfg(test)]
+    fn live_record_count(&self) -> usize {
+        self.live_records.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MidiOutputCallbackSlot {
+    fn drop(&mut self) {
+        debug_assert_eq!(*self.readers.get_mut(), 0);
+        let record = *self.current.get_mut();
+        if !record.is_null() {
+            // SAFETY: `&mut self` proves that no safe reader or writer can still
+            // access this slot. AU teardown is also serialized against render.
+            unsafe { drop(Box::from_raw(record)) };
         }
     }
 }
@@ -918,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn midi_output_callback_replacement_never_blocks_or_tears_render_loads() {
+    fn midi_output_callback_replacement_reclaims_records_without_blocking_render_loads() {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use std::thread;
 
@@ -955,7 +1011,9 @@ mod tests {
         writer.join().unwrap();
 
         assert_eq!(slot.load().unwrap().user_data as usize, UPDATE_COUNT);
+        assert_eq!(slot.live_record_count(), 1);
         slot.store(None).unwrap();
         assert!(slot.load().is_none());
+        assert_eq!(slot.live_record_count(), 0);
     }
 }

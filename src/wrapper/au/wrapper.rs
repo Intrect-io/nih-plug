@@ -31,8 +31,8 @@
 //!
 //!   3. **main↔audio shared state** — existing audio-input wiring is protected
 //!      by a mutex and snapshotted into a local `Copy`. MIDI output callbacks
-//!      use an atomic pointer to immutable, lifetime-stable records so their
-//!      render path never blocks.
+//!      use an atomic pointer plus reader-count reclamation so their render path
+//!      never blocks while replaced callback records are reclaimed promptly.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -252,8 +252,8 @@ pub struct Wrapper<P: AuPlugin> {
     midi_input: midi::MidiInputState<P>,
 
     /// Host callback installed through `kAudioUnitProperty_MIDIOutputCallback`.
-    /// Loads from render are lock-free; retired records remain stable until
-    /// this AudioUnit is destroyed.
+    /// Loads from render are lock-free; the control-thread writer waits for the
+    /// brief pointer-copy section before reclaiming a retired record.
     midi_output_callback: midi::MidiOutputCallbackSlot,
 
     /// Per-aux-input-port render callbacks (elements 1, 2, … of Input scope).
