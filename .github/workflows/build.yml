@@ -1,19 +1,14 @@
-name: Automated Builds
+name: Integration Builds
 
 on:
   push:
     branches:
-      - '**'
-    tags:
-      - '*'
-  pull_request:
-    branches:
       - master
   workflow_dispatch:
 
-# Packaging a commit that has already been superseded wastes a full macOS
-# universal build. Tags get their own group, so release builds are never
-# cancelled by a subsequent branch push.
+# The real PR contract is covered by Tests (including a macOS AU host smoke).
+# This full example-package matrix is an integration check for master or an
+# operator-requested diagnostic, not a per-feature-branch artifact factory.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -107,17 +102,21 @@ jobs:
           fi
 
       - name: Determine build archive name
+        if: github.event_name == 'workflow_dispatch'
         run: |
           # Windows (usually) doesn't like colons in file names
           echo "ARCHIVE_NAME=nih-plugs-$(date -u +"%Y-%m-%d-%H%m%S")-${{ matrix.name }}" >> "$GITHUB_ENV"
       - name: Move all packaged plugin into a directory
+        if: github.event_name == 'workflow_dispatch'
         run: |
           # GitHub Action strips the top level directory, great, have another one
           mkdir -p "$ARCHIVE_NAME/$ARCHIVE_NAME"
           mv target/bundled/* "$ARCHIVE_NAME/$ARCHIVE_NAME"
       - name: Add an OS-specific readme file with installation instructions
+        if: github.event_name == 'workflow_dispatch'
         run: cp ".github/workflows/readme-${{ runner.os }}.txt" "$ARCHIVE_NAME/$ARCHIVE_NAME/README.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'workflow_dispatch'
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: ${{ env.ARCHIVE_NAME }}

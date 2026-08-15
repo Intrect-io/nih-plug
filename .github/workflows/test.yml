@@ -2,9 +2,10 @@ name: Tests
 
 on:
   push:
-  pull_request:
     branches:
       - master
+  pull_request:
+  workflow_dispatch:
 
 # A push that supersedes an in-flight run makes that run's result worthless, and
 # the macOS jobs here are slow enough that queued-but-stale runs delay the ones
@@ -97,6 +98,15 @@ jobs:
       - name: Run the Audio Unit MIDI host smoke test
         if: startsWith(matrix.os, 'macos')
         run: scripts/au_midi_smoke.sh
+
+      # Logic's input callback returns silence if the wrapper drops the render
+      # timestamp, and it may replace AudioBufferList mData pointers instead of
+      # writing into the caller's scratch buffers. Both previously yielded
+      # noErr plus silent output, so a normal AU instantiate or MIDI smoke test
+      # cannot catch this regression.
+      - name: Run the Logic-style Audio Unit input regression test
+        if: startsWith(matrix.os, 'macos')
+        run: scripts/au_logic_input_smoke.sh
 
       # `nih_debug_assert!` becomes a panicking `debug_assert!` under `cfg(test)`,
       # so the release behaviour of contract-violating paths is only reachable

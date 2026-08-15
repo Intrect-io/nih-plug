@@ -1,9 +1,11 @@
-name: Docs
+name: Documentation
 
 on:
   push:
     branches:
       - master
+  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -74,17 +76,3 @@ jobs:
           <meta charset="utf-8">
           <meta http-equiv="refresh" content="0; url=nih_plug">
           EOF
-      - name: Deploy to GitHub Pages
-        # The deploy target and its SSH key belong to upstream. On a fork this
-        # step can only fail — the secret is not there — so building the docs
-        # stays useful as a check while publishing is skipped.
-        if: github.repository == 'robbert-vdh/nih-plug'
-        uses: JamesIves/github-pages-deploy-action@360c8e75d0ee81732d0a5675c71e51b569df2ee8 # v4.3.0
-        with:
-          branch: gh-pages
-          folder: target/doc
-
-          # Having the gh-pages branch on this repository adds a whole bunch of
-          # noise to the GitHub feed if you follow this repo
-          repository-name: robbert-vdh/nih-plug-docs
-          ssh-key: ${{ secrets.DOCS_DEPLOY_KEY }}

@@ -74,10 +74,10 @@ use super::midi;
 ///
 /// AU v2 gives a host two ways to feed an effect's input bus: install a render
 /// callback (`kAudioUnitProperty_SetRenderCallback`), or wire a source unit
-/// directly with this property. Logic Pro uses the latter; Ableton Live and
-/// most other hosts use the former. Supporting only callbacks therefore looks
-/// correct everywhere except Logic, where the input bus is never connected and
-/// the plug-in renders silence while reporting no error at all.
+/// directly with this property. These are separate host contracts and both
+/// paths must work. The Logic Pro silence regression originated in the callback
+/// pull path (timestamp forwarding and `mData` pointer replacement), not in
+/// `MakeConnection`; this struct implements the independent connection path.
 ///
 /// `au_sys` 0.1.1 defines the property ID but not this struct, so the
 /// AudioToolbox layout is mirrored here.
