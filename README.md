@@ -144,7 +144,9 @@ Scroll down for more information on the underlying plugin framework.
     management.
 - Full support for receiving and outputting both modern polyphonic note
   expression events as well as MIDI CCs, channel pressure, and pitch bend for
-  CLAP and VST3.
+  CLAP and VST3. The macOS AUv2 wrapper supports MusicDevice MIDI input,
+  sample-offset MIDI 1.0 output callbacks, SysEx, and the extended Start/Stop
+  Note API.
   - MIDI SysEx is also supported. Plugins can define their own structs or sum
     types to wrap around those messages so they don't need to interact with raw
     byte buffers in the process function.
@@ -182,12 +184,19 @@ cargo xtask bundle gain --release
 
 ### Plugin formats
 
-NIH-plug can currently export VST3 and
-[CLAP](https://github.com/free-audio/clap) plugins. Exporting a specific plugin
-format for a plugin is as simple as calling the `nih_export_<format>!(Foo);`
-macro. The `cargo xtask bundle` command will detect which plugin formats your
-plugin supports and create the appropriate bundles accordingly, even when cross
-compiling.
+NIH-plug can currently export VST3, [CLAP](https://github.com/free-audio/clap),
+and macOS Audio Unit v2 plugins. Exporting a specific plugin format is as simple
+as calling the `nih_export_<format>!(Foo);` macro. The `cargo xtask bundle`
+command detects which formats a plugin supports and creates the appropriate
+bundles, including `.component` bundles on macOS.
+
+An Audio Unit implements `AuPlugin` with its type, subtype, and manufacturer
+four-character codes, calls `nih_export_au!(Foo)`, and adds the matching
+`[package.au]` metadata to `bundler.toml`. Effects (`aufx`), music effects
+(`aumf`), instruments (`aumu`), and generators (`augn`) can use the same audio,
+parameter, state, editor, and MIDI APIs as the other wrappers. See the
+[`sine`](plugins/examples/sine) instrument and [`gain`](plugins/examples/gain)
+effect examples.
 
 ### Example plugins
 
@@ -210,6 +219,9 @@ examples.
 - [**midi_inverter**](plugins/examples/midi_inverter) takes note/MIDI events and
   flips around the note, channel, expression, pressure, and CC values. This
   example demonstrates how to receive and output those events.
+- [**sine**](plugins/examples/sine) is a mono/stereo test-tone instrument that
+  demonstrates Audio Unit music-device input and MIDI output alongside its CLAP
+  and VST3 exports.
 - [**poly_mod_synth**](plugins/examples/poly_mod_synth) is a simple polyphonic
   synthesizer with support for polyphonic modulation in supported CLAP hosts.
   This demonstrates how polyphonic modulation can be used in NIH-plug.

@@ -6,10 +6,28 @@ on:
     branches:
       - master
 
+# A push that supersedes an in-flight run makes that run's result worthless, and
+# the macOS jobs here are slow enough that queued-but-stale runs delay the ones
+# somebody is actually waiting on.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 defaults:
   run:
     # This otherwise gets run under dash which does not support brace expansion
     shell: bash
+
+env:
+  # `simd` requires a nightly compiler, and `portable_simd` is not a stable API:
+  # `std::simd::{LaneCount, SupportedLaneCount}` no longer resolve on current
+  # nightlies, which broke every job in this workflow. Pin the toolchain so the
+  # build is reproducible, and bump this deliberately once the SIMD adapters in
+  # `src/buffer/` have been ported to the newer API.
+  NIGHTLY_TOOLCHAIN: nightly-2025-01-01
 
 jobs:
   test:
@@ -19,7 +37,7 @@ jobs:
     name: Build and test all components
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Needed for git-describe to do anything useful
       - name: Fetch all git history
         run: git fetch --force --prune --tags --unshallow
@@ -30,7 +48,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libgl-dev libjack-dev libx11-xcb-dev  libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - uses: actions/cache@v4
+      # The cache key used to be `${{ matrix.name }}-${{ matrix.cross-target }}`,
+      # neither of which exists in this workflow's matrix, so all three runners
+      # shared the single key `-` and kept overwriting each other's caches with
+      # artifacts for the wrong platform.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         # FIXME: Caching `target/` causes the Windows runner to blow up after some time
         if: startsWith(matrix.os, 'windows')
         with:
@@ -38,8 +60,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ matrix.name }}-${{ matrix.cross-target }}
-      - uses: actions/cache@v4
+          key: test-${{ matrix.os }}-${{ env.NIGHTLY_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-${{ matrix.os }}-${{ env.NIGHTLY_TOOLCHAIN }}-
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: "!startsWith(matrix.os, 'windows')"
         with:
           path: |
@@ -47,23 +70,50 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ matrix.name }}-${{ matrix.cross-target }}
+          key: test-${{ matrix.os }}-${{ env.NIGHTLY_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-${{ matrix.os }}-${{ env.NIGHTLY_TOOLCHAIN }}-
 
       - name: Set up Rust toolchain
         # Needed for SIMD
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       - name: Run the tests
         # Don't use --all-features as that will enable a whole bunch of
         # conflicting iced features. `--locked` ensures that the lockfile is up
         # to date. We only really need this in one of the builds.
         run: cargo test --locked --workspace --features "simd,standalone,zstd"
 
+      # The Audio Unit wrapper is macOS-only, so the workspace run above never
+      # compiles it. Without this step the AU code — the part of this fork that
+      # upstream does not have — has no CI coverage at all.
+      - name: Test the Audio Unit wrapper
+        if: startsWith(matrix.os, 'macos')
+        run: cargo test --locked --features "au,vst3,zstd"
+
+      # Unit tests cover the selector and packet conversion edge cases. This
+      # also loads the generated aumu through AudioComponent, sends MIDI into
+      # it, renders non-silent audio, and receives the MIDI output callback.
+      - name: Run the Audio Unit MIDI host smoke test
+        if: startsWith(matrix.os, 'macos')
+        run: scripts/au_midi_smoke.sh
+
+      # `nih_debug_assert!` becomes a panicking `debug_assert!` under `cfg(test)`,
+      # so the release behaviour of contract-violating paths is only reachable
+      # from `#[cfg(not(debug_assertions))]` tests. A different set of tests runs
+      # here than in the debug run above; that asymmetry is intentional.
+      - name: Run the release-only tests
+        # These tests are platform-independent. Running them on every matrix
+        # member tripled their cost without increasing coverage.
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo test --locked --release --lib --features "standalone,zstd"
+
   # This makes sure that NIH-plug can be compiled without VST3 support
   build-without-vst3:
     name: Build NIH-plug without VST3 support
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Fetch all git history
         run: git fetch --force --prune --tags --unshallow
 
@@ -72,17 +122,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libgl-dev libjack-dev libx11-xcb-dev  libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: build-without-vst3-ubuntu
+          key: build-without-vst3-ubuntu-${{ env.NIGHTLY_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-without-vst3-ubuntu-${{ env.NIGHTLY_TOOLCHAIN }}-
 
       - name: Set up Rust toolchain
         # Needed for SIMD
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       - name: Run the tests
         run: cargo build --no-default-features

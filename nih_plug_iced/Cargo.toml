@@ -59,14 +59,14 @@ smol = ["iced_baseview/smol"]
 nih_plug = { path = "..", default-features = false }
 nih_plug_assets = { git = "https://github.com/robbert-vdh/nih_plug_assets.git" }
 
-# The currently targeted version of baseview uses a different version of
-# `raw_window_handle` than NIH-plug, so we need to manually convert between them
-raw-window-handle = "0.4"
+# Keep this aligned with the patched baseview and iced_baseview revisions.
+raw-window-handle = "0.5"
 
 atomic_refcell = "0.1"
 baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "1d9806d5bd92275d0d8142d9c9c90198757b9b25" }
 crossbeam = "0.8"
-# This targets iced 0.4
-iced_baseview = { git = "https://github.com/robbert-vdh/iced_baseview.git", branch = "feature/update-baseview", default-features = false }
+# This targets iced 0.4 and carries the raw-window-handle 0.5 compatibility
+# needed by the pinned Intrect baseview fork.
+iced_baseview = { git = "https://github.com/Intrect-io/iced_baseview.git", rev = "7f1cedb96d5825626abafdab82d8e2940ff5b39c", default-features = false }
 # To make the state persistable
 serde = { version = "1.0", features = ["derive"] }

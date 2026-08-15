@@ -2816,7 +2816,7 @@ dependencies = [
 [[package]]
 name = "iced_baseview"
 version = "0.0.3"
-source = "git+https://github.com/robbert-vdh/iced_baseview.git?branch=feature/update-baseview#df3a852a15cf0e9fcc8d2b32f5718e56780beaf3"
+source = "git+https://github.com/Intrect-io/iced_baseview.git?rev=7f1cedb96d5825626abafdab82d8e2940ff5b39c#7f1cedb96d5825626abafdab82d8e2940ff5b39c"
 dependencies = [
  "baseview",
  "copypasta 0.7.1",
@@ -2826,7 +2826,7 @@ dependencies = [
  "iced_graphics",
  "iced_native",
  "keyboard-types",
- "raw-window-handle 0.4.3",
+ "raw-window-handle 0.5.2",
 ]
 
 [[package]]
@@ -3660,7 +3660,7 @@ dependencies = [
  "iced_baseview",
  "nih_plug",
  "nih_plug_assets",
- "raw-window-handle 0.4.3",
+ "raw-window-handle 0.5.2",
  "serde",
 ]
 

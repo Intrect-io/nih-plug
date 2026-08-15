@@ -29,9 +29,10 @@
 //!      only ever touched from `render()`. AU guarantees render is not
 //!      re-entered, so a `&mut` borrow inside that scope is sound.
 //!
-//!   3. **main↔audio shared state** — `input_callback`. `Mutex<Option<…>>`;
-//!      main thread updates rarely, audio thread snapshots into a local `Copy`
-//!      at the top of `render()`. The mutex is held only for the snapshot.
+//!   3. **main↔audio shared state** — existing audio-input wiring is protected
+//!      by a mutex and snapshotted into a local `Copy`. MIDI output callbacks
+//!      use an atomic pointer plus reader-count reclamation so their render path
+//!      never blocks while replaced callback records are reclaimed promptly.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -40,10 +41,11 @@ use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroU32;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use au_sys as au;
+use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
@@ -56,11 +58,17 @@ use crate::editor::Editor;
 use crate::params::internals::ParamPtr;
 use crate::params::{ParamFlags, Params};
 use crate::plugin::au::AuPlugin;
-use crate::prelude::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
+use crate::prelude::{
+    AudioIOLayout, AuxiliaryBuffers, BufferConfig, MidiConfig, ProcessMode, ProcessStatus,
+};
 use crate::wrapper::state::{self, PluginState};
 
-use super::context::{AUParameter, AUParameterListenerNotify, AuGuiContextInner, AuInitContext, AuProcessContext, ContextSink};
+use super::context::{
+    AUParameter, AUParameterListenerNotify, AuGuiContextInner, AuInitContext, AuProcessContext,
+    ContextSink,
+};
 use super::factory::fourcc;
+use super::midi;
 
 /// Payload of `kAudioUnitProperty_MakeConnection`.
 ///
@@ -161,6 +169,14 @@ pub struct Wrapper<P: AuPlugin> {
     /// Latency reported via `kAudioUnitProperty_Latency`. f64 bits.
     latency_seconds_bits: AtomicU64,
 
+    /// Tail duration reported by the most recent `Plugin::process()` call.
+    /// Stored as f64 bits so the render thread can update it lock-free.
+    tail_seconds_bits: AtomicU64,
+
+    /// OSStatus returned by the most recent failed render, or `noErr` after a
+    /// successful render.
+    last_render_error: AtomicI32,
+
     /// Whether `Plugin::initialize()` has run successfully since the last
     /// `Uninitialize` / first construction. Render is a no-op when false.
     initialized: AtomicBool,
@@ -231,6 +247,15 @@ pub struct Wrapper<P: AuPlugin> {
     /// produce valid audio; the next block picks up the new one.
     input_connection: Mutex<Option<AudioUnitConnection>>,
 
+    /// Bounded queue populated by the MusicDevice selector calls and drained
+    /// once at the start of each render block.
+    midi_input: midi::MidiInputState<P>,
+
+    /// Host callback installed through `kAudioUnitProperty_MIDIOutputCallback`.
+    /// Loads from render are lock-free; the control-thread writer waits for the
+    /// brief pointer-copy section before reclaiming a retired record.
+    midi_output_callback: midi::MidiOutputCallbackSlot,
+
     /// Per-aux-input-port render callbacks (elements 1, 2, … of Input scope).
     /// Length equals `P::AUDIO_IO_LAYOUTS` max `aux_input_ports.len()`.
     /// Each `Mutex` is independent so the audio thread can snapshot without
@@ -243,7 +268,7 @@ pub struct Wrapper<P: AuPlugin> {
     ///
     /// `UnsafeCell` because only `render()` touches it after `Initialize`,
     /// and AU does not re-enter render.
-    render_state: UnsafeCell<RenderState>,
+    render_state: UnsafeCell<RenderState<P>>,
 
     /// The plugin's `Editor` instance, if the plugin provides one.
     /// Created once in `new()` and never replaced.
@@ -263,7 +288,7 @@ pub struct Wrapper<P: AuPlugin> {
 /// All audio-thread mutable state. Reused across render calls and grown
 /// only inside `Initialize` (main thread, before render is allowed). The
 /// render hot path only writes existing slots — no allocation.
-struct RenderState {
+struct RenderState<P: AuPlugin> {
     /// Per-channel scratch for input pulled via the host's render callback.
     /// One inner vec per channel, each pre-sized to `max_frames_per_slice`.
     input_scratch: Vec<Vec<f32>>,
@@ -295,9 +320,12 @@ struct RenderState {
     /// Per-aux-port `Buffer<'static>` whose slot vectors are pre-grown in
     /// `provision`. Slices are cleared after each `render()` call.
     aux_buffers: Vec<Buffer<'static>>,
+
+    /// Preallocated MIDI input/output queues and MIDIPacketList storage.
+    midi: midi::MidiRenderState<P>,
 }
 
-impl RenderState {
+impl<P: AuPlugin> RenderState<P> {
     fn new() -> Self {
         Self {
             input_scratch: Vec::new(),
@@ -306,6 +334,7 @@ impl RenderState {
             aux_input_scratch: Vec::new(),
             aux_bl_storages: Vec::new(),
             aux_buffers: Vec::new(),
+            midi: midi::MidiRenderState::new(),
         }
     }
 
@@ -348,7 +377,8 @@ impl RenderState {
         for &port_ch in aux_ports {
             let n_ch = port_ch.get() as usize;
             // Per-channel scratch frames.
-            self.aux_input_scratch.push(vec![vec![0.0_f32; max_frames]; n_ch]);
+            self.aux_input_scratch
+                .push(vec![vec![0.0_f32; max_frames]; n_ch]);
             // BufferList backing storage.
             let words = bl_byte_size(n_ch).div_ceil(mem::size_of::<u64>());
             self.aux_bl_storages.push(vec![0u64; words]);
@@ -408,6 +438,8 @@ const NOTIFY_LATENCY: u32 = 1 << 0;
 const NOTIFY_STREAM_FORMAT: u32 = 1 << 1;
 const NOTIFY_BYPASS_EFFECT: u32 = 1 << 2;
 const NOTIFY_MAX_FRAMES_PER_SLICE: u32 = 1 << 3;
+const NOTIFY_TAIL_TIME: u32 = 1 << 4;
+const NOTIFY_LAST_RENDER_ERROR: u32 = 1 << 5;
 
 /// `Send` + `Sync` justification:
 ///
@@ -463,7 +495,9 @@ impl<P: AuPlugin> Wrapper<P> {
             execute_background: Arc::new(|_| {}),
             execute_gui: Arc::new(|_| {}),
         };
-        let editor = plugin.editor(async_executor).map(|e| Arc::new(Mutex::new(e)));
+        let editor = plugin
+            .editor(async_executor)
+            .map(|e| Arc::new(Mutex::new(e)));
 
         // `gui_context_inner` is created here with instance = null; the
         // real AudioUnit handle is filled in by `open()`. Because
@@ -492,6 +526,8 @@ impl<P: AuPlugin> Wrapper<P> {
             max_frames_per_slice: AtomicU32::new(1024),
             n_channels: AtomicU32::new(2),
             latency_seconds_bits: AtomicU64::new(pack_f64(0.0)),
+            tail_seconds_bits: AtomicU64::new(pack_f64(0.0)),
+            last_render_error: AtomicI32::new(au::noErr),
             initialized: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
             bypass_param_idx,
@@ -502,6 +538,8 @@ impl<P: AuPlugin> Wrapper<P> {
             sink: ContextSink::new(),
             input_callback: Mutex::new(None),
             input_connection: Mutex::new(None),
+            midi_input: midi::MidiInputState::new(),
+            midi_output_callback: midi::MidiOutputCallbackSlot::new(),
             aux_input_callbacks: {
                 let n_aux = P::AUDIO_IO_LAYOUTS
                     .iter()
@@ -548,6 +586,26 @@ impl<P: AuPlugin> Wrapper<P> {
     fn set_latency_seconds(&self, l: f64) {
         self.latency_seconds_bits
             .store(pack_f64(l), Ordering::Release);
+    }
+    #[inline]
+    fn tail_seconds(&self) -> f64 {
+        unpack_f64(self.tail_seconds_bits.load(Ordering::Acquire))
+    }
+    #[inline]
+    fn set_tail_seconds(&self, seconds: f64) {
+        let previous = self
+            .tail_seconds_bits
+            .swap(pack_f64(seconds), Ordering::AcqRel);
+        if previous != pack_f64(seconds) {
+            self.mark_pending(NOTIFY_TAIL_TIME);
+        }
+    }
+    #[inline]
+    fn set_last_render_error(&self, status: au::OSStatus) {
+        let previous = self.last_render_error.swap(status, Ordering::AcqRel);
+        if status != au::noErr && previous != status {
+            self.mark_pending(NOTIFY_LAST_RENDER_ERROR);
+        }
     }
     #[inline]
     fn n_channels(&self) -> u32 {
@@ -602,15 +660,33 @@ impl<P: AuPlugin> Wrapper<P> {
             fire(au::kAudioUnitProperty_Latency, au::kAudioUnitScope_Global);
         }
         if pending & NOTIFY_STREAM_FORMAT != 0 {
-            fire(au::kAudioUnitProperty_StreamFormat, au::kAudioUnitScope_Output);
-            fire(au::kAudioUnitProperty_StreamFormat, au::kAudioUnitScope_Input);
+            fire(
+                au::kAudioUnitProperty_StreamFormat,
+                au::kAudioUnitScope_Output,
+            );
+            fire(
+                au::kAudioUnitProperty_StreamFormat,
+                au::kAudioUnitScope_Input,
+            );
         }
         if pending & NOTIFY_BYPASS_EFFECT != 0 {
-            fire(au::kAudioUnitProperty_BypassEffect, au::kAudioUnitScope_Global);
+            fire(
+                au::kAudioUnitProperty_BypassEffect,
+                au::kAudioUnitScope_Global,
+            );
         }
         if pending & NOTIFY_MAX_FRAMES_PER_SLICE != 0 {
             fire(
                 au::kAudioUnitProperty_MaximumFramesPerSlice,
+                au::kAudioUnitScope_Global,
+            );
+        }
+        if pending & NOTIFY_TAIL_TIME != 0 {
+            fire(au::kAudioUnitProperty_TailTime, au::kAudioUnitScope_Global);
+        }
+        if pending & NOTIFY_LAST_RENDER_ERROR != 0 {
+            fire(
+                au::kAudioUnitProperty_LastRenderError,
                 au::kAudioUnitScope_Global,
             );
         }
@@ -631,7 +707,7 @@ impl<P: AuPlugin> Wrapper<P> {
     /// `RenderState` for in-place mutation by the audio thread.
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    unsafe fn render_state_mut(&self) -> &mut RenderState {
+    unsafe fn render_state_mut(&self) -> &mut RenderState<P> {
         unsafe { &mut *self.render_state.get() }
     }
 
@@ -653,6 +729,12 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn close(self_ptr: *mut c_void) -> au::OSStatus {
         // Drop editor handle before the wrapper is destroyed.
         let this = unsafe { Self::from_ptr(self_ptr) };
+        if this.initialized.swap(false, Ordering::AcqRel) {
+            // Hosts are allowed to dispose an initialized AudioUnit without a
+            // preceding Uninitialize call. Keep Plugin's lifecycle balanced.
+            unsafe { this.plugin_mut() }.deactivate();
+        }
+        this.midi_input.clear();
         let instance = this.instance.swap(0, Ordering::AcqRel) as usize as *mut c_void;
         cocoaui::close_audio_unit_view(instance);
         this.editor_handle.clear();
@@ -671,9 +753,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 std::mem::transmute::<au::AudioUnitUninitializeProc, _>(Self::uninitialize)
             },
             au::kAudioUnitGetPropertyInfoSelect => unsafe {
-                std::mem::transmute::<au::AudioUnitGetPropertyInfoProc, _>(
-                    Self::get_property_info,
-                )
+                std::mem::transmute::<au::AudioUnitGetPropertyInfoProc, _>(Self::get_property_info)
             },
             au::kAudioUnitGetPropertySelect => unsafe {
                 std::mem::transmute::<au::AudioUnitGetPropertyProc, _>(Self::get_property)
@@ -703,6 +783,24 @@ impl<P: AuPlugin> Wrapper<P> {
                     Self::remove_property_listener_with_user_data,
                 )
             },
+            midi::MUSIC_DEVICE_MIDI_EVENT_SELECT if P::MIDI_INPUT >= MidiConfig::Basic => unsafe {
+                std::mem::transmute::<midi::MusicDeviceMidiEventProc, _>(
+                    Self::music_device_midi_event,
+                )
+            },
+            midi::MUSIC_DEVICE_SYS_EX_SELECT if P::MIDI_INPUT >= MidiConfig::Basic => unsafe {
+                std::mem::transmute::<midi::MusicDeviceSysExProc, _>(Self::music_device_sys_ex)
+            },
+            midi::MUSIC_DEVICE_START_NOTE_SELECT if P::MIDI_INPUT >= MidiConfig::Basic => unsafe {
+                std::mem::transmute::<midi::MusicDeviceStartNoteProc, _>(
+                    Self::music_device_start_note,
+                )
+            },
+            midi::MUSIC_DEVICE_STOP_NOTE_SELECT if P::MIDI_INPUT >= MidiConfig::Basic => unsafe {
+                std::mem::transmute::<midi::MusicDeviceStopNoteProc, _>(
+                    Self::music_device_stop_note,
+                )
+            },
             _ => return None,
         };
         Some(method)
@@ -716,18 +814,11 @@ impl<P: AuPlugin> Wrapper<P> {
         let this = unsafe { Self::from_ptr(self_ptr) };
 
         let n_ch = this.n_channels().max(1);
-        let chans = NonZeroU32::new(n_ch);
-        // Pick the best-matching layout for the current channel count. Prefer a
-        // layout whose main_input_channels matches; fall back to const_default.
-        let selected_layout = P::AUDIO_IO_LAYOUTS
-            .iter()
-            .find(|l| l.main_input_channels == chans && l.main_output_channels == chans)
-            .copied()
-            .unwrap_or(AudioIOLayout {
-                main_input_channels: chans,
-                main_output_channels: chans,
-                ..AudioIOLayout::const_default()
-            });
+        let chans = NonZeroU32::new(n_ch).expect("n_ch is clamped to at least one");
+        let selected_layout = match layout_for_output::<P>(chans) {
+            Some(layout) => *layout,
+            None => return au::kAudioUnitErr_FormatNotSupported,
+        };
         let max_frames = this.max_frames_per_slice();
         let sr = this.sample_rate();
         let buffer_config = BufferConfig {
@@ -758,7 +849,15 @@ impl<P: AuPlugin> Wrapper<P> {
         // Provision the audio-thread render state so the hot path is
         // allocation-free. SAFETY: render is serialised vs. Initialize.
         let render_state = unsafe { this.render_state_mut() };
-        render_state.provision(n_ch as usize, max_frames as usize, selected_layout.aux_input_ports);
+        render_state.provision(
+            n_ch as usize,
+            max_frames as usize,
+            selected_layout.aux_input_ports,
+        );
+        render_state.midi.clear();
+        this.midi_input.clear();
+        this.set_tail_seconds(0.0);
+        this.set_last_render_error(au::noErr);
 
         let latency = this.sink.latency_samples.load(Ordering::Relaxed);
         if latency > 0 && sr > 0.0 {
@@ -785,6 +884,8 @@ impl<P: AuPlugin> Wrapper<P> {
             // SAFETY: AU forbids Uninitialize concurrent with Render.
             unsafe { this.plugin_mut() }.deactivate();
         }
+        this.midi_input.clear();
+        unsafe { this.render_state_mut() }.midi.clear();
         au::noErr
     }
 
@@ -796,7 +897,59 @@ impl<P: AuPlugin> Wrapper<P> {
         let this = unsafe { Self::from_ptr(self_ptr) };
         // SAFETY: AU calls Reset on the main thread, serialised against render.
         unsafe { this.plugin_mut() }.reset();
+        this.midi_input.clear();
+        unsafe { this.render_state_mut() }.midi.clear();
+        this.set_tail_seconds(0.0);
         au::noErr
+    }
+
+    unsafe extern "C" fn music_device_midi_event(
+        self_ptr: *mut c_void,
+        status: au::UInt32,
+        data_1: au::UInt32,
+        data_2: au::UInt32,
+        offset: au::UInt32,
+    ) -> au::OSStatus {
+        unsafe { Self::from_ptr(self_ptr) }
+            .midi_input
+            .push_midi_event(status, data_1, data_2, offset)
+    }
+
+    unsafe extern "C" fn music_device_sys_ex(
+        self_ptr: *mut c_void,
+        data: *const u8,
+        length: au::UInt32,
+    ) -> au::OSStatus {
+        unsafe { Self::from_ptr(self_ptr) }
+            .midi_input
+            .push_sysex(data, length)
+    }
+
+    unsafe extern "C" fn music_device_start_note(
+        self_ptr: *mut c_void,
+        _instrument: au::UInt32,
+        group: au::UInt32,
+        out_note_id: *mut au::UInt32,
+        offset: au::UInt32,
+        params: *const midi::MusicDeviceNoteParams,
+    ) -> au::OSStatus {
+        unsafe { Self::from_ptr(self_ptr) }.midi_input.start_note(
+            group,
+            out_note_id,
+            offset,
+            params,
+        )
+    }
+
+    unsafe extern "C" fn music_device_stop_note(
+        self_ptr: *mut c_void,
+        group: au::UInt32,
+        note_id: au::UInt32,
+        offset: au::UInt32,
+    ) -> au::OSStatus {
+        unsafe { Self::from_ptr(self_ptr) }
+            .midi_input
+            .stop_note(group, note_id, offset)
     }
 
     fn get_class_info(&self) -> *mut c_void {
@@ -898,7 +1051,7 @@ impl<P: AuPlugin> Wrapper<P> {
         self_ptr: *mut c_void,
         id: au::AudioUnitPropertyID,
         scope: au::AudioUnitScope,
-        _element: au::AudioUnitElement,
+        element: au::AudioUnitElement,
         out_data_size: *mut au::UInt32,
         out_writable: *mut au::Boolean,
     ) -> au::OSStatus {
@@ -918,15 +1071,18 @@ impl<P: AuPlugin> Wrapper<P> {
 
         match id {
             au::kAudioUnitProperty_SampleRate
-                if scope == au::kAudioUnitScope_Input
-                    || scope == au::kAudioUnitScope_Output =>
+                if scope == au::kAudioUnitScope_Input || scope == au::kAudioUnitScope_Output =>
             {
                 respond(std::mem::size_of::<au::Float64>() as u32, true)
             }
-            au::kAudioUnitProperty_StreamFormat => respond(
-                std::mem::size_of::<au::AudioStreamBasicDescription>() as u32,
-                true,
-            ),
+            au::kAudioUnitProperty_StreamFormat
+                if bus_channel_count::<P>(this.n_channels(), scope, element).is_some() =>
+            {
+                respond(
+                    std::mem::size_of::<au::AudioStreamBasicDescription>() as u32,
+                    true,
+                )
+            }
             au::kAudioUnitProperty_ElementCount => {
                 respond(std::mem::size_of::<au::UInt32>() as u32, false)
             }
@@ -936,9 +1092,7 @@ impl<P: AuPlugin> Wrapper<P> {
             au::kAudioUnitProperty_TailTime if scope == au::kAudioUnitScope_Global => {
                 respond(std::mem::size_of::<au::Float64>() as u32, false)
             }
-            au::kAudioUnitProperty_MaximumFramesPerSlice
-                if scope == au::kAudioUnitScope_Global =>
-            {
+            au::kAudioUnitProperty_MaximumFramesPerSlice if scope == au::kAudioUnitScope_Global => {
                 respond(std::mem::size_of::<au::UInt32>() as u32, true)
             }
             au::kAudioUnitProperty_ParameterList if scope == au::kAudioUnitScope_Global => {
@@ -948,18 +1102,22 @@ impl<P: AuPlugin> Wrapper<P> {
                     false,
                 )
             }
-            au::kAudioUnitProperty_ParameterInfo if scope == au::kAudioUnitScope_Global => {
+            au::kAudioUnitProperty_ParameterInfo if scope == au::kAudioUnitScope_Global => respond(
+                std::mem::size_of::<au::AudioUnitParameterInfo>() as u32,
+                false,
+            ),
+            au::kAudioUnitProperty_SupportedNumChannels if scope == au::kAudioUnitScope_Global => {
                 respond(
-                    std::mem::size_of::<au::AudioUnitParameterInfo>() as u32,
+                    (P::AUDIO_IO_LAYOUTS.len() * std::mem::size_of::<au::AUChannelInfo>()) as u32,
                     false,
                 )
             }
-            au::kAudioUnitProperty_SupportedNumChannels
-                if scope == au::kAudioUnitScope_Global =>
+            au::kAudioUnitProperty_MakeConnection
+                if scope == au::kAudioUnitScope_Input
+                    && element == 0
+                    && current_layout::<P>(this.n_channels())
+                        .is_some_and(|layout| layout.main_input_channels.is_some()) =>
             {
-                respond(std::mem::size_of::<au::AUChannelInfo>() as u32, false)
-            }
-            au::kAudioUnitProperty_MakeConnection if scope == au::kAudioUnitScope_Input => {
                 respond(std::mem::size_of::<AudioUnitConnection>() as u32, true)
             }
             au::kAudioUnitProperty_BypassEffect if scope == au::kAudioUnitScope_Global => {
@@ -968,7 +1126,10 @@ impl<P: AuPlugin> Wrapper<P> {
             au::kAudioUnitProperty_LastRenderError if scope == au::kAudioUnitScope_Global => {
                 respond(std::mem::size_of::<au::OSStatus>() as u32, false)
             }
-            au::kAudioUnitProperty_SetRenderCallback if scope == au::kAudioUnitScope_Input => {
+            au::kAudioUnitProperty_SetRenderCallback
+                if scope == au::kAudioUnitScope_Input
+                    && bus_channel_count::<P>(this.n_channels(), scope, element).is_some() =>
+            {
                 respond(
                     std::mem::size_of::<au::AURenderCallbackStruct>() as u32,
                     true,
@@ -982,6 +1143,24 @@ impl<P: AuPlugin> Wrapper<P> {
             }
             au::kAudioUnitProperty_HostCallbacks if scope == au::kAudioUnitScope_Global => {
                 respond(std::mem::size_of::<au::HostCallbackInfo>() as u32, true)
+            }
+            au::kAudioUnitProperty_MIDIOutputCallbackInfo
+                if scope == au::kAudioUnitScope_Global && P::MIDI_OUTPUT >= MidiConfig::Basic =>
+            {
+                respond(std::mem::size_of::<*mut c_void>() as u32, false)
+            }
+            au::kAudioUnitProperty_MIDIOutputCallback
+                if scope == au::kAudioUnitScope_Global && P::MIDI_OUTPUT >= MidiConfig::Basic =>
+            {
+                respond(
+                    std::mem::size_of::<midi::AuMidiOutputCallbackStruct>() as u32,
+                    true,
+                )
+            }
+            midi::MUSIC_DEVICE_PROPERTY_SUPPORTS_START_STOP_NOTE
+                if scope == au::kAudioUnitScope_Global && P::MIDI_INPUT >= MidiConfig::Basic =>
+            {
+                respond(std::mem::size_of::<au::UInt32>() as u32, false)
             }
             au::kAudioUnitProperty_CocoaUI if scope == au::kAudioUnitScope_Global => {
                 if this.editor.is_some() {
@@ -1019,11 +1198,17 @@ impl<P: AuPlugin> Wrapper<P> {
             return au::kAudioUnitErr_InvalidParameter;
         }
 
-        match id {
-            au::kAudioUnitProperty_SampleRate => {
-                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<au::Float64>() {
+        macro_rules! require_output {
+            ($ty:ty) => {
+                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<$ty>() {
                     return au::kAudioUnitErr_InvalidPropertyValue;
                 }
+            };
+        }
+
+        match id {
+            au::kAudioUnitProperty_SampleRate => {
+                require_output!(au::Float64);
                 unsafe {
                     *(out_data as *mut au::Float64) = this.sample_rate();
                     *io_data_size = std::mem::size_of::<au::Float64>() as u32;
@@ -1031,17 +1216,19 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_ElementCount => {
-                // Input scope: element 0 = main, elements 1+ = aux inputs.
+                require_output!(au::UInt32);
+                // Input scope: optional main input followed by aux inputs.
                 // Output scope: always 1 (aux outputs not yet implemented).
                 let n_ch = this.n_channels().max(1);
                 let chans = NonZeroU32::new(n_ch);
-                let n_aux_inputs = P::AUDIO_IO_LAYOUTS
-                    .iter()
-                    .find(|l| l.main_input_channels == chans && l.main_output_channels == chans)
-                    .map(|l| l.aux_input_ports.len())
-                    .unwrap_or(0);
+                let layout = chans.and_then(layout_for_output::<P>);
                 let count: au::UInt32 = match scope {
-                    au::kAudioUnitScope_Input => 1 + n_aux_inputs as u32,
+                    au::kAudioUnitScope_Input => layout
+                        .map(|layout| {
+                            u32::from(layout.main_input_channels.is_some())
+                                + layout.aux_input_ports.len() as u32
+                        })
+                        .unwrap_or(0),
                     au::kAudioUnitScope_Output => 1,
                     au::kAudioUnitScope_Global => 1,
                     _ => 0,
@@ -1053,6 +1240,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_Latency if scope == au::kAudioUnitScope_Global => {
+                require_output!(au::Float64);
                 unsafe {
                     *(out_data as *mut au::Float64) = this.latency_seconds();
                     *io_data_size = std::mem::size_of::<au::Float64>() as u32;
@@ -1060,13 +1248,15 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_TailTime if scope == au::kAudioUnitScope_Global => {
+                require_output!(au::Float64);
                 unsafe {
-                    *(out_data as *mut au::Float64) = 0.0;
+                    *(out_data as *mut au::Float64) = this.tail_seconds();
                     *io_data_size = std::mem::size_of::<au::Float64>() as u32;
                 }
                 au::noErr
             }
             au::kAudioUnitProperty_MaximumFramesPerSlice => {
+                require_output!(au::UInt32);
                 unsafe {
                     *(out_data as *mut au::UInt32) = this.max_frames_per_slice();
                     *io_data_size = std::mem::size_of::<au::UInt32>() as u32;
@@ -1074,11 +1264,11 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_StreamFormat => {
-                if (unsafe { *io_data_size } as usize)
-                    < std::mem::size_of::<au::AudioStreamBasicDescription>()
-                {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                require_output!(au::AudioStreamBasicDescription);
+                let channels = match bus_channel_count::<P>(this.n_channels(), scope, element) {
+                    Some(channels) => channels,
+                    None => return au::kAudioUnitErr_InvalidElement,
+                };
                 let asbd = au::AudioStreamBasicDescription {
                     mSampleRate: this.sample_rate(),
                     mFormatID: au::kAudioFormatLinearPCM,
@@ -1088,14 +1278,13 @@ impl<P: AuPlugin> Wrapper<P> {
                     mBytesPerPacket: 4,
                     mFramesPerPacket: 1,
                     mBytesPerFrame: 4,
-                    mChannelsPerFrame: this.n_channels(),
+                    mChannelsPerFrame: channels,
                     mBitsPerChannel: 32,
                     mReserved: 0,
                 };
                 unsafe {
                     *(out_data as *mut au::AudioStreamBasicDescription) = asbd;
-                    *io_data_size =
-                        std::mem::size_of::<au::AudioStreamBasicDescription>() as u32;
+                    *io_data_size = std::mem::size_of::<au::AudioStreamBasicDescription>() as u32;
                 }
                 au::noErr
             }
@@ -1134,43 +1323,36 @@ impl<P: AuPlugin> Wrapper<P> {
                 }
                 au::noErr
             }
-            au::kAudioUnitProperty_SupportedNumChannels
-                if scope == au::kAudioUnitScope_Global =>
-            {
-                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<au::AUChannelInfo>() {
+            au::kAudioUnitProperty_SupportedNumChannels if scope == au::kAudioUnitScope_Global => {
+                let needed = P::AUDIO_IO_LAYOUTS.len() * std::mem::size_of::<au::AUChannelInfo>();
+                if (unsafe { *io_data_size } as usize) < needed {
                     return au::kAudioUnitErr_InvalidPropertyValue;
                 }
-                // Report the first declared layout's main channel count.
-                // If multiple layouts are declared we currently only expose
-                // one entry; auval accepts this as a conservative answer.
-                let info = match P::AUDIO_IO_LAYOUTS.iter().next() {
-                    Some(layout) => {
-                        let in_ch = layout
-                            .main_input_channels
-                            .map(|n| n.get() as i16)
-                            .unwrap_or(0);
-                        let out_ch = layout
-                            .main_output_channels
-                            .map(|n| n.get() as i16)
-                            .unwrap_or(0);
-                        au::AUChannelInfo {
-                            inChannels: in_ch,
-                            outChannels: out_ch,
-                        }
+                let dst = out_data as *mut au::AUChannelInfo;
+                for (idx, layout) in P::AUDIO_IO_LAYOUTS.iter().enumerate() {
+                    unsafe {
+                        *dst.add(idx) = au::AUChannelInfo {
+                            inChannels: layout
+                                .main_input_channels
+                                .map(|n| n.get() as i16)
+                                .unwrap_or(0),
+                            outChannels: layout
+                                .main_output_channels
+                                .map(|n| n.get() as i16)
+                                .unwrap_or(0),
+                        };
                     }
-                    None => au::AUChannelInfo {
-                        inChannels: -1,
-                        outChannels: -1,
-                    },
-                };
-                unsafe {
-                    *(out_data as *mut au::AUChannelInfo) = info;
-                    *io_data_size = std::mem::size_of::<au::AUChannelInfo>() as u32;
                 }
+                unsafe { *io_data_size = needed as u32 };
                 au::noErr
             }
             au::kAudioUnitProperty_BypassEffect if scope == au::kAudioUnitScope_Global => {
-                let on = if this.bypass.load(Ordering::Acquire) { 1 } else { 0 };
+                require_output!(au::UInt32);
+                let on = if this.bypass.load(Ordering::Acquire) {
+                    1
+                } else {
+                    0
+                };
                 unsafe {
                     *(out_data as *mut au::UInt32) = on;
                     *io_data_size = std::mem::size_of::<au::UInt32>() as u32;
@@ -1178,13 +1360,16 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_LastRenderError if scope == au::kAudioUnitScope_Global => {
+                require_output!(au::OSStatus);
                 unsafe {
-                    *(out_data as *mut au::OSStatus) = au::noErr;
+                    *(out_data as *mut au::OSStatus) =
+                        this.last_render_error.load(Ordering::Acquire);
                     *io_data_size = std::mem::size_of::<au::OSStatus>() as u32;
                 }
                 au::noErr
             }
             au::kAudioUnitProperty_InPlaceProcessing => {
+                require_output!(au::UInt32);
                 unsafe {
                     *(out_data as *mut au::UInt32) = 1;
                     *io_data_size = std::mem::size_of::<au::UInt32>() as u32;
@@ -1192,9 +1377,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 au::noErr
             }
             au::kAudioUnitProperty_ClassInfo if scope == au::kAudioUnitScope_Global => {
-                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<*mut c_void>() {
-                    return au::kAudioUnitErr_InvalidPropertyValue;
-                }
+                require_output!(*mut c_void);
                 let dict = this.get_class_info();
                 unsafe {
                     *(out_data as *mut *mut c_void) = dict;
@@ -1206,7 +1389,8 @@ impl<P: AuPlugin> Wrapper<P> {
                 if this.editor.is_none() {
                     return au::kAudioUnitErr_InvalidProperty;
                 }
-                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<au::AUCocoaViewInfo>() {
+                if (unsafe { *io_data_size } as usize) < std::mem::size_of::<au::AUCocoaViewInfo>()
+                {
                     return au::kAudioUnitErr_InvalidPropertyValue;
                 }
                 // Register (or look up) the per-type ObjC view factory class and
@@ -1241,6 +1425,30 @@ impl<P: AuPlugin> Wrapper<P> {
                         presetName: preset_name,
                     };
                     *io_data_size = std::mem::size_of::<au::AUPreset>() as u32;
+                }
+                au::noErr
+            }
+            au::kAudioUnitProperty_MIDIOutputCallbackInfo
+                if scope == au::kAudioUnitScope_Global && P::MIDI_OUTPUT >= MidiConfig::Basic =>
+            {
+                require_output!(*mut c_void);
+                let names: CFArray<CFString> =
+                    CFArray::from_CFTypes(&[CFString::from_static_string("MIDI Out")]);
+                let names_ref = names.as_concrete_TypeRef();
+                std::mem::forget(names);
+                unsafe {
+                    *(out_data as *mut *mut c_void) = names_ref as *mut c_void;
+                    *io_data_size = std::mem::size_of::<*mut c_void>() as u32;
+                }
+                au::noErr
+            }
+            midi::MUSIC_DEVICE_PROPERTY_SUPPORTS_START_STOP_NOTE
+                if scope == au::kAudioUnitScope_Global && P::MIDI_INPUT >= MidiConfig::Basic =>
+            {
+                require_output!(au::UInt32);
+                unsafe {
+                    *(out_data as *mut au::UInt32) = 1;
+                    *io_data_size = std::mem::size_of::<au::UInt32>() as u32;
                 }
                 au::noErr
             }
@@ -1306,6 +1514,9 @@ impl<P: AuPlugin> Wrapper<P> {
                 if asbd.mChannelsPerFrame == 0 {
                     return au::kAudioUnitErr_InvalidPropertyValue;
                 }
+                if !(asbd.mSampleRate > 0.0 && asbd.mSampleRate.is_finite()) {
+                    return au::kAudioUnitErr_InvalidPropertyValue;
+                }
                 // Reject non-PCM / non-float / interleaved — we only ever
                 // advertise non-interleaved 32-bit float in get_property.
                 if asbd.mFormatID != au::kAudioFormatLinearPCM
@@ -1317,16 +1528,33 @@ impl<P: AuPlugin> Wrapper<P> {
                 if asbd.mBitsPerChannel != 32 {
                     return au::kAudioUnitErr_FormatNotSupported;
                 }
-                // Match the requested channel count against P::AUDIO_IO_LAYOUTS.
-                // For an effect (in_ch == out_ch) we look for a layout where
-                // both main_input and main_output match.
                 let req_ch = asbd.mChannelsPerFrame;
-                if !layout_supports::<P>(req_ch) {
-                    return au::kAudioUnitErr_FormatNotSupported;
+                match scope {
+                    au::kAudioUnitScope_Output if element == 0 => {
+                        let req = NonZeroU32::new(req_ch).expect("channel count checked above");
+                        if layout_for_output::<P>(req).is_none() {
+                            return au::kAudioUnitErr_FormatNotSupported;
+                        }
+                        this.n_channels.store(req_ch, Ordering::Release);
+                    }
+                    au::kAudioUnitScope_Input => {
+                        let expected = match bus_channel_count::<P>(
+                            this.n_channels(),
+                            au::kAudioUnitScope_Input,
+                            element,
+                        ) {
+                            Some(expected) => expected,
+                            None => return au::kAudioUnitErr_InvalidElement,
+                        };
+                        if expected != req_ch {
+                            return au::kAudioUnitErr_FormatNotSupported;
+                        }
+                    }
+                    au::kAudioUnitScope_Output => return au::kAudioUnitErr_InvalidElement,
+                    _ => return au::kAudioUnitErr_InvalidScope,
                 }
 
                 this.set_sample_rate(asbd.mSampleRate);
-                this.n_channels.store(req_ch, Ordering::Release);
                 this.mark_pending(NOTIFY_STREAM_FORMAT);
                 au::noErr
             }
@@ -1375,6 +1603,12 @@ impl<P: AuPlugin> Wrapper<P> {
                 if element != 0 {
                     return au::kAudioUnitErr_InvalidElement;
                 }
+                let has_main_input = current_layout::<P>(this.n_channels())
+                    .map(|layout| layout.main_input_channels.is_some())
+                    .unwrap_or(false);
+                if !has_main_input {
+                    return au::kAudioUnitErr_InvalidElement;
+                }
                 let conn = unsafe { *(in_data as *const AudioUnitConnection) };
                 // `conn.dest_input_number` is deliberately not consulted: AU's
                 // convention is that the property's element *is* the
@@ -1400,11 +1634,20 @@ impl<P: AuPlugin> Wrapper<P> {
                 }
                 au::noErr
             }
-            au::kAudioUnitProperty_SetRenderCallback => {
+            au::kAudioUnitProperty_SetRenderCallback if scope == au::kAudioUnitScope_Input => {
                 payload!(au::AURenderCallbackStruct);
                 let cb = unsafe { *(in_data as *const au::AURenderCallbackStruct) };
-                let new_cb = if cb.inputProc.is_some() { Some(cb) } else { None };
-                if element == 0 {
+                let new_cb = if cb.inputProc.is_some() {
+                    Some(cb)
+                } else {
+                    None
+                };
+                let layout = match current_layout::<P>(this.n_channels()) {
+                    Some(layout) => layout,
+                    None => return au::kAudioUnitErr_FormatNotSupported,
+                };
+                let aux_base = u32::from(layout.main_input_channels.is_some());
+                if aux_base == 1 && element == 0 {
                     if let Ok(mut guard) = this.input_callback.lock() {
                         *guard = new_cb;
                     }
@@ -1414,12 +1657,19 @@ impl<P: AuPlugin> Wrapper<P> {
                         *guard = None;
                     }
                 } else {
-                    // elements 1+ are aux inputs
-                    let aux_idx = (element - 1) as usize;
+                    if element < aux_base {
+                        return au::kAudioUnitErr_InvalidElement;
+                    }
+                    let aux_idx = (element - aux_base) as usize;
+                    if aux_idx >= layout.aux_input_ports.len() {
+                        return au::kAudioUnitErr_InvalidElement;
+                    }
                     if let Some(slot) = this.aux_input_callbacks.get(aux_idx) {
                         if let Ok(mut guard) = slot.lock() {
                             *guard = new_cb;
                         }
+                    } else {
+                        return au::kAudioUnitErr_InvalidElement;
                     }
                 }
                 au::noErr
@@ -1437,6 +1687,22 @@ impl<P: AuPlugin> Wrapper<P> {
                     *guard = Some(cb);
                 }
                 au::noErr
+            }
+            au::kAudioUnitProperty_MIDIOutputCallback
+                if scope == au::kAudioUnitScope_Global && P::MIDI_OUTPUT >= MidiConfig::Basic =>
+            {
+                payload!(midi::AuMidiOutputCallbackStruct);
+                let callback =
+                    unsafe { ptr::read(in_data as *const midi::AuMidiOutputCallbackStruct) };
+                if this
+                    .midi_output_callback
+                    .store(callback.callback.map(|_| callback))
+                    .is_ok()
+                {
+                    au::noErr
+                } else {
+                    au::kAudioUnitErr_CannotDoInCurrentContext
+                }
             }
             _ => au::kAudioUnitErr_InvalidProperty,
         }
@@ -1563,6 +1829,7 @@ impl<P: AuPlugin> Wrapper<P> {
         let this = unsafe { Self::from_ptr(self_ptr) };
 
         if io_data.is_null() {
+            this.set_last_render_error(au::kAudioUnitErr_InvalidParameter);
             return au::kAudioUnitErr_InvalidParameter;
         }
 
@@ -1572,6 +1839,22 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         let n_frames = in_number_frames as usize;
+        if in_number_frames > this.max_frames_per_slice() {
+            unsafe { zero_buffer_list(io_data, in_number_frames) };
+            this.set_last_render_error(au::kAudioUnitErr_TooManyFramesToProcess);
+            return au::kAudioUnitErr_TooManyFramesToProcess;
+        }
+
+        let layout = match current_layout::<P>(this.n_channels()) {
+            Some(layout) => layout,
+            None => {
+                unsafe { zero_buffer_list(io_data, in_number_frames) };
+                this.set_last_render_error(au::kAudioUnitErr_FormatNotSupported);
+                return au::kAudioUnitErr_FormatNotSupported;
+            }
+        };
+        let has_main_input = layout.main_input_channels.is_some();
+        let aux_element_base = u32::from(has_main_input);
 
         // Snapshot the input callback under the mutex (cheap struct copy).
         // Released immediately so main-thread updates don't block render
@@ -1579,19 +1862,22 @@ impl<P: AuPlugin> Wrapper<P> {
         // The two wirings are kept mutually exclusive when the host sets them,
         // so at most one of these is ever populated; the callback is preferred
         // if both somehow are.
-        let input_source = this
-            .input_callback
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .map(InputSource::Callback)
-            .or_else(|| {
-                this.input_connection
+        let input_source = has_main_input
+            .then(|| {
+                this.input_callback
                     .lock()
                     .ok()
                     .and_then(|g| *g)
-                    .map(InputSource::Connection)
-            });
+                    .map(InputSource::Callback)
+                    .or_else(|| {
+                        this.input_connection
+                            .lock()
+                            .ok()
+                            .and_then(|g| *g)
+                            .map(InputSource::Connection)
+                    })
+            })
+            .flatten();
 
         // SAFETY: render is not re-entered; we are the sole owner of
         // RenderState for the duration of this call.
@@ -1615,8 +1901,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 // The N-tuple of AudioBuffer entries lives at the natural
                 // C `mBuffers` offset, which the compiler computes
                 // accounting for any padding after `mNumberBuffers`.
-                let header_offset =
-                    mem::offset_of!(au::AudioBufferList, mBuffers);
+                let header_offset = mem::offset_of!(au::AudioBufferList, mBuffers);
                 let buffers_ptr = unsafe {
                     (rs.bl_storage.as_mut_ptr() as *mut u8).add(header_offset)
                         as *mut au::AudioBuffer
@@ -1626,8 +1911,7 @@ impl<P: AuPlugin> Wrapper<P> {
                     unsafe {
                         *buffers_ptr.add(ch) = au::AudioBuffer {
                             mNumberChannels: 1,
-                            mDataByteSize: (n_frames * mem::size_of::<f32>())
-                                as au::UInt32,
+                            mDataByteSize: (n_frames * mem::size_of::<f32>()) as au::UInt32,
                             mData: scratch_ptr as *mut c_void,
                         };
                     }
@@ -1671,7 +1955,11 @@ impl<P: AuPlugin> Wrapper<P> {
                         )
                     },
                 };
-                if status == au::noErr {
+                if status != au::noErr {
+                    unsafe { zero_buffer_list(io_data, in_number_frames) };
+                    this.set_last_render_error(status);
+                    return status;
+                } else {
                     pulled_input = true;
                     // The callback is allowed to *replace* the mData pointers
                     // with its own buffers instead of filling the ones we
@@ -1689,8 +1977,8 @@ impl<P: AuPlugin> Wrapper<P> {
                         let src = b.mData as *const f32;
                         let dst = rs.input_scratch[ch].as_mut_ptr();
                         if !src.is_null() && src != dst as *const f32 {
-                            let frames = n_frames
-                                .min(b.mDataByteSize as usize / mem::size_of::<f32>());
+                            let frames =
+                                n_frames.min(b.mDataByteSize as usize / mem::size_of::<f32>());
                             unsafe { ptr::copy_nonoverlapping(src, dst, frames) };
                         }
                     }
@@ -1711,9 +1999,8 @@ impl<P: AuPlugin> Wrapper<P> {
                 if buf.mData.is_null() || !buffer_fits_frames(buf, n_frames) {
                     continue;
                 }
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(buf.mData as *mut f32, n_frames)
-                };
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(buf.mData as *mut f32, n_frames) };
                 let src = &rs.input_scratch[i][..n_frames];
                 dst.copy_from_slice(src);
             }
@@ -1770,10 +2057,7 @@ impl<P: AuPlugin> Wrapper<P> {
                         slots[i] = &mut [];
                         continue;
                     }
-                    let raw = std::slice::from_raw_parts_mut(
-                        buf.mData as *mut f32,
-                        n_frames,
-                    );
+                    let raw = std::slice::from_raw_parts_mut(buf.mData as *mut f32, n_frames);
                     // The slot type carries `'static` because `RenderState`
                     // is itself field-stored; the slice we put here lives
                     // only until we clear it below. This mirrors the
@@ -1794,7 +2078,8 @@ impl<P: AuPlugin> Wrapper<P> {
                 if let Some(beat_and_tempo) = cb.beatAndTempoProc {
                     let mut beat = 0.0;
                     let mut tempo = 0.0;
-                    if unsafe { beat_and_tempo(cb.hostUserData, &mut beat, &mut tempo) } == au::noErr
+                    if unsafe { beat_and_tempo(cb.hostUserData, &mut beat, &mut tempo) }
+                        == au::noErr
                     {
                         transport.pos_beats = Some(beat);
                         transport.tempo = Some(tempo);
@@ -1865,6 +2150,7 @@ impl<P: AuPlugin> Wrapper<P> {
 
         // ── 3) Pull aux inputs and wire them into AuxiliaryBuffers. ──────
         let n_aux = rs.aux_buffers.len();
+        let mut upstream_error = au::noErr;
         for aux_idx in 0..n_aux {
             let cb_snapshot = this
                 .aux_input_callbacks
@@ -1872,8 +2158,8 @@ impl<P: AuPlugin> Wrapper<P> {
                 .and_then(|m| m.lock().ok().and_then(|g| *g));
 
             let n_ch = rs.aux_input_scratch[aux_idx].len();
-            let bl_storage_ok = rs.aux_bl_storages[aux_idx].len() * mem::size_of::<u64>()
-                >= bl_byte_size(n_ch);
+            let bl_storage_ok =
+                rs.aux_bl_storages[aux_idx].len() * mem::size_of::<u64>() >= bl_byte_size(n_ch);
 
             if let Some(cb) = cb_snapshot {
                 if n_ch > 0 && bl_storage_ok {
@@ -1901,31 +2187,37 @@ impl<P: AuPlugin> Wrapper<P> {
                     // Real timestamp, same as the main input: a zeroed one is
                     // a spec violation Logic answers with silence (AUD-831).
                     let mut flags: au::AudioUnitRenderActionFlags = 0;
-                    let proc = cb.inputProc.unwrap();
-                    // element = aux_idx + 1 (element 0 is main)
-                    let _status = unsafe {
+                    // `SetRenderCallback` stores `None` when `inputProc` is
+                    // absent, but keep the render boundary fail-closed if a
+                    // malformed callback ever reaches this snapshot.
+                    let Some(proc) = cb.inputProc else {
+                        continue;
+                    };
+                    let status = unsafe {
                         proc(
                             cb.inputProcRefCon,
                             &mut flags,
                             in_time_stamp,
-                            (aux_idx + 1) as au::UInt32,
+                            aux_element_base + aux_idx as au::UInt32,
                             in_number_frames,
                             bl_ptr,
                         )
                     };
                     // Same zero-copy contract as the main input: the callback
                     // may have swapped mData to its own buffers (AUD-831).
-                    if _status == au::noErr {
+                    if status == au::noErr {
                         for ch in 0..n_ch {
                             let b = unsafe { &*buffers_ptr.add(ch) };
                             let src = b.mData as *const f32;
                             let dst = rs.aux_input_scratch[aux_idx][ch].as_mut_ptr();
                             if !src.is_null() && src != dst as *const f32 {
-                                let frames = n_frames
-                                    .min(b.mDataByteSize as usize / mem::size_of::<f32>());
+                                let frames =
+                                    n_frames.min(b.mDataByteSize as usize / mem::size_of::<f32>());
                                 unsafe { ptr::copy_nonoverlapping(src, dst, frames) };
                             }
                         }
+                    } else if upstream_error == au::noErr {
+                        upstream_error = status;
                     }
                     // Wire scratch into the aux Buffer's slots.
                     unsafe {
@@ -1957,18 +2249,25 @@ impl<P: AuPlugin> Wrapper<P> {
             }
         }
 
-        let mut process_ctx = AuProcessContext::<P> {
-            sink: this.sink.clone(),
-            transport,
-            _marker: PhantomData,
-        };
+        // Snapshot exactly the MIDI events that were queued before this block
+        // and order them by sample offset before handing them to the plugin.
+        this.midi_input.drain_into(&mut rs.midi, in_number_frames);
+
+        if upstream_error != au::noErr {
+            unsafe {
+                clear_render_slices(rs);
+                zero_buffer_list(io_data, in_number_frames);
+            }
+            this.set_last_render_error(upstream_error);
+            return upstream_error;
+        }
 
         // Bypass: skip Plugin::process entirely. Input has already been
         // copied into io_data above (callback path) or sits there in-place
         // (host path), so the pass-through is implicit — we just don't run
         // the plugin's DSP.
 
-        if !this.bypass.load(Ordering::Acquire) {
+        let process_status = if !this.bypass.load(Ordering::Acquire) {
             // SAFETY: aux_buffers is only accessed here (audio thread, no re-entry).
             // We cast to `&'static mut [Buffer<'static>]` to satisfy
             // AuxiliaryBuffers<'_> — the same lifetime-laundering pattern the
@@ -1977,35 +2276,67 @@ impl<P: AuPlugin> Wrapper<P> {
             let aux_inputs_ptr = rs.aux_buffers.as_mut_ptr();
             let aux_inputs_len = rs.aux_buffers.len();
             let mut aux = AuxiliaryBuffers {
-                inputs: unsafe {
-                    std::slice::from_raw_parts_mut(aux_inputs_ptr, aux_inputs_len)
-                },
+                inputs: unsafe { std::slice::from_raw_parts_mut(aux_inputs_ptr, aux_inputs_len) },
                 outputs: &mut [],
             };
             // SAFETY: render is not concurrent with Initialize/Uninitialize/Reset
             // and AU does not re-enter render, so this `&mut P` is unique.
-            let _status = unsafe { this.plugin_mut() }.process(
-                &mut rs.buffer,
-                &mut aux,
-                &mut process_ctx,
-            );
-        }
+            let midi_state = &mut rs.midi;
+            let mut process_ctx = AuProcessContext::<P> {
+                sink: this.sink.clone(),
+                transport,
+                input_events: &mut midi_state.input_events,
+                output_events: &mut midi_state.output_events,
+                _marker: PhantomData,
+            };
+            unsafe { this.plugin_mut() }.process(&mut rs.buffer, &mut aux, &mut process_ctx)
+        } else {
+            ProcessStatus::Normal
+        };
+
+        let render_status = match process_status {
+            ProcessStatus::Error(err) => {
+                nih_debug_assert_failure!("Process error: {}", err);
+                au::kAudioUnitErr_CannotDoInCurrentContext
+            }
+            ProcessStatus::Normal => {
+                this.set_tail_seconds(0.0);
+                au::noErr
+            }
+            ProcessStatus::Tail(samples) => {
+                this.set_tail_seconds(if sr > 0.0 { samples as f64 / sr } else { 0.0 });
+                au::noErr
+            }
+            ProcessStatus::KeepAlive => {
+                this.set_tail_seconds(f64::INFINITY);
+                au::noErr
+            }
+        };
+
+        let midi_output_callback = this.midi_output_callback.load();
+        let midi_status = if render_status == au::noErr {
+            unsafe {
+                rs.midi
+                    .flush_output(midi_output_callback, in_time_stamp, in_number_frames)
+            }
+        } else {
+            rs.midi.output_events.clear();
+            au::noErr
+        };
 
         // Clear the slot slices so the `'static` lifetime can never escape
         // this render call via a stale `&mut [f32]`.
-        unsafe {
-            rs.buffer.set_slices(0, |slots| {
-                for slot in slots.iter_mut() {
-                    *slot = &mut [];
-                }
-            });
-            for aux_buf in rs.aux_buffers.iter_mut() {
-                aux_buf.set_slices(0, |slots| {
-                    for slot in slots.iter_mut() {
-                        *slot = &mut [];
-                    }
-                });
-            }
+        unsafe { clear_render_slices(rs) };
+
+        let final_status = if render_status != au::noErr {
+            render_status
+        } else {
+            midi_status
+        };
+        if final_status != au::noErr {
+            unsafe { zero_buffer_list(io_data, in_number_frames) };
+            this.set_last_render_error(final_status);
+            return final_status;
         }
 
         let latency = this.sink.latency_samples.load(Ordering::Relaxed);
@@ -2020,6 +2351,7 @@ impl<P: AuPlugin> Wrapper<P> {
             }
         }
 
+        this.set_last_render_error(au::noErr);
         au::noErr
     }
 
@@ -2050,9 +2382,7 @@ impl<P: AuPlugin> Wrapper<P> {
         let proc_addr = proc as usize;
         if let Ok(mut guard) = this.listeners.lock() {
             guard.retain(|l| {
-                !(l.property_id == id
-                    && (l.proc as usize) == proc_addr
-                    && l.user_data == user_data)
+                !(l.property_id == id && (l.proc as usize) == proc_addr && l.user_data == user_data)
             });
         }
         au::noErr
@@ -2124,18 +2454,46 @@ fn string_to_cfstring(s: &str) -> au::CFStringRef {
     ptr as au::CFStringRef
 }
 
-/// True if the plugin advertises an `AudioIOLayout` whose main I/O matches
-/// `req_ch`. We require both `main_input_channels` and `main_output_channels`
-/// to match because AU effects use a single channel count for both sides.
-fn layout_supports<P: AuPlugin>(req_ch: u32) -> bool {
-    let req = match NonZeroU32::new(req_ch) {
-        Some(n) => n,
-        None => return false,
-    };
-    P::AUDIO_IO_LAYOUTS.iter().any(|layout| {
-        layout.main_input_channels == Some(req)
-            && layout.main_output_channels == Some(req)
-    })
+/// Find the declared layout for an AU main output channel count. This also
+/// covers instruments/generators whose `main_input_channels` is `None`.
+fn layout_for_output<P: AuPlugin>(channels: NonZeroU32) -> Option<&'static AudioIOLayout> {
+    P::AUDIO_IO_LAYOUTS
+        .iter()
+        .find(|layout| layout.main_output_channels == Some(channels))
+}
+
+fn current_layout<P: AuPlugin>(output_channels: u32) -> Option<&'static AudioIOLayout> {
+    NonZeroU32::new(output_channels).and_then(layout_for_output::<P>)
+}
+
+/// Return the channel count for a concrete AU bus. Input buses are laid out as
+/// the optional main input followed by auxiliary inputs; output bus zero is the
+/// main output (nih-plug does not expose auxiliary outputs through `Buffer`).
+fn bus_channel_count<P: AuPlugin>(
+    output_channels: u32,
+    scope: au::AudioUnitScope,
+    element: au::AudioUnitElement,
+) -> Option<u32> {
+    let layout = current_layout::<P>(output_channels)?;
+    match scope {
+        au::kAudioUnitScope_Output if element == 0 => {
+            layout.main_output_channels.map(NonZeroU32::get)
+        }
+        au::kAudioUnitScope_Input => {
+            let has_main = layout.main_input_channels.is_some();
+            if has_main && element == 0 {
+                return layout.main_input_channels.map(NonZeroU32::get);
+            }
+            let aux_base = u32::from(has_main);
+            let aux_idx = element.checked_sub(aux_base)? as usize;
+            layout
+                .aux_input_ports
+                .get(aux_idx)
+                .copied()
+                .map(NonZeroU32::get)
+        }
+        _ => None,
+    }
 }
 
 fn classify_unit(unit: &str) -> au::AudioUnitParameterUnit {
@@ -2176,8 +2534,8 @@ pub use Wrapper as AuWrapper;
 mod cocoaui {
     use std::collections::HashMap;
     use std::ffi::c_void;
-    use std::sync::{Arc, Mutex, OnceLock};
     use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use au_sys as au;
 
@@ -2194,7 +2552,8 @@ mod cocoaui {
     fn au_log(msg: &str) {
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
+            .create(true)
+            .append(true)
             .open("/tmp/nih_plug_au.log")
         {
             let _ = writeln!(f, "{}", msg);
@@ -2310,7 +2669,10 @@ mod cocoaui {
         container_ns_view: *mut c_void,
         handle_slot: *const c_void,
     ) {
-        au_log!("[nih-plug AU] cocoaui_close_view: container={:?}", container_ns_view);
+        au_log!(
+            "[nih-plug AU] cocoaui_close_view: container={:?}",
+            container_ns_view
+        );
         if !handle_slot.is_null() {
             unsafe { (*(handle_slot as *const GuiHandleSlot)).clear() };
         }
@@ -2361,7 +2723,10 @@ mod cocoaui {
             .lock()
             .expect("AU CocoaUI pending-spawn mutex poisoned")
             .insert(key, template);
-        au_log!("[nih-plug AU] cocoaui_view_info: spawn template stored for AU={:#x}", key);
+        au_log!(
+            "[nih-plug AU] cocoaui_view_info: spawn template stored for AU={:#x}",
+            key
+        );
 
         let bundle_url_ref = match unsafe { bundle_cf_url() } {
             Ok(r) => r,
@@ -2387,7 +2752,11 @@ mod cocoaui {
             return None;
         }
 
-        au_log!("[nih-plug AU] cocoaui_view_info: class={} bundle={:?}", VIEW_CLASS_NAME, bundle_url_ref);
+        au_log!(
+            "[nih-plug AU] cocoaui_view_info: class={} bundle={:?}",
+            VIEW_CLASS_NAME,
+            bundle_url_ref
+        );
         Some(au::AUCocoaViewInfo {
             mCocoaAUViewBundleLocation: bundle_url_ref,
             mCocoaAUViewClass: [class_name_ref],
@@ -2430,10 +2799,14 @@ mod cocoaui {
 
         // Foo.component/Contents/MacOS/Foo → Foo.component/
         let bundle_path = std::path::Path::new(dylib_path)
-            .parent().ok_or(())?  // MacOS/
-            .parent().ok_or(())?  // Contents/
-            .parent().ok_or(())?  // Foo.component/
-            .to_str().ok_or(())?;
+            .parent()
+            .ok_or(())? // MacOS/
+            .parent()
+            .ok_or(())? // Contents/
+            .parent()
+            .ok_or(())? // Foo.component/
+            .to_str()
+            .ok_or(())?;
 
         let path_bytes = bundle_path.as_bytes();
         let cf_url = unsafe {
@@ -2489,6 +2862,26 @@ fn buffer_fits_frames(buf: &au::AudioBuffer, n_samples: usize) -> bool {
     reported_bytes == 0 || reported_bytes / mem::size_of::<f32>() >= n_samples
 }
 
+/// Clear every host-backed slice before leaving `render()`. `RenderState`
+/// stores these with a widened lifetime, so no early-return path may retain a
+/// pointer after the host's AudioBufferList goes out of scope.
+unsafe fn clear_render_slices<P: AuPlugin>(state: &mut RenderState<P>) {
+    unsafe {
+        state.buffer.set_slices(0, |slots| {
+            for slot in slots.iter_mut() {
+                *slot = &mut [];
+            }
+        });
+        for aux_buffer in state.aux_buffers.iter_mut() {
+            aux_buffer.set_slices(0, |slots| {
+                for slot in slots.iter_mut() {
+                    *slot = &mut [];
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod buffer_list_tests {
     use super::*;
@@ -2519,10 +2912,7 @@ mod buffer_list_tests {
             let header_offset = mem::offset_of!(au::AudioBufferList, mBuffers);
             let buffers_ptr = (bl_ptr as *mut u8).add(header_offset) as *mut au::AudioBuffer;
 
-            *buffers_ptr.add(0) = buffer(
-                FRAMES * mem::size_of::<f32>(),
-                well_formed.as_mut_ptr(),
-            );
+            *buffers_ptr.add(0) = buffer(FRAMES * mem::size_of::<f32>(), well_formed.as_mut_ptr());
             // Only claims a single sample's worth of storage
             *buffers_ptr.add(1) = buffer(mem::size_of::<f32>(), undersized.as_mut_ptr());
             // A null payload must be skipped entirely
@@ -2553,12 +2943,178 @@ mod buffer_list_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::prelude::*;
+
+    #[derive(Default)]
+    struct InstrumentParams;
+
+    unsafe impl Params for InstrumentParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    struct TestInstrument {
+        params: Arc<InstrumentParams>,
+    }
+
+    impl Default for TestInstrument {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(InstrumentParams),
+            }
+        }
+    }
+
+    impl Plugin for TestInstrument {
+        const NAME: &'static str = "AU Instrument Test";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/robbert-vdh/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+            AudioIOLayout {
+                main_input_channels: None,
+                main_output_channels: NonZeroU32::new(2),
+                ..AudioIOLayout::const_default()
+            },
+            AudioIOLayout {
+                main_input_channels: None,
+                main_output_channels: NonZeroU32::new(1),
+                ..AudioIOLayout::const_default()
+            },
+        ];
+        const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::KeepAlive
+        }
+    }
+
+    impl AuPlugin for TestInstrument {
+        const AU_TYPE: [u8; 4] = *b"aumu";
+        const AU_SUBTYPE: [u8; 4] = *b"TstI";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    #[test]
+    fn instrument_has_no_audio_input_bus_and_exposes_music_device_selectors() {
+        let wrapper = Wrapper::<TestInstrument>::new() as *mut c_void;
+        let mut count = u32::MAX;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        assert_eq!(
+            unsafe {
+                Wrapper::<TestInstrument>::get_property(
+                    wrapper,
+                    au::kAudioUnitProperty_ElementCount,
+                    au::kAudioUnitScope_Input,
+                    0,
+                    &mut count as *mut u32 as *mut c_void,
+                    &mut size,
+                )
+            },
+            au::noErr
+        );
+        assert_eq!(count, 0);
+        assert_eq!(
+            bus_channel_count::<TestInstrument>(2, au::kAudioUnitScope_Output, 0),
+            Some(2)
+        );
+        assert_eq!(
+            bus_channel_count::<TestInstrument>(2, au::kAudioUnitScope_Input, 0),
+            None
+        );
+        assert!(
+            unsafe { Wrapper::<TestInstrument>::lookup(midi::MUSIC_DEVICE_MIDI_EVENT_SELECT) }
+                .is_some()
+        );
+        assert!(
+            unsafe { Wrapper::<TestInstrument>::lookup(midi::MUSIC_DEVICE_START_NOTE_SELECT) }
+                .is_some()
+        );
+
+        assert_eq!(
+            unsafe { Wrapper::<TestInstrument>::close(wrapper) },
+            au::noErr
+        );
+    }
+
+    #[test]
+    fn fixed_size_properties_reject_undersized_output_buffers() {
+        let wrapper = Wrapper::<TestInstrument>::new() as *mut c_void;
+        let properties = [
+            (
+                au::kAudioUnitProperty_ElementCount,
+                au::kAudioUnitScope_Input,
+            ),
+            (au::kAudioUnitProperty_Latency, au::kAudioUnitScope_Global),
+            (au::kAudioUnitProperty_TailTime, au::kAudioUnitScope_Global),
+            (
+                au::kAudioUnitProperty_MaximumFramesPerSlice,
+                au::kAudioUnitScope_Global,
+            ),
+            (
+                au::kAudioUnitProperty_BypassEffect,
+                au::kAudioUnitScope_Global,
+            ),
+            (
+                au::kAudioUnitProperty_LastRenderError,
+                au::kAudioUnitScope_Global,
+            ),
+            (
+                au::kAudioUnitProperty_InPlaceProcessing,
+                au::kAudioUnitScope_Global,
+            ),
+        ];
+        let mut output = 0u64;
+
+        for (property, scope) in properties {
+            let mut size = 0;
+            assert_eq!(
+                unsafe {
+                    Wrapper::<TestInstrument>::get_property(
+                        wrapper,
+                        property,
+                        scope,
+                        0,
+                        &mut output as *mut u64 as *mut c_void,
+                        &mut size,
+                    )
+                },
+                au::kAudioUnitErr_InvalidPropertyValue,
+                "property {property} accepted an undersized output buffer"
+            );
+        }
+
+        assert_eq!(
+            unsafe { Wrapper::<TestInstrument>::close(wrapper) },
+            au::noErr
+        );
+    }
 
     #[test]
     fn classify_unit_decibels() {
         assert_eq!(classify_unit("dB"), au::kAudioUnitParameterUnit_Decibels);
-        assert_eq!(classify_unit("decibel"), au::kAudioUnitParameterUnit_Decibels);
+        assert_eq!(
+            classify_unit("decibel"),
+            au::kAudioUnitParameterUnit_Decibels
+        );
         assert_eq!(classify_unit("dBFS"), au::kAudioUnitParameterUnit_Decibels);
     }
 
@@ -2572,20 +3128,29 @@ mod tests {
     #[test]
     fn classify_unit_percent() {
         assert_eq!(classify_unit("%"), au::kAudioUnitParameterUnit_Percent);
-        assert_eq!(classify_unit("percent"), au::kAudioUnitParameterUnit_Percent);
+        assert_eq!(
+            classify_unit("percent"),
+            au::kAudioUnitParameterUnit_Percent
+        );
     }
 
     #[test]
     fn classify_unit_seconds() {
         assert_eq!(classify_unit("ms"), au::kAudioUnitParameterUnit_Seconds);
         assert_eq!(classify_unit("sec"), au::kAudioUnitParameterUnit_Seconds);
-        assert_eq!(classify_unit("seconds"), au::kAudioUnitParameterUnit_Seconds);
+        assert_eq!(
+            classify_unit("seconds"),
+            au::kAudioUnitParameterUnit_Seconds
+        );
     }
 
     #[test]
     fn classify_unit_generic_fallback() {
         assert_eq!(classify_unit(""), au::kAudioUnitParameterUnit_Generic);
         assert_eq!(classify_unit("ratio"), au::kAudioUnitParameterUnit_Generic);
-        assert_eq!(classify_unit("semitones"), au::kAudioUnitParameterUnit_Generic);
+        assert_eq!(
+            classify_unit("semitones"),
+            au::kAudioUnitParameterUnit_Generic
+        );
     }
 }

@@ -651,6 +651,33 @@ impl<S: SysExMessage> NoteEvent<S> {
             NoteEvent::MidiSysEx { timing, .. } => *timing -= samples,
         }
     }
+
+    /// Clamp this event's sample offset to the last valid frame in a process
+    /// block. Wrappers call this at their host boundary so plugins never need
+    /// to defend against out-of-range host timestamps.
+    #[cfg_attr(not(feature = "au"), allow(dead_code))]
+    pub(crate) fn clamp_timing(&mut self, last_frame: u32) {
+        match self {
+            NoteEvent::NoteOn { timing, .. }
+            | NoteEvent::NoteOff { timing, .. }
+            | NoteEvent::Choke { timing, .. }
+            | NoteEvent::VoiceTerminated { timing, .. }
+            | NoteEvent::PolyModulation { timing, .. }
+            | NoteEvent::MonoAutomation { timing, .. }
+            | NoteEvent::PolyPressure { timing, .. }
+            | NoteEvent::PolyVolume { timing, .. }
+            | NoteEvent::PolyPan { timing, .. }
+            | NoteEvent::PolyTuning { timing, .. }
+            | NoteEvent::PolyVibrato { timing, .. }
+            | NoteEvent::PolyExpression { timing, .. }
+            | NoteEvent::PolyBrightness { timing, .. }
+            | NoteEvent::MidiChannelPressure { timing, .. }
+            | NoteEvent::MidiPitchBend { timing, .. }
+            | NoteEvent::MidiCC { timing, .. }
+            | NoteEvent::MidiProgramChange { timing, .. }
+            | NoteEvent::MidiSysEx { timing, .. } => *timing = (*timing).min(last_frame),
+        }
+    }
 }
 
 #[cfg(test)]
