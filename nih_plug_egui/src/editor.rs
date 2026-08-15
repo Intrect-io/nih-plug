@@ -3,6 +3,7 @@
 use crate::egui::Vec2;
 use crate::egui::ViewportCommand;
 use crate::EguiState;
+#[cfg(all(feature = "opengl", not(feature = "wgpu")))]
 use baseview::gl::GlConfig;
 use baseview::PhySize;
 use baseview::{Size, WindowHandle, WindowOpenOptions, WindowScalePolicy};
@@ -73,6 +74,9 @@ where
 
         let (unscaled_width, unscaled_height) = self.egui_state.size();
         let scaling_factor = self.scaling_factor.load();
+        // Repaint unconditionally for the first frames so the window is never blank while the
+        // host still has it unmapped, even when the plugin opted out of continuous repaints.
+        let mut warmup_frames = 30u32;
         let window = EguiWindow::open_parented(
             &ParentWindowHandleAdapter(parent),
             WindowOpenOptions {
@@ -85,7 +89,12 @@ where
                     .map(|factor| WindowScalePolicy::ScaleFactor(factor as f64))
                     .unwrap_or(WindowScalePolicy::SystemScaleFactor),
 
-                #[cfg(feature = "opengl")]
+                // `wgpu` creates its own surface, so leave baseview's GL context unset. The
+                // field still exists whenever anything in the graph enables `opengl`, hence
+                // the explicit `None` arm rather than just cfg'ing the initializer away.
+                #[cfg(all(feature = "opengl", feature = "wgpu"))]
+                gl_config: None,
+                #[cfg(all(feature = "opengl", not(feature = "wgpu")))]
                 gl_config: Some(GlConfig {
                     version: (3, 2),
                     red_bits: 8,
@@ -106,13 +115,29 @@ where
             move |egui_ctx, _queue, state| build(egui_ctx, &mut state.write()),
             move |egui_ctx, queue, state| {
                 let setter = ParamSetter::new(context.as_ref());
+                warmup_frames = warmup_frames.saturating_sub(1);
 
                 // If the window was requested to resize
                 if let Some(new_size) = egui_state.requested_size.swap(None) {
                     // Ask the plugin host to resize to self.size()
                     if context.request_resize() {
-                        // Resize the content of egui window
-                        queue.resize(PhySize::new(new_size.0, new_size.1));
+                        // new_size 는 논리 픽셀. baseview window.resize() 와
+                        // egui screen_rect 둘 다 갱신해야 한다.
+                        //
+                        // macOS standalone 에서는 NSWindow::setContentSize_ 로 OS 창은
+                        // 커지지만 WindowEvent::Resized 가 backing-property 변경 때만
+                        // 발생해 egui 의 physical_size/screen_rect 가 갱신되지 않는다
+                        // (커진 창의 좌상단 옛 크기 영역에만 GUI, 나머지 빈 배경).
+                        //
+                        // 그래서 queue.resize(PhySize) 로 egui 의 physical_size 를
+                        // 직접 갱신한다. physical_size 는 물리 픽셀이므로 DPI 배율을
+                        // 곱한다. ViewportCommand::InnerSize(논리) 는 baseview 의
+                        // window.resize() 를 호출해 OS 창 자체를 리사이즈한다.
+                        let ppp = egui_ctx.pixels_per_point();
+                        queue.resize(PhySize::new(
+                            (new_size.0 as f32 * ppp).round() as u32,
+                            (new_size.1 as f32 * ppp).round() as u32,
+                        ));
                         egui_ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
                             new_size.0 as f32,
                             new_size.1 as f32,
@@ -123,11 +148,17 @@ where
                     }
                 }
 
-                // For now, just always redraw. Most plugin GUIs have meters, and those almost always
-                // need a redraw. Later we can try to be a bit more sophisticated about this. Without
-                // this we would also have a blank GUI when it gets first opened because most DAWs open
-                // their GUI while the window is still unmapped.
-                egui_ctx.request_repaint();
+                // Most plugin GUIs have meters, and those almost always need a redraw, so by
+                // default just always redraw. Hosts also tend to open the GUI while the window is
+                // still unmapped, which would leave it blank without this.
+                //
+                // A plugin that schedules its own repaints can opt out through
+                // `EguiState::set_continuous_repaint(false)`; forcing an immediate repaint here
+                // pins `repaint_delay` to zero, which silently overrides any interval it asks for.
+                // The first frames are always repainted so the window never comes up blank.
+                if warmup_frames > 0 || egui_state.continuous_repaint() {
+                    egui_ctx.request_repaint();
+                }
                 (update)(egui_ctx, &setter, &mut state.write());
             },
         );

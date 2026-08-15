@@ -217,8 +217,11 @@ impl<const NUM_SIDECHAIN_INPUTS: usize> StftHelper<NUM_SIDECHAIN_INPUTS> {
     ///
     /// # Panics
     ///
-    /// Will panic if `block_size > max_block_size`.
+    /// Will panic if `block_size == 0 || block_size > max_block_size`.
     pub fn set_block_size(&mut self, block_size: usize) {
+        // The constructor rejects a zero block size for the same reason: the processing functions
+        // derive their window interval from it, and a zero interval cannot make progress
+        assert_ne!(block_size, 0);
         assert!(block_size <= self.main_input_ring_buffers[0].capacity());
 
         self.update_buffers(block_size);
@@ -280,7 +283,8 @@ impl<const NUM_SIDECHAIN_INPUTS: usize> StftHelper<NUM_SIDECHAIN_INPUTS> {
     ///
     /// Panics if `main_buffer` or the buffers in `sidechain_buffers` do not have the same number of
     /// channels as this [`StftHelper`], or if the sidechain buffers do not contain the same number of
-    /// samples as the main buffer.
+    /// samples as the main buffer. Also panics if `overlap_times` is zero or larger than the
+    /// current block size, since the window interval is `block_size / overlap_times`.
     ///
     /// TODO: Add more useful ways to do STFT and other buffered operations. I just went with this
     ///       approach because it's what I needed myself, but generic combinators like this could
@@ -333,6 +337,28 @@ impl<const NUM_SIDECHAIN_INPUTS: usize> StftHelper<NUM_SIDECHAIN_INPUTS> {
         let main_buffer_len = main_buffer.num_samples();
         let num_channels = main_buffer.num_channels();
         let block_size = self.main_input_ring_buffers[0].len();
+
+        // The sidechain buffers are indexed through unchecked accessors below, so their dimensions
+        // need to be verified here. An empty input is how `process_overlap_add()` opts out of the
+        // sidechain inputs; those are zero filled instead of being read from.
+        for sidechain_buffer in &sidechain_buffers {
+            // Only the indices actually read below matter, so a sidechain input that is longer than
+            // the main buffer stays valid; the tail is simply not consumed this call
+            assert!(
+                (sidechain_buffer.num_channels() == 0 && sidechain_buffer.num_samples() == 0)
+                    || (sidechain_buffer.num_channels() >= num_channels
+                        && sidechain_buffer.num_samples() >= main_buffer_len),
+                "The sidechain buffers need to cover at least as many channels as this \
+                 `StftHelper` and at least as many samples as the main buffer"
+            );
+        }
+
+        // A window interval of zero would make the `rem_euclid()` below panic, and the loop could
+        // never advance past it
+        assert!(
+            overlap_times <= block_size,
+            "The overlap amount cannot exceed the block size"
+        );
         let window_interval = (block_size / overlap_times) as i32;
         let mut already_processed_samples = 0;
         while already_processed_samples < main_buffer_len {
@@ -377,13 +403,22 @@ impl<const NUM_SIDECHAIN_INPUTS: usize> StftHelper<NUM_SIDECHAIN_INPUTS> {
                 .iter()
                 .zip(self.sidechain_ring_buffers.iter_mut())
             {
+                // Validated above: the dimensions either match the main buffer, or the input is
+                // empty and must not be indexed at all
+                let has_samples =
+                    sidechain_buffer.num_channels() > 0 && sidechain_buffer.num_samples() > 0;
+
                 for sample_offset in 0..samples_to_process {
                     for channel_idx in 0..num_channels {
-                        let sample = unsafe {
-                            sidechain_buffer.get_sample_unchecked(
-                                channel_idx,
-                                already_processed_samples + sample_offset,
-                            )
+                        let sample = if has_samples {
+                            unsafe {
+                                sidechain_buffer.get_sample_unchecked(
+                                    channel_idx,
+                                    already_processed_samples + sample_offset,
+                                )
+                            }
+                        } else {
+                            0.0
                         };
                         let ring_buffer_sample = unsafe {
                             sidechain_ring_buffers
@@ -509,6 +544,10 @@ impl<const NUM_SIDECHAIN_INPUTS: usize> StftHelper<NUM_SIDECHAIN_INPUTS> {
         let main_buffer_len = buffer.num_samples();
         let num_channels = buffer.num_channels();
         let block_size = self.main_input_ring_buffers[0].len();
+        assert!(
+            overlap_times <= block_size,
+            "The overlap amount cannot exceed the block size"
+        );
         let window_interval = (block_size / overlap_times) as i32;
         let mut already_processed_samples = 0;
         while already_processed_samples < main_buffer_len {

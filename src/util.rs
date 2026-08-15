@@ -76,7 +76,7 @@ pub fn gain_to_db_fast(gain: f32) -> f32 {
 #[inline]
 pub fn gain_to_db_fast_epsilon(gain: f32) -> f32 {
     const CONVERSION_FACTOR: f32 = std::f32::consts::LOG10_E * 20.0;
-    f32::max(gain, MINUS_INFINITY_GAIN).ln() * CONVERSION_FACTOR
+    f32::max(gain, f32::EPSILON).ln() * CONVERSION_FACTOR
 }
 
 /// Convert a MIDI note ID to a frequency at A4 = 440 Hz equal temperament and middle C = note 60 =
@@ -191,6 +191,49 @@ mod tests {
         #[test]
         fn test_gain_to_db_minus_infinity_negative() {
             approx::assert_relative_eq!(gain_to_db(-2.0), gain_to_db_fast(-2.0), epsilon = 1e-7);
+        }
+    }
+
+    mod epsilon_db_gain_conversion {
+        use super::super::*;
+
+        /// The epsilon variant must floor at `f32::EPSILON` instead of `MINUS_INFINITY_GAIN`, or
+        /// gains in `[f32::EPSILON, MINUS_INFINITY_GAIN)` are clamped to -100 dB.
+        #[test]
+        fn test_gain_to_db_fast_epsilon_below_minus_infinity_gain() {
+            let gain = MINUS_INFINITY_GAIN / 10.0;
+            assert!(gain > f32::EPSILON);
+
+            approx::assert_relative_eq!(
+                gain_to_db_fast_epsilon(gain),
+                gain_to_db(MINUS_INFINITY_GAIN) - 20.0,
+                epsilon = 1e-4
+            );
+            assert!(gain_to_db_fast_epsilon(gain) < MINUS_INFINITY_DB);
+        }
+
+        #[test]
+        fn test_gain_to_db_fast_epsilon_floor() {
+            assert_eq!(
+                gain_to_db_fast_epsilon(0.0),
+                gain_to_db_fast_epsilon(f32::EPSILON)
+            );
+            assert_eq!(
+                gain_to_db_fast_epsilon(-2.0),
+                gain_to_db_fast_epsilon(f32::EPSILON)
+            );
+        }
+
+        /// `db_to_gain_fast()` is the documented counterpart, so normal gains must roundtrip.
+        #[test]
+        fn test_db_to_gain_fast_roundtrip() {
+            for gain in [1.0f32, 0.5, 0.25, 1e-3, 1e-6] {
+                approx::assert_relative_eq!(
+                    db_to_gain_fast(gain_to_db_fast_epsilon(gain)),
+                    gain,
+                    epsilon = 1e-7
+                );
+            }
         }
     }
 }

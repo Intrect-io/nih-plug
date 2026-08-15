@@ -30,6 +30,10 @@ pub struct BufferManager {
     aux_input_channel_pointers: Vec<Option<ChannelPointers>>,
     aux_output_channel_pointers: Vec<Option<ChannelPointers>>,
 
+    /// The block size the backing buffers were preallocated for. `create_buffers()` must not
+    /// allocate, so blocks larger than this are truncated instead of growing the storage.
+    max_buffer_size: usize,
+
     /// The backing buffers that will be filled during `create_buffers`. This `'static` lifetime
     /// will be shortened when returning a reference to these buffers in `create_buffers` to match
     /// the function's lifetime.
@@ -137,6 +141,8 @@ impl BufferManager {
             aux_input_channel_pointers: vec![None; audio_io_layout.aux_input_ports.len()],
             aux_output_channel_pointers: vec![None; audio_io_layout.aux_output_ports.len()],
 
+            max_buffer_size,
+
             main_buffer,
 
             aux_input_buffers,
@@ -170,6 +176,18 @@ impl BufferManager {
         num_samples: usize,
         set_buffer_sources: impl FnOnce(&mut BufferSource),
     ) -> Buffers<'a, 'buffer> {
+        // The auxiliary input storage was preallocated for `max_buffer_size` samples, so a larger
+        // block makes the copy below reallocate on the audio thread. Truncating the block instead
+        // would silently drop the tail of the host's buffer — a correctness bug in exchange for a
+        // latency spike — so this only flags the host's contract violation.
+        nih_debug_assert!(
+            num_samples <= self.max_buffer_size,
+            "The host asked for a {} sample block, but the buffers were allocated for at most {} \
+             samples. The auxiliary input storage has to grow to match.",
+            num_samples,
+            self.max_buffer_size
+        );
+
         // Make sure the caller can't forget to unset previously set values
         self.main_input_channel_pointers = None;
         self.main_output_channel_pointers = None;
@@ -202,8 +220,12 @@ impl BufferManager {
                     }
 
                     // If the caller/host should have provided buffer pointers but didn't then we
-                    // must get rid of any dangling slices
-                    output_slices[output_channel_pointers.num_channels..].fill_with(|| &mut [])
+                    // must get rid of any dangling slices. The host may also report more channels
+                    // than this layout was configured for, in which case there is nothing left to
+                    // clear.
+                    let assigned_channels =
+                        output_channel_pointers.num_channels.min(output_slices.len());
+                    output_slices[assigned_channels..].fill_with(|| &mut [])
                 }
                 None => {
                     nih_debug_assert_eq!(output_slices.len(), 0);
@@ -220,15 +242,20 @@ impl BufferManager {
             self.main_input_channel_pointers,
             self.main_output_channel_pointers,
         ) {
+            // Both pointer arrays are indexed with the same channel index below, so the copy needs
+            // to stop at whichever of the two is shorter. A host reporting more input than output
+            // channels would otherwise read past the end of the output pointer array.
+            let copied_channels = input_channel_pointers
+                .num_channels
+                .min(output_channel_pointers.num_channels);
+            nih_debug_assert_eq!(copied_channels, input_channel_pointers.num_channels);
+
             self.main_buffer.set_slices(num_samples, |output_slices| {
-                for (channel_idx, output_slice) in output_slices
-                    .iter_mut()
-                    .enumerate()
-                    .take(input_channel_pointers.num_channels)
+                for (channel_idx, output_slice) in
+                    output_slices.iter_mut().enumerate().take(copied_channels)
                 {
                     let input_channel_pointer =
                         *input_channel_pointers.ptrs.as_ptr().add(channel_idx);
-                    debug_assert!(channel_idx < output_channel_pointers.num_channels);
                     let output_channel_pointer =
                         *output_channel_pointers.ptrs.as_ptr().add(channel_idx);
 
@@ -245,9 +272,11 @@ impl BufferManager {
 
             // Any excess channels will need to be filled with zeroes since they'd otherwise point
             // to whatever was left in the buffer
-            if input_channel_pointers.num_channels < output_channel_pointers.num_channels {
+            if copied_channels < output_channel_pointers.num_channels {
                 self.main_buffer.set_slices(num_samples, |output_slices| {
-                    for slice in &mut output_slices[input_channel_pointers.num_channels..] {
+                    // The host may report more output channels than this layout was configured for
+                    let uncopied_channels = copied_channels.min(output_slices.len());
+                    for slice in &mut output_slices[uncopied_channels..] {
                         slice.fill(0.0);
                     }
                 });
@@ -349,8 +378,11 @@ impl BufferManager {
                         }
 
                         // If the caller/host should have provided buffer pointers but didn't then
-                        // we must get rid of any dangling slices
-                        output_slices[output_channel_pointers.num_channels..].fill_with(|| &mut [])
+                        // we must get rid of any dangling slices. See the main output bus for why
+                        // this is clamped.
+                        let assigned_channels =
+                            output_channel_pointers.num_channels.min(output_slices.len());
+                        output_slices[assigned_channels..].fill_with(|| &mut [])
                     }
                     None => {
                         nih_debug_assert_eq!(output_slices.len(), 0);
@@ -499,6 +531,122 @@ mod miri {
             for sample in channel {
                 assert!(*sample == 0.0);
             }
+        }
+    }
+
+    /// The contract violations below are caught by debug assertions, which `nih_debug_assert!()`
+    /// upgrades to panicking assertions during tests. That leaves the release behavior—which is what
+    /// actually needs to not be undefined—only reachable through `cargo test --release`.
+    #[cfg(not(debug_assertions))]
+    mod release_only {
+        use super::*;
+
+        /// A layout without auxiliary ports, so these tests only have to set up the main IO.
+        const MAIN_ONLY_AUDIO_IO_LAYOUT: AudioIOLayout = AudioIOLayout {
+            main_input_channels: Some(new_nonzero_u32(NUM_MAIN_INPUT_CHANNELS as u32)),
+            main_output_channels: Some(new_nonzero_u32(NUM_MAIN_OUTPUT_CHANNELS as u32)),
+            aux_input_ports: &[],
+            aux_output_ports: &[],
+            names: PortNames::const_default(),
+        };
+
+        /// Set up the main IO from separate input and output storage, reporting
+        /// `num_input_channels`/`num_output_channels` to the buffer manager. The pointer arrays are
+        /// sized to match what is reported, so indexing past a reported count is a genuine
+        /// out of bounds access that miri catches. Returns the number of samples in the resulting
+        /// main buffer.
+        fn create_main_buffers(
+            buffer_manager: &mut BufferManager,
+            input_storage: &mut [Vec<f32>],
+            output_storage: &mut [Vec<f32>],
+            num_samples: usize,
+        ) -> usize {
+            let num_input_channels = input_storage.len();
+            let num_output_channels = output_storage.len();
+
+            let mut input_pointers: Vec<*mut f32> = input_storage
+                .iter_mut()
+                .map(|channel_slice| channel_slice.as_mut_ptr())
+                .collect();
+            let mut output_pointers: Vec<*mut f32> = output_storage
+                .iter_mut()
+                .map(|channel_slice| channel_slice.as_mut_ptr())
+                .collect();
+
+            let buffers = unsafe {
+                buffer_manager.create_buffers(0, num_samples, |buffer_sources| {
+                    *buffer_sources.main_output_channel_pointers = Some(ChannelPointers {
+                        ptrs: NonNull::new(output_pointers.as_mut_ptr()).unwrap(),
+                        num_channels: num_output_channels,
+                    });
+                    *buffer_sources.main_input_channel_pointers = Some(ChannelPointers {
+                        ptrs: NonNull::new(input_pointers.as_mut_ptr()).unwrap(),
+                        num_channels: num_input_channels,
+                    });
+                })
+            };
+
+            buffers.main_buffer.samples()
+        }
+
+        /// A block larger than `max_buffer_size` violates the host's own contract, but the audio
+        /// still has to come out intact: truncating it here would silently drop the tail of the
+        /// host's buffer. Only the auxiliary input storage has to grow to match.
+        #[test]
+        fn oversized_block_is_not_truncated() {
+            let mut input_storage = vec![vec![0.0f32; BUFFER_SIZE * 2]; NUM_MAIN_INPUT_CHANNELS];
+            let mut output_storage = vec![vec![0.0f32; BUFFER_SIZE * 2]; NUM_MAIN_OUTPUT_CHANNELS];
+            let mut buffer_manager =
+                BufferManager::for_audio_io_layout(BUFFER_SIZE, MAIN_ONLY_AUDIO_IO_LAYOUT);
+
+            let samples = create_main_buffers(
+                &mut buffer_manager,
+                &mut input_storage,
+                &mut output_storage,
+                BUFFER_SIZE * 2,
+            );
+            assert_eq!(samples, BUFFER_SIZE * 2);
+        }
+
+        /// A host reporting more output channels than the layout was configured for used to index
+        /// past the end of the output slices.
+        #[test]
+        fn excess_host_output_channels_are_ignored() {
+            let mut input_storage = vec![vec![0.0f32; BUFFER_SIZE]; NUM_MAIN_INPUT_CHANNELS];
+            let mut output_storage =
+                vec![vec![0.0f32; BUFFER_SIZE]; NUM_MAIN_OUTPUT_CHANNELS + 2];
+            let mut buffer_manager =
+                BufferManager::for_audio_io_layout(BUFFER_SIZE, MAIN_ONLY_AUDIO_IO_LAYOUT);
+
+            let samples = create_main_buffers(
+                &mut buffer_manager,
+                &mut input_storage,
+                &mut output_storage,
+                BUFFER_SIZE,
+            );
+            assert_eq!(samples, BUFFER_SIZE);
+        }
+
+        /// A host reporting more input than output channels used to read past the end of the output
+        /// pointer array while copying the main input to the main output. The output pointer array
+        /// here is exactly one entry long, so the old code's second read was out of bounds.
+        #[test]
+        fn excess_host_input_channels_are_ignored() {
+            let mut input_storage = vec![vec![1.0f32; BUFFER_SIZE]; NUM_MAIN_OUTPUT_CHANNELS + 2];
+            let mut output_storage = vec![vec![0.0f32; BUFFER_SIZE]; 1];
+            let mut buffer_manager =
+                BufferManager::for_audio_io_layout(BUFFER_SIZE, MAIN_ONLY_AUDIO_IO_LAYOUT);
+
+            let samples = create_main_buffers(
+                &mut buffer_manager,
+                &mut input_storage,
+                &mut output_storage,
+                BUFFER_SIZE,
+            );
+            assert_eq!(samples, BUFFER_SIZE);
+
+            // Only the single channel the host actually provided may have been written to
+            assert!(output_storage[0].iter().all(|sample| *sample == 1.0));
         }
     }
 }

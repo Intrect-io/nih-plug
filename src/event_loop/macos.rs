@@ -1,6 +1,6 @@
 //! An event loop implementation for macOS.
 
-use core_foundation::base::kCFAllocatorDefault;
+use core_foundation::base::{kCFAllocatorDefault, CFRelease};
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopRemoveSource,
     CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceInvalidate, CFRunLoopSourceRef,
@@ -126,6 +126,9 @@ impl<T, E> Drop for MacOSEventLoop<T, E> {
                 kCFRunLoopCommonModes,
             );
             CFRunLoopSourceInvalidate(self.loop_source.0);
+            // `CFRunLoopSourceCreate()` follows the create rule, so this owns a reference that needs
+            // to be released or the source leaks for every instance of the plugin
+            CFRelease(self.loop_source.0 as _);
         }
     }
 }

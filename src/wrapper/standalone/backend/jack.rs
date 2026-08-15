@@ -65,7 +65,12 @@ impl<P: Plugin> Backend<P> for Jack {
             + 'static
             + Send,
     ) {
-        let client = self.client.take().unwrap();
+        // This is `None` if a previous `run()` call could not hand the client back, which happens
+        // when the JACK server disappears
+        let Some(client) = self.client.take() else {
+            nih_error!("The JACK client is no longer available");
+            return;
+        };
         let buffer_size = client.buffer_size();
 
         // We'll preallocate the buffers here, and then assign them to the slices belonging to the
@@ -302,7 +307,15 @@ impl<P: Plugin> Backend<P> for Jack {
         // PipeWire lets us connect the ports whenever we want, but JACK2 is very strict and only
         // allows us to connect the ports when the client is active. And the connections will
         // disappear when the client is deactivated. Fun.
-        let async_client = client.activate_async((), process_handler).unwrap();
+        // The JACK server may have shut down between creating the client and activating it, and
+        // panicking here takes the whole standalone down with it
+        let async_client = match client.activate_async((), process_handler) {
+            Ok(async_client) => async_client,
+            Err(err) => {
+                nih_error!("Could not activate the JACK client: {err}");
+                return;
+            }
+        };
         if let Err(err) = self.connect_ports(&async_client) {
             nih_error!("Error connecting JACK ports: {err}")
         }
@@ -311,9 +324,13 @@ impl<P: Plugin> Backend<P> for Jack {
         // get the request to shut down or until the process callback runs into an error
         parker.park();
 
-        // And put the client back where it belongs in case this function is called a second time
-        let (client, _, _) = async_client.deactivate().unwrap();
-        self.client = Some(client);
+        // And put the client back where it belongs in case this function is called a second time.
+        // If the server went away then the client is gone with it, so leave `self.client` empty
+        // rather than panicking; `run()` already took it out above.
+        match async_client.deactivate() {
+            Ok((client, _, _)) => self.client = Some(client),
+            Err(err) => nih_error!("Could not deactivate the JACK client: {err}"),
+        }
     }
 }
 

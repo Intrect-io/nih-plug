@@ -13,8 +13,8 @@ use vst3_sys::vst::{
     kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, Event, EventTypes, IAudioProcessor,
     IComponent, IEditController, IEventList, IMidiMapping, INoteExpressionController,
     IParamValueQueue, IParameterChanges, IProcessContextRequirements, IUnitInfo,
-    LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription, NoteOffEvent,
-    NoteOnEvent, ParameterFlags, PolyPressureEvent, ProgramListInfo, TChar, UnitInfo,
+    AudioBusBuffers, LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription,
+    NoteOffEvent, NoteOnEvent, ParameterFlags, PolyPressureEvent, ProgramListInfo, TChar, UnitInfo,
 };
 use vst3_sys::VST3;
 use widestring::U16CStr;
@@ -28,7 +28,7 @@ use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 use super::view::WrapperView;
 use crate::prelude::{
     AuxiliaryBuffers, BufferConfig, MidiConfig, NoteEvent, ParamFlags, ProcessMode, ProcessStatus,
-    SysExMessage, Transport, Vst3Plugin,
+    Transport, Vst3Plugin,
 };
 use crate::util::permit_alloc;
 use crate::wrapper::state;
@@ -1102,6 +1102,10 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                             }));
                         } else if event.type_ == EventTypes::kNoteOffEvent as u16 {
                             let event = event.event.note_off;
+
+                            // The note ID mapping is only needed while the note is sounding
+                            note_expression_controller.unregister_note(&event);
+
                             process_events.push(ProcessEvent::NoteEvent(NoteEvent::NoteOff {
                                 timing,
                                 voice_id: if event.note_id != -1 {
@@ -1145,12 +1149,19 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
 
                             // `NoteEvent::from_midi` prints some tracing if parsing fails, which is
                             // not necessarily an error
-                            assert!(!event.bytes.is_null());
-                            let sysex_buffer =
-                                std::slice::from_raw_parts(event.bytes, event.size as usize);
-                            if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
-                                process_events.push(ProcessEvent::NoteEvent(note_event));
-                            };
+                            if event.bytes.is_null() {
+                                // Panicking here would unwind across the VST3 C ABI from the audio
+                                // thread and take the host down with it
+                                nih_debug_assert_failure!(
+                                    "The host sent a SysEx event without a buffer"
+                                );
+                            } else {
+                                let sysex_buffer =
+                                    std::slice::from_raw_parts(event.bytes, event.size as usize);
+                                if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
+                                    process_events.push(ProcessEvent::NoteEvent(note_event));
+                                };
+                            }
                         }
                     }
                 }
@@ -1259,53 +1270,18 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     Some(ChannelPointers { ptrs, num_channels });
                             }
 
-                            if !data.inputs.is_null() {
-                                for (aux_input_no, aux_input_channel_pointers) in buffer_source
-                                    .aux_input_channel_pointers
-                                    .iter_mut()
-                                    .enumerate()
-                                {
-                                    let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                    if aux_input_idx > data.num_outputs as usize {
-                                        break;
-                                    }
-
-                                    let audio_input = &*data.inputs.add(aux_input_idx);
-                                    match NonNull::new(audio_input.buffers as *mut *mut f32) {
-                                        Some(ptrs) => {
-                                            let num_channels = audio_input.num_channels as usize;
-
-                                            *aux_input_channel_pointers =
-                                                Some(ChannelPointers { ptrs, num_channels });
-                                        }
-                                        None => continue,
-                                    }
-                                }
-                            }
-
-                            if !data.outputs.is_null() {
-                                for (aux_output_no, aux_output_channel_pointers) in buffer_source
-                                    .aux_output_channel_pointers
-                                    .iter_mut()
-                                    .enumerate()
-                                {
-                                    let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                    if aux_output_idx > data.num_outputs as usize {
-                                        break;
-                                    }
-
-                                    let audio_output = &*data.outputs.add(aux_output_idx);
-                                    match NonNull::new(audio_output.buffers as *mut *mut f32) {
-                                        Some(ptrs) => {
-                                            let num_channels = audio_output.num_channels as usize;
-
-                                            *aux_output_channel_pointers =
-                                                Some(ChannelPointers { ptrs, num_channels });
-                                        }
-                                        None => continue,
-                                    }
-                                }
-                            }
+                            assign_aux_channel_pointers(
+                                buffer_source.aux_input_channel_pointers,
+                                data.inputs,
+                                data.num_inputs,
+                                aux_input_start_idx,
+                            );
+                            assign_aux_channel_pointers(
+                                buffer_source.aux_output_channel_pointers,
+                                data.outputs,
+                                data.num_outputs,
+                                aux_output_start_idx,
+                            );
                         });
 
                     // We already checked whether the host has initiated a parameter flush, but in
@@ -1605,9 +1581,9 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                             NoteEvent::MidiSysEx { timing: _, message }
                                 if P::MIDI_OUTPUT >= MidiConfig::Basic =>
                             {
-                                let (padded_sysex_buffer, length) = message.to_buffer();
+                                let (padded_sysex_buffer, length) =
+                                    crate::midi::sysex::to_buffer_checked(message);
                                 let padded_sysex_buffer = padded_sysex_buffer.borrow();
-                                nih_debug_assert!(padded_sysex_buffer.len() >= length);
                                 let sysex_buffer = &padded_sysex_buffer[..length];
 
                                 vst3_event.type_ = EventTypes::kDataEvent as u16;
@@ -1891,5 +1867,139 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         _data: SharedVstPtr<dyn IBStream>,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+/// Wire the host's auxiliary bus buffers into `channel_pointers`.
+///
+/// The plugin's auxiliary busses start at `start_idx` in the host's bus array, which also holds the
+/// main bus. `num_busses` is what the host reported for that array, and it does not have to match
+/// the plugin's layout: hosts may provide fewer busses than the plugin declares. Indexing has to be
+/// bounded by that count and by the direction's own array, or this reads past the end of the host's
+/// allocation.
+///
+/// # Safety
+///
+/// `busses` must either be null or point to at least `num_busses` [`AudioBusBuffers`].
+unsafe fn assign_aux_channel_pointers(
+    channel_pointers: &mut [Option<ChannelPointers>],
+    busses: *const AudioBusBuffers,
+    num_busses: i32,
+    start_idx: usize,
+) {
+    if busses.is_null() {
+        return;
+    }
+
+    let num_busses = num_busses.max(0) as usize;
+    for (aux_no, aux_channel_pointers) in channel_pointers.iter_mut().enumerate() {
+        let bus_idx = aux_no + start_idx;
+        // An index equal to the bus count is already one past the end of the array
+        if bus_idx >= num_busses {
+            break;
+        }
+
+        let bus = &*busses.add(bus_idx);
+        match NonNull::new(bus.buffers as *mut *mut f32) {
+            Some(ptrs) => {
+                *aux_channel_pointers = Some(ChannelPointers {
+                    ptrs,
+                    num_channels: bus.num_channels.max(0) as usize,
+                });
+            }
+            None => continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod aux_bus_tests {
+    use super::*;
+
+    /// Build a host bus array where every bus points at the same dummy channel pointer array.
+    fn busses(num_channels: &[i32], channel_ptrs: &mut [*mut f32]) -> Vec<AudioBusBuffers> {
+        num_channels
+            .iter()
+            .map(|num_channels| AudioBusBuffers {
+                num_channels: *num_channels,
+                silence_flags: 0,
+                buffers: channel_ptrs.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn null_bus_arrays_are_ignored() {
+        let mut channel_pointers = vec![None; 2];
+
+        unsafe { assign_aux_channel_pointers(&mut channel_pointers, std::ptr::null(), 4, 1) };
+
+        assert!(channel_pointers.iter().all(Option::is_none));
+    }
+
+    /// The auxiliary busses used to be bounded against the number of *output* busses regardless of
+    /// direction, so an asymmetric layout could index past the end of the input array.
+    #[test]
+    fn fewer_host_busses_than_the_layout_declares() {
+        let mut sample = 0.0f32;
+        let mut channel_ptrs = [&mut sample as *mut f32];
+        // One main bus plus a single auxiliary bus, while the plugin declares three auxiliary busses
+        let host_busses = busses(&[2, 1], &mut channel_ptrs);
+
+        let mut channel_pointers = vec![None; 3];
+        unsafe {
+            assign_aux_channel_pointers(
+                &mut channel_pointers,
+                host_busses.as_ptr(),
+                host_busses.len() as i32,
+                1,
+            )
+        };
+
+        assert_eq!(channel_pointers[0].map(|p| p.num_channels), Some(1));
+        assert!(channel_pointers[1].is_none());
+        assert!(channel_pointers[2].is_none());
+    }
+
+    #[test]
+    fn all_available_busses_are_assigned() {
+        let mut sample = 0.0f32;
+        let mut channel_ptrs = [&mut sample as *mut f32];
+        let host_busses = busses(&[2, 1, 4], &mut channel_ptrs);
+
+        let mut channel_pointers = vec![None; 2];
+        unsafe {
+            assign_aux_channel_pointers(
+                &mut channel_pointers,
+                host_busses.as_ptr(),
+                host_busses.len() as i32,
+                1,
+            )
+        };
+
+        assert_eq!(channel_pointers[0].map(|p| p.num_channels), Some(1));
+        assert_eq!(channel_pointers[1].map(|p| p.num_channels), Some(4));
+    }
+
+    /// A host reporting a negative bus or channel count must not turn into an enormous `usize`.
+    #[test]
+    fn negative_counts_are_clamped() {
+        let mut sample = 0.0f32;
+        let mut channel_ptrs = [&mut sample as *mut f32];
+        let host_busses = busses(&[2, -1], &mut channel_ptrs);
+
+        let mut channel_pointers = vec![None; 1];
+        unsafe { assign_aux_channel_pointers(&mut channel_pointers, host_busses.as_ptr(), -1, 1) };
+        assert!(channel_pointers[0].is_none());
+
+        unsafe {
+            assign_aux_channel_pointers(
+                &mut channel_pointers,
+                host_busses.as_ptr(),
+                host_busses.len() as i32,
+                1,
+            )
+        };
+        assert_eq!(channel_pointers[0].map(|p| p.num_channels), Some(0));
     }
 }

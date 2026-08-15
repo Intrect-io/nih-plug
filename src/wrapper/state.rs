@@ -244,7 +244,7 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
 /// multiple places. The returned state object can be passed to [`deserialize_object()`].
 pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
     #[cfg(feature = "zstd")]
-    let result: Option<PluginState> = match zstd::decode_all(state) {
+    let result: Option<PluginState> = match decode_all_bounded(state) {
         Ok(decompressed) => match serde_json::from_slice(decompressed.as_slice()) {
             Ok(s) => {
                 let state_bytes = decompressed.len();
@@ -291,4 +291,37 @@ pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
     };
 
     result
+}
+
+/// The maximum size of a plugin state blob, both as read from a host provided stream and after
+/// decompressing it. Zstandard can expand data by several orders of magnitude and the CLAP state
+/// stream carries a host controlled length prefix, so without a bound a malformed or hostile project
+/// file could make the host allocate until it runs out of memory. Plugins may persist sample data
+/// alongside their parameters, so this is set generously.
+pub(crate) const MAX_STATE_SIZE: u64 = 1 << 30;
+
+/// [`zstd::decode_all()`], but refusing to allocate more than [`MAX_STATE_SIZE`] bytes.
+#[cfg(feature = "zstd")]
+fn decode_all_bounded(state: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut decoder = zstd::Decoder::new(state)?;
+    let mut decompressed = Vec::new();
+    // Reading one byte past the limit is what makes an oversized blob distinguishable from one that
+    // exactly fills it
+    decoder
+        .by_ref()
+        .take(MAX_STATE_SIZE + 1)
+        .read_to_end(&mut decompressed)?;
+
+    if decompressed.len() as u64 > MAX_STATE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "The state decompresses to more than the maximum supported {MAX_STATE_SIZE} bytes"
+            ),
+        ));
+    }
+
+    Ok(decompressed)
 }

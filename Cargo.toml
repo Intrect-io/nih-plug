@@ -3,6 +3,7 @@ name = "nih_plug"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.80"
+links = "nih_plug_cocoaui"
 authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
 license = "ISC"
 
@@ -63,6 +64,9 @@ standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "
 # wrapper you might otherwise still include a couple (unused) symbols from the
 # `vst3-sys` crate.
 vst3 = ["dep:vst3-sys"]
+# Enables the `nih_export_au!()` macro for Apple Audio Unit (AUv2) plugins on macOS.
+# Builds AudioComponentPlugInInterface vtable + Cocoa view (objc2-app-kit).
+au = ["dep:au-sys", "dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
 # Add adapters to the Buffer object for reading the channel data to and from
 # `std::simd` vectors. Requires a nightly compiler.
 simd = []
@@ -120,12 +124,22 @@ zstd = { version = "0.12.3", optional = true }
 [dev-dependencies]
 approx = "0.5.1"
 
-[target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies]
+# Used for the Linux event loop, and by the standalone wrapper's SIGINT handling on all Unices
+[target.'cfg(target_family = "unix")'.dependencies]
 libc = "0.2.124"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
 core-foundation = "0.9.3"
+
+# Used for the `au` feature (Apple Audio Unit v2 plugin wrapper).
+au-sys = { version = "0.1", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-app-kit = { version = "0.3", optional = true }
+
+[build-dependencies]
+cc = { version = "1.0", optional = false }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.44"
@@ -133,6 +147,7 @@ features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Console",
   "Win32_System_LibraryLoader",
   "Win32_System_Performance",
 ]
@@ -145,3 +160,18 @@ strip = "symbols"
 inherits = "release"
 debug = true
 strip = "none"
+
+# AUD-379: baseview patched to guard against null BASEVIEW_STATE_IVAR in
+# become_first_responder / resign_first_responder.  The crash happens when
+# an AU host calls uiViewForAudioUnit:withSize: on a parent view that is
+# already attached to a window: addSubview: fires viewWillMoveToWindow which
+# calls makeFirstResponder before WindowState has been stored in the ivar.
+#
+# Pinned by commit rather than to the vendor/baseview gitlink: that gitlink had
+# no .gitmodules entry and its only remote was a local cargo cache directory,
+# so cargo could not fetch this repo as a git dependency at all
+# ("no URL configured for submodule 'vendor/baseview'"). The fork now carries
+# the same patch in a form any clone can resolve. AUD-660's 60 Hz frame-clock
+# retune rides on the same commit.
+[patch."https://github.com/RustAudio/baseview.git"]
+baseview = { git = "https://github.com/Intrect-io/baseview.git", rev = "11cb5d195309a3d76bde73c31da984445f175d19" }

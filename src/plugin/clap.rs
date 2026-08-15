@@ -31,10 +31,28 @@ pub trait ClapPlugin: Plugin {
 pub struct PolyModulationConfig {
     /// The maximum number of voices this plugin will ever use. Call the context's
     /// `set_current_voice_capacity()` method during initialization or audio processing to set the
-    /// polyphony limit.
+    /// polyphony limit. This must be at least one, see
+    /// [`effective_max_voice_capacity()`][Self::effective_max_voice_capacity()].
     pub max_voice_capacity: u32,
     /// If set to `true`, then the host may send note events for the same channel and key, but using
     /// different voice IDs. Bitwig Studio, for instance, can use this to do voice stacking. After
     /// enabling this, you should always prioritize using voice IDs to map note events to voices.
     pub supports_overlapping_voices: bool,
+}
+
+impl PolyModulationConfig {
+    /// [`max_voice_capacity`][Self::max_voice_capacity], with zero replaced by one.
+    ///
+    /// A plugin can set the field to zero, which the CLAP wrapper would then use as the upper bound
+    /// when clamping the current voice capacity into `1..=max`. That range is empty, and
+    /// [`Ord::clamp()`] panics on it. Since the config is static plugin metadata, that would turn a
+    /// typo into a host-visible crash.
+    pub fn effective_max_voice_capacity(&self) -> u32 {
+        nih_debug_assert!(
+            self.max_voice_capacity >= 1,
+            "The maximum voice capacity cannot be zero"
+        );
+
+        self.max_voice_capacity.max(1)
+    }
 }

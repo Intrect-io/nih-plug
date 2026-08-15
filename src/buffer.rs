@@ -100,6 +100,13 @@ impl<'a> Buffer<'a> {
     /// ````
     #[inline]
     pub fn iter_blocks<'slice>(&'slice mut self, max_block_size: usize) -> BlocksIter<'slice, 'a> {
+        // A zero block size cannot make progress. `BlocksIter` yields nothing in that case instead
+        // of looping forever, but that would silently drop audio, so flag it during development
+        nih_debug_assert_ne!(
+            max_block_size, 0,
+            "The maximum block size must be a positive number"
+        );
+
         BlocksIter {
             buffers: self.output_slices.as_mut_slice(),
             max_block_size,
@@ -197,5 +204,50 @@ mod miri {
         for i in 32..48 {
             assert_eq!(real_buffers[0][i], 0.0);
         }
+    }
+
+    #[test]
+    fn block_size_hint_counts_remaining_blocks() {
+        let mut real_buffers = vec![vec![0.0; 512]; 2];
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(512, |output_slices| {
+                let (first_channel, other_channels) = real_buffers.split_at_mut(1);
+                *output_slices = vec![&mut first_channel[0], &mut other_channels[0]];
+            })
+        };
+
+        // 512 samples in blocks of at most 100 samples is six blocks, the last of which is only
+        // twelve samples long
+        let mut blocks = buffer.iter_blocks(100);
+        assert_eq!(blocks.len(), 6);
+
+        // `BlocksIter` implements `ExactSizeIterator`, so the hint needs to shrink as blocks are
+        // consumed instead of always reporting the total block count
+        let mut expected_remaining = 6;
+        while blocks.next().is_some() {
+            expected_remaining -= 1;
+            assert_eq!(blocks.len(), expected_remaining);
+        }
+        assert_eq!(expected_remaining, 0);
+    }
+
+    /// A zero block size is a contract violation that's caught by a debug assertion, but it must
+    /// never turn into an infinite iterator in release builds. See `blocks::tests` for the release
+    /// behavior, which can't be exercised through `Buffer::iter_blocks()` because of this assertion.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn zero_block_size_is_asserted() {
+        let mut real_buffers = vec![vec![0.0; 512]; 2];
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(512, |output_slices| {
+                let (first_channel, other_channels) = real_buffers.split_at_mut(1);
+                *output_slices = vec![&mut first_channel[0], &mut other_channels[0]];
+            })
+        };
+
+        let _ = buffer.iter_blocks(0);
     }
 }

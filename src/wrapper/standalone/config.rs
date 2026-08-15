@@ -24,12 +24,12 @@ pub struct WrapperConfig {
     /// The audio backend's sample rate.
     ///
     /// This setting is ignored when using the JACK backend.
-    #[clap(value_parser, short = 'r', long, default_value = "48000")]
+    #[clap(value_parser = positive_finite_f32, short = 'r', long, default_value = "48000")]
     pub sample_rate: f32,
     /// The audio backend's period size.
     ///
     /// This setting is ignored when using the JACK backend.
-    #[clap(value_parser, short = 'p', long, default_value = "512")]
+    #[clap(value_parser = nonzero_u32, short = 'p', long, default_value = "512")]
     pub period_size: u32,
 
     /// The input device for the ALSA, CoreAudio, and WASAPI backends. No input will be connected if
@@ -81,18 +81,64 @@ pub struct WrapperConfig {
     //
     // Currently baseview has no way to report this to us, so we'll expose it as a command line
     // option instead.
-    #[clap(value_parser, long, default_value = "1.0")]
+    #[clap(value_parser = positive_finite_f32, long, default_value = "1.0")]
     pub dpi_scale: f32,
 
     /// The transport's tempo.
-    #[clap(value_parser, long, default_value = "120")]
+    #[clap(value_parser = positive_finite_f32, long, default_value = "120")]
     pub tempo: f32,
     /// The time signature's numerator.
-    #[clap(value_parser, long, default_value = "4")]
+    #[clap(value_parser = nonzero_u32, long, default_value = "4")]
     pub timesig_num: u32,
     /// The time signature's denominator.
-    #[clap(value_parser, long, default_value = "4")]
+    #[clap(value_parser = nonzero_u32, long, default_value = "4")]
     pub timesig_denom: u32,
+}
+
+/// Parse a floating point argument, rejecting values that aren't usable.
+///
+/// These end up in the buffer configuration, the transport, and the editor's scale factor. `clap`'s
+/// default `f32` parser happily accepts `nan`, `inf`, zero, and negative numbers, none of which any
+/// of those can do anything sensible with.
+fn positive_finite_f32(input: &str) -> Result<f32, String> {
+    let value: f32 = input.parse().map_err(|err| format!("{err}"))?;
+    if !(value.is_finite() && value > 0.0) {
+        return Err(String::from("expected a positive, finite number"));
+    }
+
+    Ok(value)
+}
+
+/// Parse an integer argument that is divided by or used as a buffer size, so it cannot be zero.
+fn nonzero_u32(input: &str) -> Result<u32, String> {
+    let value: u32 = input.parse().map_err(|err| format!("{err}"))?;
+    if value == 0 {
+        return Err(String::from("expected a number greater than zero"));
+    }
+
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_finite_f32_rejects_unusable_values() {
+        assert_eq!(positive_finite_f32("48000"), Ok(48000.0));
+        assert_eq!(positive_finite_f32("0.5"), Ok(0.5));
+
+        for input in ["nan", "inf", "-inf", "0", "-0", "-1", "-48000"] {
+            assert!(positive_finite_f32(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn nonzero_u32_rejects_zero() {
+        assert_eq!(nonzero_u32("512"), Ok(512));
+        assert!(nonzero_u32("0").is_err());
+        assert!(nonzero_u32("-1").is_err());
+    }
 }
 
 /// Determines which audio and MIDI backend should be used.

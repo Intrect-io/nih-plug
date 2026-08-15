@@ -116,7 +116,9 @@ impl<P: Plugin> AsyncExecutor<P> {
         (self.execute_background)(task);
     }
 
-    /// Execute a task on a background thread using `[Plugin::task_executor]`.
+    /// Execute a task on the main/GUI thread using `[Plugin::task_executor]`. Use this for tasks
+    /// that need to interact with the GUI or with other main thread only APIs. Long running tasks
+    /// will block the GUI, so use [`execute_background()`][Self::execute_background()] for those.
     ///
     /// # Note
     ///

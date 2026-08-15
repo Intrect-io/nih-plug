@@ -15,6 +15,49 @@ pub use factory::PluginInfo;
 pub use vst3_sys;
 pub use wrapper::Wrapper;
 
+/// Whether a factory class info request can be served.
+///
+/// The class index needs to be in bounds, and the host's output pointer needs to be non-null.
+/// `IPluginFactory::getClassInfo()` and friends are called across the C ABI, so neither can be
+/// assumed. Writing through a null `info` would be undefined behavior rather than the
+/// `kInvalidArgument` the interface expects.
+///
+/// Used by [`nih_export_vst3!()`][crate::nih_export_vst3!()], which is why this is public.
+#[doc(hidden)]
+pub fn class_info_request_is_valid<T>(index: i32, num_classes: usize, info: *const T) -> bool {
+    !info.is_null() && index >= 0 && (index as usize) < num_classes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vst3_sys::base::PClassInfo;
+
+    /// The factory used to dereference `info` after validating only the class index.
+    #[test]
+    fn null_info_pointers_are_rejected() {
+        assert!(!class_info_request_is_valid::<PClassInfo>(
+            0,
+            1,
+            std::ptr::null()
+        ));
+    }
+
+    #[test]
+    fn out_of_range_class_indices_are_rejected() {
+        let info = std::mem::MaybeUninit::<PClassInfo>::uninit();
+        let info_ptr = info.as_ptr();
+
+        assert!(class_info_request_is_valid(0, 2, info_ptr));
+        assert!(class_info_request_is_valid(1, 2, info_ptr));
+
+        assert!(!class_info_request_is_valid(2, 2, info_ptr));
+        assert!(!class_info_request_is_valid(-1, 2, info_ptr));
+        assert!(!class_info_request_is_valid(i32::MIN, 2, info_ptr));
+        assert!(!class_info_request_is_valid(0, 0, info_ptr));
+    }
+}
+
 /// Export one or more VST3 plugins from this library using the provided plugin types. The first
 /// plugin's vendor information is used for the factory's information.
 #[macro_export]
@@ -87,7 +130,11 @@ macro_rules! nih_export_vst3 {
                 }
 
                 unsafe fn get_class_info(&self, index: i32, info: *mut PClassInfo) -> tresult {
-                    if index < 0 || index >= self.plugin_infos.len() as i32 {
+                    if !$crate::wrapper::vst3::class_info_request_is_valid(
+                        index,
+                        self.plugin_infos.len(),
+                        info,
+                    ) {
                         return kInvalidArgument;
                     }
 
@@ -149,7 +196,11 @@ macro_rules! nih_export_vst3 {
 
             impl IPluginFactory2 for Factory {
                 unsafe fn get_class_info2(&self, index: i32, info: *mut PClassInfo2) -> tresult {
-                    if index < 0 || index >= self.plugin_infos.len() as i32 {
+                    if !$crate::wrapper::vst3::class_info_request_is_valid(
+                        index,
+                        self.plugin_infos.len(),
+                        info,
+                    ) {
                         return kInvalidArgument;
                     }
 
@@ -165,7 +216,11 @@ macro_rules! nih_export_vst3 {
                     index: i32,
                     info: *mut PClassInfoW,
                 ) -> tresult {
-                    if index < 0 || index >= self.plugin_infos.len() as i32 {
+                    if !$crate::wrapper::vst3::class_info_request_is_valid(
+                        index,
+                        self.plugin_infos.len(),
+                        info,
+                    ) {
                         return kInvalidArgument;
                     }
 

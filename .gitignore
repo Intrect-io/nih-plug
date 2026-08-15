@@ -1,1 +1,12 @@
 /target/
+/trash/
+/.gemini/
+/.claude/
+# 세션 트랜스크립트/메모 (루트 한정)
+/20[0-9][0-9]-*.txt
+
+# vendor/baseview was a gitlink with no .gitmodules entry, which made this repo
+# unusable as a cargo git dependency (AUD-736). The patched baseview now lives
+# in its own repo, pinned by rev in Cargo.toml. Local working copies may still
+# keep the directory here for path-patch workflows in sibling projects.
+/vendor/

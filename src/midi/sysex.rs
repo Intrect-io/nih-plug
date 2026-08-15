@@ -34,7 +34,31 @@ pub trait SysExMessage: Debug + Clone + PartialEq + Send + Sync {
     /// alongside the message's length in bytes. The buffer may contain padding at the end. This
     /// should contain the full message including headers and the EOX byte, see the trait's
     /// docstring for more information.
+    ///
+    /// The returned length must not exceed the length of [`Buffer`][Self::Buffer]. Since this trait
+    /// is implemented by the plugin, the wrappers cannot rely on that and go through
+    /// [`to_buffer_checked()`] instead.
     fn to_buffer(self) -> (Self::Buffer, usize);
+}
+
+/// [`SysExMessage::to_buffer()`], with the returned length clamped to the buffer's length.
+///
+/// The trait documents that the length must fit in the buffer, but because plugins implement the
+/// trait themselves that invariant cannot be enforced at the type level. Slicing the buffer with an
+/// oversized length would panic on the audio thread in release builds, so clamp the length here and
+/// only flag the contract violation during development.
+pub(crate) fn to_buffer_checked<M: SysExMessage>(message: M) -> (M::Buffer, usize) {
+    let (buffer, length) = message.to_buffer();
+
+    let max_length = buffer.borrow().len();
+    nih_debug_assert!(
+        length <= max_length,
+        "`SysExMessage::to_buffer()` returned a length of {} for a {} byte buffer",
+        length,
+        max_length
+    );
+
+    (buffer, length.min(max_length))
 }
 
 /// A default implementation plugins that don't need SysEx support can use.

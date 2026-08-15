@@ -12,6 +12,7 @@ use rtrb::RingBuffer;
 use std::borrow::Borrow;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ScopedJoinHandle;
 
 use super::super::config::WrapperConfig;
@@ -21,9 +22,37 @@ use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, MidiConfig, NoteEvent, Plugin, PluginNoteEvent,
     Transport,
 };
+use crate::util::permit_alloc;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
 const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// How many times an audio callback may spin on the input ring buffer, in total, before it gives up
+/// on the rest of the period.
+///
+/// The capture and playback streams run on separate threads and are configured independently, so
+/// they can disagree on the channel count, and either one can error out or be disconnected at any
+/// time. Without a bound, the surviving callback spins forever on a real-time thread. Giving up
+/// produces a dropout instead, which is recoverable.
+///
+/// The budget has to outlast the normal phase drift between two independently clocked devices,
+/// which can be most of a period, while still being far below the point where the callback would
+/// miss its own deadline. A spin iteration is a failed atomic load, so this is on the order of
+/// milliseconds rather than the tens of microseconds a tighter bound would give.
+const RING_BUFFER_SPIN_LIMIT: usize = 1 << 22;
+
+/// Report a dropout from an audio callback without allocating on every occurrence.
+///
+/// Logging formats a message and takes the logger's lock, so this only fires the first time. A
+/// dropout is a persistent configuration or device problem, not something worth a message per
+/// period.
+fn report_audio_dropout(message: &str) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        permit_alloc(|| nih_error!("{}", message));
+    }
+}
 
 /// Uses CPAL for audio and midir for MIDI.
 pub struct CpalMidir {
@@ -129,10 +158,23 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
-                // Data is sent to the output data callback using a wait-free ring buffer
-                let (rb_producer, rb_consumer) = RingBuffer::new(
-                    self.output.config.channels as usize * self.config.period_size as usize,
-                );
+                // Data is sent to the output data callback using a wait-free ring buffer. The input
+                // and output devices are configured separately and may not agree on a channel
+                // count, so this is sized for whichever side is larger. The spin limits in the two
+                // callbacks turn any remaining mismatch into a dropout instead of a hang.
+                let ring_buffer_channels =
+                    (self.output.config.channels as usize).max(input.config.channels as usize);
+                if input.config.channels != self.output.config.channels {
+                    nih_warn!(
+                        "The input device has {} channels while the output device has {}, audio \
+                         input will drop out",
+                        input.config.channels,
+                        self.output.config.channels
+                    );
+                }
+
+                let (rb_producer, rb_consumer) =
+                    RingBuffer::new(ring_buffer_channels * self.config.period_size as usize);
                 input_rb_consumer = Some(rb_consumer);
 
                 let input_parker = Parker::new();
@@ -170,11 +212,20 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     (SampleFormat::U64, u64),
                     (SampleFormat::F32, f32),
                     (SampleFormat::F64, f64)
-                )
-                .expect("Fatal error creating the capture stream");
-                stream
-                    .play()
-                    .expect("Fatal error trying to start the capture stream");
+                );
+
+                // Device removal or a configuration race must not take the whole process down
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        nih_error!("Could not create the capture stream: {err:#}");
+                        return;
+                    }
+                };
+                if let Err(err) = stream.play() {
+                    nih_error!("Could not start the capture stream: {err:#}");
+                    return;
+                }
                 _input_stream = Some(stream);
 
                 // Playback is delayed one period if we're capturing audio so it has something to
@@ -321,16 +372,31 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 (SampleFormat::U64, u64),
                 (SampleFormat::F32, f32),
                 (SampleFormat::F64, f64)
-            )
-            .expect("Fatal error creating the output stream");
+            );
 
+            // See the capture stream above, a backend failure here should not abort the process.
+            // Returning outright would skip the MIDI teardown below, which has to run either way,
+            // so a failure only skips the wait.
             // TODO: Wait a period before doing this when also reading the input
-            output_stream
-                .play()
-                .expect("Fatal error trying to start the output stream");
+            let output_stream = match output_stream {
+                Ok(stream) => match stream.play() {
+                    Ok(()) => Some(stream),
+                    Err(err) => {
+                        nih_error!("Could not start the output stream: {err:#}");
+                        None
+                    }
+                },
+                Err(err) => {
+                    nih_error!("Could not create the output stream: {err:#}");
+                    None
+                }
+            };
 
-            // Wait for the audio thread to exit
-            parker.park();
+            // Wait for the audio thread to exit. Nothing will ever unpark this if the stream never
+            // started, since the callback that does so is never called.
+            if output_stream.is_some() {
+                parker.park();
+            }
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -641,10 +707,38 @@ impl CpalMidir {
         // This callback needs to copy input samples to a ring buffer that can be read from in the
         // output data callback
         move |data, _info| {
+            // The spin budget is for the whole callback, not per sample. Resetting it for every
+            // sample would multiply the wait by `data.len()`, which is how a bounded spin turns
+            // back into a multi-period stall on a real-time thread.
+            let mut spins_left = RING_BUFFER_SPIN_LIMIT;
+            let mut dropped_samples = 0usize;
             for sample in data {
                 // If for whatever reason the input callback is fired twice before an output
                 // callback, then just spin on this until the push succeeds
-                while input_rb_producer.push(sample.to_sample()).is_err() {}
+                let mut value = sample.to_sample();
+                loop {
+                    match input_rb_producer.push(value) {
+                        Ok(()) => break,
+                        Err(rtrb::PushError::Full(returned)) => {
+                            // The output callback may have stopped consuming entirely, so this
+                            // cannot wait forever
+                            if spins_left == 0 {
+                                dropped_samples += 1;
+                                break;
+                            }
+                            spins_left -= 1;
+
+                            value = returned;
+                        }
+                    }
+                }
+            }
+
+            if dropped_samples > 0 {
+                report_audio_dropout(
+                    "The audio output stream is not consuming captured samples, input samples are \
+                     being dropped",
+                );
             }
 
             // The run function is blocked until a single period has been processed here. After this
@@ -772,8 +866,18 @@ impl CpalMidir {
             // write-only (with `BufferManager` always zeroing them out when creating the buffers).
             match &mut input_rb_consumer {
                 Some(input_rb_consumer) => {
+                    // As on the producer side, the budget covers the whole callback
+                    let mut spins_left = RING_BUFFER_SPIN_LIMIT;
+                    let mut input_dropped_out = false;
                     for channel in main_io_storage.iter_mut() {
                         for sample in channel {
+                            // Once the input has fallen behind there is no point in waiting on the
+                            // remaining samples in this period
+                            if input_dropped_out {
+                                *sample = 0.0;
+                                continue;
+                            }
+
                             loop {
                                 // Keep spinning on this if the output callback somehow outpaces the
                                 // input callback
@@ -781,8 +885,30 @@ impl CpalMidir {
                                     *sample = input_sample;
                                     break;
                                 }
+
+                                // The input stream may have errored out or been disconnected, in
+                                // which case no samples are ever coming
+                                if spins_left == 0 {
+                                    input_dropped_out = true;
+                                    *sample = 0.0;
+                                    break;
+                                }
+                                spins_left -= 1;
                             }
                         }
+                    }
+
+                    if input_dropped_out {
+                        // A partial period leaves the read cursor in the middle of a frame, which
+                        // would rotate the channels for every callback after this one. Dropping
+                        // what is left resynchronizes on the next full callback, since the producer
+                        // only ever pushes whole callbacks.
+                        while input_rb_consumer.pop().is_ok() {}
+
+                        report_audio_dropout(
+                            "The audio input stream did not produce enough samples, the rest of \
+                             this period is silence",
+                        );
                     }
                 }
                 None => {

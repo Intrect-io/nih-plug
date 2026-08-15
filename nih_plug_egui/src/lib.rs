@@ -75,6 +75,24 @@ pub struct EguiState {
     /// Whether the editor's window is currently open.
     #[serde(skip)]
     open: AtomicBool,
+
+    /// Whether to force a repaint on every frame.
+    ///
+    /// Defaults to `true`, which is the historical behaviour: most plugin GUIs have meters
+    /// that need continuous redraws, and hosts often open the window while it is still
+    /// unmapped, which would otherwise leave it blank.
+    ///
+    /// Plugins that schedule their own repaints (e.g. through `Context::request_repaint_after()`)
+    /// can opt out with [`EguiState::set_continuous_repaint()`]. Without opting out the
+    /// unconditional request drives `repaint_delay` to zero every frame, so whatever interval
+    /// the plugin asks for is silently ignored and the GUI renders as fast as the windowing
+    /// timer ticks.
+    #[serde(skip, default = "continuous_repaint_default")]
+    continuous_repaint: AtomicBool,
+}
+
+fn continuous_repaint_default() -> AtomicBool {
+    AtomicBool::new(true)
 }
 
 impl<'a> PersistentField<'a, EguiState> for Arc<EguiState> {
@@ -98,6 +116,7 @@ impl EguiState {
             size: AtomicCell::new((width, height)),
             requested_size: Default::default(),
             open: AtomicBool::new(false),
+            continuous_repaint: continuous_repaint_default(),
         })
     }
 
@@ -113,7 +132,21 @@ impl EguiState {
     }
 
     /// Set the new size that will be used to resize the window if the host allows.
-    fn set_requested_size(&self, new_size: (u32, u32)) {
+    pub fn set_requested_size(&self, new_size: (u32, u32)) {
         self.requested_size.store(Some(new_size));
+    }
+
+    /// Whether a repaint is forced on every frame. See [`EguiState::set_continuous_repaint()`].
+    pub fn continuous_repaint(&self) -> bool {
+        self.continuous_repaint.load(Ordering::Relaxed)
+    }
+
+    /// Opt out of the per-frame forced repaint so the plugin's own repaint schedule is honoured.
+    ///
+    /// Pass `false` only if the GUI requests its own repaints — otherwise it will freeze after
+    /// the initial frames. The first frames after the window opens are always repainted
+    /// regardless, so the window never comes up blank.
+    pub fn set_continuous_repaint(&self, continuous: bool) {
+        self.continuous_repaint.store(continuous, Ordering::Relaxed);
     }
 }

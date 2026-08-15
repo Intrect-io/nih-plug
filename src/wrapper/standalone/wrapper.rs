@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use super::backend::Backend;
 use super::config::WrapperConfig;
@@ -26,6 +27,94 @@ use crate::wrapper::util::process_wrapper;
 /// How many parameter changes we can store in our unprocessed parameter change queue. Storing more
 /// than this many parameters at a time will cause changes to get lost.
 const EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// How often the headless main loop checks whether the process has been interrupted. There is no
+/// window event loop to piggyback on in that case, and the interrupt flag cannot wake up a channel
+/// receive, so this is polled alongside the GUI task channel.
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Ctrl+C/SIGINT handling for the headless standalone, so it can shut the audio thread down and
+/// deactivate the plugin instead of having the process killed from under it.
+mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the process has been interrupted since startup.
+    pub fn interrupted() -> bool {
+        INTERRUPTED.load(Ordering::Relaxed)
+    }
+
+    /// Installing a process-wide signal handler from a unit test would make the whole test binary
+    /// ignore Ctrl+C for the rest of the run. The shutdown loop this feeds is covered through
+    /// `GuiTask::Close` instead.
+    #[cfg(test)]
+    pub fn register() {}
+
+    #[cfg(all(not(test), target_family = "unix"))]
+    pub fn register() {
+        extern "C" fn handle_signal(signal: libc::c_int) {
+            // A relaxed atomic store is the only thing done here, since almost nothing else is
+            // async-signal-safe
+            INTERRUPTED.store(true, Ordering::Relaxed);
+
+            // Restore the default disposition so a second Ctrl+C still terminates the process. The
+            // shutdown path joins the audio thread, and a backend whose device has gone away can
+            // block there indefinitely; the user needs a way out that isn't SIGKILL.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
+
+        // SAFETY: `handle_signal` only performs an atomic store and a `signal()` call, both of
+        //         which are async-signal-safe
+        unsafe {
+            for signal in [libc::SIGINT, libc::SIGTERM] {
+                // A signal the parent process set to be ignored (`nohup`, background jobs) must
+                // stay ignored
+                let previous = libc::signal(
+                    signal,
+                    handle_signal as *const () as libc::sighandler_t,
+                );
+                if previous == libc::SIG_IGN {
+                    libc::signal(signal, libc::SIG_IGN);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(not(test), target_os = "windows"))]
+    pub fn register() {
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::System::Console::{
+            SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+        };
+
+        // `CTRL_CLOSE_EVENT` is deliberately not handled: Windows terminates the process as soon as
+        // the handler returns, so there is no window in which the poll loop below could run the
+        // shutdown path. Claiming to handle it would only suppress the default behavior.
+        unsafe extern "system" fn handle_ctrl_event(event: u32) -> BOOL {
+            match event {
+                CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                    INTERRUPTED.store(true, Ordering::Relaxed);
+                    BOOL::from(true)
+                }
+                _ => BOOL::from(false),
+            }
+        }
+
+        // SAFETY: the handler only performs an atomic store
+        let registered = unsafe { SetConsoleCtrlHandler(Some(handle_ctrl_event), true) };
+        if !registered.as_bool() {
+            // Without this there is no way to interrupt the process short of killing it, so this
+            // has to be visible in release builds too
+            nih_error!("Could not register the console control handler, Ctrl+C will not work");
+        }
+    }
+
+    #[cfg(all(not(test), not(any(target_family = "unix", target_os = "windows"))))]
+    pub fn register() {
+        nih_log!("Interrupt handling is not implemented for this platform");
+    }
+}
 
 pub struct Wrapper<P: Plugin, B: Backend<P>> {
     backend: AtomicRefCell<B>,
@@ -111,6 +200,8 @@ pub enum Task<P: Plugin> {
 pub enum WrapperError {
     /// The plugin returned `false` during initialization.
     InitializationFailed,
+    /// The plugin returned [`ProcessStatus::Error`] while processing audio.
+    ProcessingFailed,
 }
 
 struct WrapperWindowHandler {
@@ -314,10 +405,14 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         // We'll spawn a separate thread to handle IO and to process audio. This audio thread should
         // terminate together with this function.
         let terminate_audio_thread = Arc::new(AtomicBool::new(false));
+        let processing_failed = Arc::new(AtomicBool::new(false));
         let audio_thread = {
             let this = self.clone();
             let terminate_audio_thread = terminate_audio_thread.clone();
-            thread::spawn(move || this.run_audio_thread(terminate_audio_thread, gui_task_sender))
+            let processing_failed = processing_failed.clone();
+            thread::spawn(move || {
+                this.run_audio_thread(terminate_audio_thread, gui_task_sender, processing_failed)
+            })
         };
 
         match self.editor.borrow().clone() {
@@ -375,10 +470,33 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 )
             }
             None => {
-                // TODO: Properly block until SIGINT is received if the plugin does not have an editor
-                // TODO: Make sure to handle `GuiTask::Close` here as well
-                nih_log!("{} does not have a GUI, blocking indefinitely...", P::NAME);
-                std::thread::park();
+                nih_log!("{} does not have a GUI, press Ctrl+C to exit", P::NAME);
+                interrupt::register();
+
+                // Without a window there is no event loop to drive, but the audio thread still
+                // sends `GuiTask::Close` when the plugin fails, and the user can interrupt the
+                // process. Both need to reach the shutdown path below.
+                loop {
+                    if interrupt::interrupted() {
+                        nih_log!("Interrupted, shutting down...");
+                        break;
+                    }
+
+                    // The backend returns from `run()` when it cannot open its streams at all, in
+                    // which case no `GuiTask` is ever sent. Without this check the process would sit
+                    // in this loop forever and then exit successfully.
+                    if audio_thread.is_finished() {
+                        break;
+                    }
+
+                    match gui_task_receiver.recv_timeout(INTERRUPT_POLL_INTERVAL) {
+                        Ok(GuiTask::Close) => break,
+                        // There is no window to resize
+                        Ok(GuiTask::Resize(_, _)) => (),
+                        Err(channel::RecvTimeoutError::Timeout) => (),
+                        Err(channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
             }
         }
 
@@ -388,6 +506,10 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         // Some plugins may use this to clean up resources. Should not be needed for the standalone
         // application, but it seems like a good idea to stay consistent.
         self.plugin.lock().deactivate();
+
+        if processing_failed.load(Ordering::SeqCst) {
+            return Err(WrapperError::ProcessingFailed);
+        }
 
         Ok(())
     }
@@ -504,7 +626,11 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         self: Arc<Self>,
         should_terminate: Arc<AtomicBool>,
         gui_task_sender: channel::Sender<GuiTask>,
+        processing_failed: Arc<AtomicBool>,
     ) {
+        let terminate_requested = should_terminate.clone();
+        let close_sender = gui_task_sender.clone();
+
         self.clone().backend.borrow_mut().run(
             move |buffer, aux, transport, input_events, output_events| {
                 // TODO: This process wrapper should actually be in the backends (since the backends
@@ -526,7 +652,12 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                             nih_error!("The plugin returned an error while processing:");
                             nih_error!("{}", err);
 
-                            let push_successful = gui_task_sender.send(GuiTask::Close).is_ok();
+                            processing_failed.store(true, Ordering::SeqCst);
+
+                            // This runs on the audio thread, so it must not block waiting for the
+                            // GUI thread to drain the bounded channel
+                            let push_successful =
+                                gui_task_sender.try_send(GuiTask::Close).is_ok();
                             nih_debug_assert!(
                                 push_successful,
                                 "Could not queue window close, the editor will remain open"
@@ -581,6 +712,12 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 })
             },
         );
+
+        // A backend that could not open its streams returns without the process callback ever
+        // having run, so nothing else would tell the main thread to stop waiting.
+        if !terminate_requested.load(Ordering::SeqCst) {
+            let _ = close_sender.try_send(GuiTask::Close);
+        }
     }
 
     fn make_gui_context(self: Arc<Self>) -> Arc<WrapperGuiContext<P, B>> {
@@ -675,5 +812,76 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         self.request_resize();
 
         success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::super::backend::Dummy;
+    use super::*;
+    use crate::prelude::{new_nonzero_u32, AuxiliaryBuffers, Buffer, PortNames};
+
+    /// A plugin without an editor whose `process()` always fails, so `run()` has to take the
+    /// headless shutdown path.
+    #[derive(Default)]
+    struct FailingPlugin;
+
+    struct FailingPluginParams;
+
+    // The `Params` derive macro resolves its paths through the `nih_plug` crate name, which does
+    // not exist inside this crate, so this trivial implementation is written out by hand
+    unsafe impl Params for FailingPluginParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    impl Plugin for FailingPlugin {
+        const NAME: &'static str = "Failing Plugin";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://example.com";
+        const EMAIL: &'static str = "info@example.com";
+        const VERSION: &'static str = "0.0.0";
+
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: Some(new_nonzero_u32(2)),
+            main_output_channels: Some(new_nonzero_u32(2)),
+            aux_input_ports: &[],
+            aux_output_ports: &[],
+            names: PortNames::const_default(),
+        }];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            Arc::new(FailingPluginParams)
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl crate::prelude::ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Error("This plugin always fails")
+        }
+    }
+
+    /// Without an editor, `run()` used to park the main thread forever. A plugin error has to shut
+    /// the audio thread down, deactivate the plugin, and surface the failure to the caller.
+    #[test]
+    fn headless_run_returns_on_processing_error() {
+        let config = WrapperConfig::parse_from(["nih-plug-test"]);
+        let backend = Dummy::new::<FailingPlugin>(config.clone());
+        let wrapper = Wrapper::<FailingPlugin, Dummy>::new(backend, config)
+            .expect("Could not create the wrapper");
+
+        assert!(matches!(
+            wrapper.run(),
+            Err(WrapperError::ProcessingFailed)
+        ));
     }
 }

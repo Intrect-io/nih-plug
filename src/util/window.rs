@@ -12,9 +12,16 @@ pub fn blackman(size: usize) -> Vec<f32> {
     window
 }
 
-/// The same as [`blackman()`], but filling an existing slice instead. asfasdf
+/// The same as [`blackman()`], but filling an existing slice instead.
+///
+/// An empty window is left untouched, and a single sample window is set to unity gain. Neither has
+/// a shape to speak of, and the usual `size - 1` denominator is zero for both.
 pub fn blackman_in_place(window: &mut [f32]) {
     let size = window.len();
+    if size <= 1 {
+        window.fill(1.0);
+        return;
+    }
 
     let scale_1 = (2.0 * f32::consts::PI) / (size - 1) as f32;
     let scale_2 = scale_1 * 2.0;
@@ -36,8 +43,14 @@ pub fn hann(size: usize) -> Vec<f32> {
 }
 
 /// The same as [`hann()`], but filling an existing slice instead.
+///
+/// See [`blackman_in_place()`] for the zero and single sample behavior.
 pub fn hann_in_place(window: &mut [f32]) {
     let size = window.len();
+    if size <= 1 {
+        window.fill(1.0);
+        return;
+    }
 
     // We want to scale `[0, size - 1]` to `[0, pi]`.
     // XXX: The `sin^2()` version results in weird rounding errors that cause spectral leakage
@@ -49,10 +62,43 @@ pub fn hann_in_place(window: &mut [f32]) {
 }
 
 /// Multiply a buffer with a window function.
+///
+/// The buffer and the window function need to have the same length. If they don't then only the
+/// overlapping part is windowed, which silently leaves a tail of the buffer unprocessed or drops
+/// window coefficients, so this is flagged during development.
 #[inline]
 pub fn multiply_with_window(buffer: &mut [f32], window_function: &[f32]) {
+    nih_debug_assert_eq!(
+        buffer.len(),
+        window_function.len(),
+        "The buffer and the window function need to have the same length"
+    );
+
     // TODO: ALso use SIMD here if available
     for (sample, window_sample) in buffer.iter_mut().zip(window_function) {
         *sample *= window_sample;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `size - 1` is the denominator in both window functions, so zero and one sample windows used
+    /// to underflow or produce NaN.
+    #[test]
+    fn degenerate_window_sizes() {
+        assert!(blackman(0).is_empty());
+        assert!(hann(0).is_empty());
+
+        assert_eq!(blackman(1), vec![1.0]);
+        assert_eq!(hann(1), vec![1.0]);
+
+        for window in [blackman(2), hann(2), blackman(3), hann(3)] {
+            assert!(
+                window.iter().all(|sample| sample.is_finite()),
+                "{window:?}"
+            );
+        }
     }
 }

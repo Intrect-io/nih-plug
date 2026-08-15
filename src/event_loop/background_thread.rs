@@ -147,11 +147,14 @@ where
             Ok(Message::Task((task, executor))) => match executor.upgrade() {
                 Some(e) => e.execute(task, true),
                 None => {
+                    // This worker thread is shared between all instances of the plugin, so a task
+                    // belonging to an instance that has since been dropped must only skip that task.
+                    // Shutting the worker down here would leave the still living instances sending
+                    // into a channel nothing reads from. The thread is shut down through
+                    // `Message::Shutdown` when the last instance releases it.
                     nih_trace!(
-                        "Received a new task but the executor is no longer alive, shutting down \
-                         worker"
+                        "Received a new task but the executor is no longer alive, skipping the task"
                     );
-                    return;
                 }
             },
             Ok(Message::Shutdown) => return,

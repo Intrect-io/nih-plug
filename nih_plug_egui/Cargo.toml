@@ -9,9 +9,16 @@ description = "An adapter to use egui GUIs with NIH-plug"
 
 [features]
 default = ["opengl", "default_fonts"]
-# `nih_plug_egui` always uses OpenGL since egui's wgpu backend is still unstable
-# depending on the platform
+# Upstream defaults to OpenGL because egui's wgpu backend was still unstable. On macOS that
+# means running on the deprecated OpenGL-on-Metal shim, which costs real CPU per frame
+# (`AppleMetalOpenGLRenderer` was 35% of the GUI thread in enzyme's profile, AUD-661), so
+# `wgpu` is exposed here as an opt-in native-Metal path.
+#
+# Cargo unions features, so a graph where one crate wants `opengl` and another wants `wgpu`
+# ends up with both. Our egui-baseview fork gives `wgpu` precedence in that case rather than
+# failing to build; the `not(wgpu)` guards below keep this crate consistent with that.
 opengl = ["egui-baseview/opengl"]
+wgpu = ["egui-baseview/wgpu"]
 default_fonts = ["egui-baseview/default_fonts"]
 rayon = ["egui-baseview/rayon"]
 
