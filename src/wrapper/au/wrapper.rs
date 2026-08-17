@@ -283,6 +283,15 @@ pub struct Wrapper<P: AuPlugin> {
     /// Shared context forwarded to the spawned editor so it can set
     /// parameter values and query plugin state.
     gui_context_inner: Option<Arc<AuGuiContextInner>>,
+
+    /// Name of the AU "present preset". We publish no factory presets, so the
+    /// preset *number* is always -1 (custom), but a host may still name the
+    /// current state through `kAudioUnitProperty_PresentPreset` — and that name
+    /// has to come back out of both that property and the `ClassInfo`
+    /// dictionary's `name` key. `auval` writes a name and then checks the round
+    /// trip through `ClassInfo`, so leaving either half out fails validation
+    /// and Logic Pro rejects the AU (INT-3727).
+    preset_name: Mutex<String>,
 }
 
 /// All audio-thread mutable state. Reused across render calls and grown
@@ -440,6 +449,12 @@ const NOTIFY_BYPASS_EFFECT: u32 = 1 << 2;
 const NOTIFY_MAX_FRAMES_PER_SLICE: u32 = 1 << 3;
 const NOTIFY_TAIL_TIME: u32 = 1 << 4;
 const NOTIFY_LAST_RENDER_ERROR: u32 = 1 << 5;
+const NOTIFY_PRESENT_PRESET: u32 = 1 << 6;
+
+/// AU's conventional name for "the current state is not a stored preset".
+/// Matches Apple's `AUBase`, which initialises its present preset to
+/// `{ presetNumber: -1, presetName: CFSTR("Untitled") }`.
+const DEFAULT_PRESET_NAME: &str = "Untitled";
 
 /// `Send` + `Sync` justification:
 ///
@@ -554,6 +569,7 @@ impl<P: AuPlugin> Wrapper<P> {
             editor,
             editor_handle: GuiHandleSlot::new(),
             gui_context_inner,
+            preset_name: Mutex::new(DEFAULT_PRESET_NAME.to_string()),
         });
         Box::into_raw(boxed) as *mut au::AudioComponentPlugInInterface
     }
@@ -687,6 +703,12 @@ impl<P: AuPlugin> Wrapper<P> {
         if pending & NOTIFY_LAST_RENDER_ERROR != 0 {
             fire(
                 au::kAudioUnitProperty_LastRenderError,
+                au::kAudioUnitScope_Global,
+            );
+        }
+        if pending & NOTIFY_PRESENT_PRESET != 0 {
+            fire(
+                au::kAudioUnitProperty_PresentPreset,
                 au::kAudioUnitScope_Global,
             );
         }
@@ -952,6 +974,16 @@ impl<P: AuPlugin> Wrapper<P> {
             .stop_note(group, note_id, offset)
     }
 
+    /// Current present-preset name. A poisoned lock falls back to the AU
+    /// default rather than propagating — a previous panic elsewhere must not
+    /// turn every subsequent property call into a validation failure.
+    fn preset_name(&self) -> String {
+        match self.preset_name.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => DEFAULT_PRESET_NAME.to_string(),
+        }
+    }
+
     fn get_class_info(&self) -> *mut c_void {
         let state = unsafe {
             state::serialize_object::<P>(
@@ -982,6 +1014,13 @@ impl<P: AuPlugin> Wrapper<P> {
             (
                 CFString::from_static_string("data").as_CFType(),
                 data.as_CFType(),
+            ),
+            // `kAUPresetNameKey`. Required: `auval` fails with "Class data
+            // doesn't contain a name key", and hosts show this string in their
+            // preset menu after a save/restore round trip (INT-3727).
+            (
+                CFString::from_static_string("name").as_CFType(),
+                CFString::new(&self.preset_name()).as_CFType(),
             ),
         ]);
 
@@ -1042,6 +1081,21 @@ impl<P: AuPlugin> Wrapper<P> {
                 },
                 buffer_config.as_ref(),
             );
+        }
+
+        // The name travels with the state blob, so a host restoring a saved
+        // `ClassInfo` gets the preset name it saved. A missing or wrongly-typed
+        // key is not an error — the parameter state is what actually matters,
+        // and hosts that never name presets simply omit it.
+        let name_key = CFString::from_static_string("name");
+        if let Some(value) = dict.find(&name_key) {
+            if value.instance_of::<CFString>() {
+                let name =
+                    unsafe { CFString::wrap_under_get_rule(value.as_CFTypeRef() as _) }.to_string();
+                if let Ok(mut guard) = self.preset_name.lock() {
+                    *guard = name;
+                }
+            }
         }
 
         au::noErr
@@ -1170,13 +1224,20 @@ impl<P: AuPlugin> Wrapper<P> {
                 }
             }
             // We don't expose AU-native factory presets (plugins manage their own
-            // preset browser), so this is read-only: report a "custom, not a
-            // factory preset" state rather than leaving it unimplemented. Hosts
-            // that support a custom Cocoa UI (`kAudioUnitProperty_CocoaUI` above)
-            // query this during validation to confirm the UI can reflect preset
-            // state; leaving it unanswered fails that check (AUD-731).
+            // preset browser), so the *number* is always -1 ("custom, not a
+            // factory preset") rather than leaving the property unimplemented.
+            // Hosts that support a custom Cocoa UI (`kAudioUnitProperty_CocoaUI`
+            // above) query this during validation to confirm the UI can reflect
+            // preset state; leaving it unanswered fails that check (AUD-731).
+            //
+            // It is writable regardless: a host names the current custom state
+            // through this property, and `auval` attempts that write during
+            // validation. Advertising it read-only did not stop the write — it
+            // only lost us the arm in `set_property_impl`, so the attempt fell
+            // through to `kAudioUnitErr_InvalidProperty` (-10879) and Logic Pro
+            // rejected the AU outright (INT-3727).
             au::kAudioUnitProperty_PresentPreset if scope == au::kAudioUnitScope_Global => {
-                respond(std::mem::size_of::<au::AUPreset>() as u32, false)
+                respond(std::mem::size_of::<au::AUPreset>() as u32, true)
             }
             _ => au::kAudioUnitErr_InvalidProperty,
         }
@@ -1412,10 +1473,10 @@ impl<P: AuPlugin> Wrapper<P> {
                 }
                 // -1 is the standard AU convention for "current state doesn't
                 // correspond to a stored factory preset" (we don't implement
-                // kAudioUnitProperty_FactoryPresets). The name is caller-owned
-                // per AU's Create Rule, same as the CocoaUI/ClassInfo replies
-                // above.
-                let preset_name = unsafe { au::cf_string_create("") };
+                // kAudioUnitProperty_FactoryPresets). The name is whatever the
+                // host last set through this property, and is caller-owned per
+                // AU's Create Rule, same as the CocoaUI/ClassInfo replies above.
+                let preset_name = unsafe { au::cf_string_create(&this.preset_name()) };
                 if preset_name.is_null() {
                     return au::kAudioUnitErr_InvalidProperty;
                 }
@@ -1679,6 +1740,35 @@ impl<P: AuPlugin> Wrapper<P> {
                 payload!(*mut c_void);
                 let dict = unsafe { *(in_data as *const *mut c_void) };
                 this.set_class_info(dict)
+            }
+            // Naming the current custom state. We publish no factory presets, so
+            // there is no indexed preset to recall — but refusing the write is
+            // what made `auval` fail with -10879 and Logic Pro blacklist the AU
+            // (INT-3727). Accept the name, keep reporting number -1.
+            au::kAudioUnitProperty_PresentPreset if scope == au::kAudioUnitScope_Global => {
+                payload!(au::AUPreset);
+                let preset = unsafe { &*(in_data as *const au::AUPreset) };
+                // A non-negative number names a factory preset, and
+                // `kAudioUnitProperty_FactoryPresets` is unimplemented — there
+                // is nothing to recall, so saying "done" would be a lie. Only
+                // AU's negative "custom state with this name" form is
+                // honourable here.
+                if preset.presetNumber >= 0 {
+                    return au::kAudioUnitErr_InvalidPropertyValue;
+                }
+                let name = if preset.presetName.is_null() {
+                    DEFAULT_PRESET_NAME.to_string()
+                } else {
+                    // Get Rule: the host owns the string it passed in, so this
+                    // must not consume a reference. Copy it out before the call
+                    // returns and the host is free to release it.
+                    unsafe { CFString::wrap_under_get_rule(preset.presetName as _) }.to_string()
+                };
+                if let Ok(mut guard) = this.preset_name.lock() {
+                    *guard = name;
+                }
+                this.mark_pending(NOTIFY_PRESENT_PRESET);
+                au::noErr
             }
             au::kAudioUnitProperty_HostCallbacks if scope == au::kAudioUnitScope_Global => {
                 payload!(au::HostCallbackInfo);
@@ -3101,6 +3191,135 @@ mod tests {
                 "property {property} accepted an undersized output buffer"
             );
         }
+
+        assert_eq!(
+            unsafe { Wrapper::<TestInstrument>::close(wrapper) },
+            au::noErr
+        );
+    }
+
+    /// `auval` names the current state through `kAudioUnitProperty_PresentPreset`
+    /// and then expects that name back out of both that property and the
+    /// `ClassInfo` dictionary's `name` key. Refusing the write returned
+    /// -10879 ("Can't set new preset") and Logic Pro rejected the AU; omitting
+    /// the key failed the following "Class data doesn't contain a name key"
+    /// check (INT-3727).
+    #[test]
+    fn present_preset_is_writable_and_round_trips_into_class_info() {
+        let wrapper = Wrapper::<TestInstrument>::new() as *mut c_void;
+
+        let mut size = std::mem::size_of::<au::AUPreset>() as u32;
+        let mut writable: au::Boolean = 0;
+        assert_eq!(
+            unsafe {
+                Wrapper::<TestInstrument>::get_property_info(
+                    wrapper,
+                    au::kAudioUnitProperty_PresentPreset,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &mut size,
+                    &mut writable,
+                )
+            },
+            au::noErr
+        );
+        assert_ne!(writable, 0, "PresentPreset must advertise as writable");
+
+        let read_preset = || {
+            let mut preset = au::AUPreset {
+                presetNumber: i32::MIN,
+                presetName: ptr::null_mut(),
+            };
+            let mut size = std::mem::size_of::<au::AUPreset>() as u32;
+            assert_eq!(
+                unsafe {
+                    Wrapper::<TestInstrument>::get_property(
+                        wrapper,
+                        au::kAudioUnitProperty_PresentPreset,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &mut preset as *mut au::AUPreset as *mut c_void,
+                        &mut size,
+                    )
+                },
+                au::noErr
+            );
+            // Create Rule: the get hands us an owned string.
+            let name = unsafe { CFString::wrap_under_create_rule(preset.presetName as _) };
+            (preset.presetNumber, name.to_string())
+        };
+
+        assert_eq!(read_preset(), (-1, DEFAULT_PRESET_NAME.to_string()));
+
+        let name = CFString::new("Test Preset Name");
+        let written = au::AUPreset {
+            presetNumber: -1,
+            presetName: name.as_concrete_TypeRef() as _,
+        };
+        assert_eq!(
+            unsafe {
+                Wrapper::<TestInstrument>::set_property(
+                    wrapper,
+                    au::kAudioUnitProperty_PresentPreset,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &written as *const au::AUPreset as *const c_void,
+                    std::mem::size_of::<au::AUPreset>() as u32,
+                )
+            },
+            au::noErr,
+            "PresentPreset write was refused — this is the -10879 auval failure"
+        );
+
+        // The number stays -1: we publish no factory presets, so claiming an
+        // index would send the host looking for `kAudioUnitProperty_FactoryPresets`.
+        assert_eq!(read_preset(), (-1, "Test Preset Name".to_string()));
+
+        // A non-negative number names a factory preset we do not have.
+        let factory = au::AUPreset {
+            presetNumber: 0,
+            presetName: name.as_concrete_TypeRef() as _,
+        };
+        assert_eq!(
+            unsafe {
+                Wrapper::<TestInstrument>::set_property(
+                    wrapper,
+                    au::kAudioUnitProperty_PresentPreset,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &factory as *const au::AUPreset as *const c_void,
+                    std::mem::size_of::<au::AUPreset>() as u32,
+                )
+            },
+            au::kAudioUnitErr_InvalidPropertyValue
+        );
+        assert_eq!(read_preset(), (-1, "Test Preset Name".to_string()));
+
+        let mut dict_ptr: *mut c_void = ptr::null_mut();
+        let mut size = std::mem::size_of::<*mut c_void>() as u32;
+        assert_eq!(
+            unsafe {
+                Wrapper::<TestInstrument>::get_property(
+                    wrapper,
+                    au::kAudioUnitProperty_ClassInfo,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &mut dict_ptr as *mut *mut c_void as *mut c_void,
+                    &mut size,
+                )
+            },
+            au::noErr
+        );
+        assert!(!dict_ptr.is_null());
+        let dict =
+            unsafe { CFDictionary::<CFString, CFType>::wrap_under_create_rule(dict_ptr as _) };
+        let stored = dict
+            .find(&CFString::from_static_string("name"))
+            .expect("ClassInfo must carry a `name` key");
+        assert_eq!(
+            unsafe { CFString::wrap_under_get_rule(stored.as_CFTypeRef() as _) }.to_string(),
+            "Test Preset Name"
+        );
 
         assert_eq!(
             unsafe { Wrapper::<TestInstrument>::close(wrapper) },
