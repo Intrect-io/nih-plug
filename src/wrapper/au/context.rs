@@ -145,9 +145,8 @@ impl<P: Plugin> GuiContext for AuGuiContext<P> {
         // keeps reading whatever `.smoothed` held since `initialize`, so every
         // parameter a plugin reads through `.smoothed` ignores its own GUI —
         // knobs appear dead while toggles (read via `.value()`) still work.
-        let sr = super::wrapper::unpack_f64(
-            self.inner.sample_rate_bits.load(Ordering::Acquire),
-        ) as f32;
+        let sr =
+            super::wrapper::unpack_f64(self.inner.sample_rate_bits.load(Ordering::Acquire)) as f32;
         if sr > 0.0 {
             unsafe { param.update_smoother(sr, false) };
         }
@@ -310,16 +309,21 @@ mod tests {
             instance_bits: AtomicU64::new(0),
             params_arc: Arc::new(EmptyParams),
             params_by_ptr: Vec::new(),
-            sample_rate_bits: Arc::new(AtomicU64::new(
-                super::super::wrapper::pack_f64(SAMPLE_RATE as f64),
-            )),
+            sample_rate_bits: Arc::new(AtomicU64::new(super::super::wrapper::pack_f64(
+                SAMPLE_RATE as f64,
+            ))),
         });
         let ctx = AuGuiContext::<TestPlugin> {
             inner,
             _marker: std::marker::PhantomData,
         };
 
-        unsafe { ctx.raw_set_parameter_normalized(ParamPtr::FloatParam(&param as *const _ as *mut _), 0.0) };
+        unsafe {
+            ctx.raw_set_parameter_normalized(
+                ParamPtr::FloatParam(&param as *const _ as *mut _),
+                0.0,
+            )
+        };
 
         assert_eq!(param.value(), 0.0, "plain value follows the GUI write");
 
@@ -352,11 +356,17 @@ mod tests {
             _marker: std::marker::PhantomData,
         };
 
-        unsafe { ctx.raw_set_parameter_normalized(ParamPtr::FloatParam(&param as *const _ as *mut _), 0.25) };
+        unsafe {
+            ctx.raw_set_parameter_normalized(
+                ParamPtr::FloatParam(&param as *const _ as *mut _),
+                0.25,
+            )
+        };
 
         assert_eq!(param.value(), 0.25, "plain value still lands");
         assert!(
-            ctx.inner.sample_rate_bits.load(Ordering::Acquire) == super::super::wrapper::pack_f64(0.0),
+            ctx.inner.sample_rate_bits.load(Ordering::Acquire)
+                == super::super::wrapper::pack_f64(0.0),
             "sample rate cell untouched"
         );
     }
