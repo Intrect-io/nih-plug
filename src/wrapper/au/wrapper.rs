@@ -1640,7 +1640,26 @@ impl<P: AuPlugin> Wrapper<P> {
                             } else {
                                 None
                             };
-                            match selected.and_then(|layout| layout.main_output_channels) {
+                            // Only accept a selection the rest of the wrapper
+                            // can reproduce. Everything downstream re-derives
+                            // the layout from the output channel count through
+                            // `layout_for_output`, which takes the *first*
+                            // match. For a plugin whose layouts share an output
+                            // count but differ on the input side — say
+                            // `[{in:2,out:2}, {in:1,out:2}]` — storing the
+                            // input-matched layout would leave the derivation
+                            // landing on the other one, so the wrapper would
+                            // report success for a format it then silently
+                            // refuses to honor. Rejecting is what the old code
+                            // did here, and it stays correct.
+                            let accepted = selected.and_then(|layout| {
+                                let out_ch = layout.main_output_channels?;
+                                match layout_for_output::<P>(out_ch) {
+                                    Some(resolved) if std::ptr::eq(resolved, layout) => Some(out_ch),
+                                    _ => None,
+                                }
+                            });
+                            match accepted {
                                 Some(out_ch) => {
                                     this.n_channels.store(out_ch.get(), Ordering::Release)
                                 }
@@ -3591,6 +3610,99 @@ mod tests {
             stream_format_channels(wrapper, au::kAudioUnitScope_Output),
             2,
             "a rejected format must leave the selected layout untouched"
+        );
+    }
+
+    #[derive(Default)]
+    struct AsymmetricEffect {
+        params: Arc<EffectParams>,
+    }
+
+    impl Plugin for AsymmetricEffect {
+        const NAME: &'static str = "AU Asymmetric Test";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/robbert-vdh/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        // Two layouts sharing an output count. `layout_for_output(2)` can only
+        // ever resolve to the first one, so the second is not representable
+        // through the wrapper's output-keyed derivation.
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+            AudioIOLayout {
+                main_input_channels: NonZeroU32::new(2),
+                main_output_channels: NonZeroU32::new(2),
+                ..AudioIOLayout::const_default()
+            },
+            AudioIOLayout {
+                main_input_channels: NonZeroU32::new(1),
+                main_output_channels: NonZeroU32::new(2),
+                ..AudioIOLayout::const_default()
+            },
+        ];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl AuPlugin for AsymmetricEffect {
+        const AU_TYPE: [u8; 4] = *b"aufx";
+        const AU_SUBTYPE: [u8; 4] = *b"TstA";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    /// Selecting by input count must not report success for a layout the
+    /// wrapper cannot then reproduce.
+    ///
+    /// Everything downstream re-derives the layout from the output channel
+    /// count via `layout_for_output`, which takes the first match. When two
+    /// layouts share an output count, the input-matched one is unreachable —
+    /// accepting it would tell the host "yes, 1 channel in" and then run
+    /// `{2,2}` anyway. Rejecting is what the pre-existing code did, and the
+    /// input-side relaxation must not weaken it.
+    #[test]
+    fn main_input_selection_rejects_layouts_it_cannot_reproduce() {
+        let wrapper = Wrapper::<AsymmetricEffect>::new() as *mut c_void;
+        let asbd = au::AudioStreamBasicDescription {
+            mSampleRate: 44100.0,
+            mFormatID: au::kAudioFormatLinearPCM,
+            mFormatFlags: au::kAudioFormatFlagIsFloat
+                | au::kAudioFormatFlagIsPacked
+                | au::kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0,
+        };
+
+        let status = unsafe {
+            Wrapper::<AsymmetricEffect>::set_property(
+                wrapper,
+                au::kAudioUnitProperty_StreamFormat,
+                au::kAudioUnitScope_Input,
+                0,
+                &asbd as *const au::AudioStreamBasicDescription as *const c_void,
+                std::mem::size_of::<au::AudioStreamBasicDescription>() as u32,
+            )
+        };
+        assert_eq!(
+            status,
+            au::kAudioUnitErr_FormatNotSupported,
+            "a layout that output-keyed derivation cannot reach must be refused"
         );
     }
 
