@@ -158,7 +158,11 @@ pub struct Wrapper<P: AuPlugin> {
     instance: AtomicU64,
 
     /// Sample rate set via `kAudioUnitProperty_StreamFormat`. f64 bits.
-    sample_rate_bits: AtomicU64,
+    ///
+    /// Shared with `AuGuiContextInner` so a GUI-driven parameter write can
+    /// update the smoother at the current rate. Both sides must observe the
+    /// same cell — a copy would go stale the moment the host changes format.
+    sample_rate_bits: Arc<AtomicU64>,
 
     /// Maximum frames per `AudioUnitRender` slice.
     max_frames_per_slice: AtomicU32,
@@ -472,11 +476,11 @@ unsafe impl<P: AuPlugin> Send for Wrapper<P> {}
 unsafe impl<P: AuPlugin> Sync for Wrapper<P> {}
 
 #[inline]
-fn pack_f64(v: f64) -> u64 {
+pub(super) fn pack_f64(v: f64) -> u64 {
     v.to_bits()
 }
 #[inline]
-fn unpack_f64(b: u64) -> f64 {
+pub(super) fn unpack_f64(b: u64) -> f64 {
     f64::from_bits(b)
 }
 
@@ -521,11 +525,13 @@ impl<P: AuPlugin> Wrapper<P> {
         // However, `instance` is just an opaque pointer forwarded to the
         // host — for the open() case where the GUI hasn't spawned yet this
         // is fine: the GUI only opens after the component is open.
+        let sample_rate_bits = Arc::new(AtomicU64::new(pack_f64(44_100.0)));
         let gui_context_inner = editor.as_ref().map(|_| {
             Arc::new(AuGuiContextInner {
                 instance_bits: AtomicU64::new(0),
                 params_arc: params_arc.clone(),
                 params_by_ptr,
+                sample_rate_bits: sample_rate_bits.clone(),
             })
         });
 
@@ -537,7 +543,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 reserved: ptr::null_mut(),
             },
             instance: AtomicU64::new(0),
-            sample_rate_bits: AtomicU64::new(pack_f64(44_100.0)),
+            sample_rate_bits,
             max_frames_per_slice: AtomicU32::new(1024),
             n_channels: AtomicU32::new(2),
             latency_seconds_bits: AtomicU64::new(pack_f64(0.0)),

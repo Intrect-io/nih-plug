@@ -1,7 +1,7 @@
 //! Minimal `InitContext` / `ProcessContext` / `GuiContext` impls for the AU wrapper.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use au_sys as au;
@@ -104,6 +104,9 @@ pub(super) struct AuGuiContextInner {
     pub params_arc: Arc<dyn crate::params::Params>,
     /// (ParamPtr → AU param ID) lookup. Index in `params_by_id` == AU param ID.
     pub params_by_ptr: Vec<(ParamPtr, au::AudioUnitParameterID)>,
+    /// The wrapper's sample-rate cell (f64 bits), shared rather than copied so
+    /// a GUI write always smooths at the rate the host most recently set.
+    pub sample_rate_bits: Arc<AtomicU64>,
 }
 
 unsafe impl Send for AuGuiContextInner {}
@@ -135,6 +138,18 @@ impl<P: Plugin> GuiContext for AuGuiContext<P> {
     unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
         // Write the value directly (same path as AU SetParameter from the host).
         unsafe { param.set_normalized_value(normalized) };
+
+        // Retarget the smoother, exactly as `Wrapper::set_parameter` does for
+        // host-driven writes. `set_normalized_value` only stores the value; it
+        // deliberately leaves the smoother alone. Without this the audio thread
+        // keeps reading whatever `.smoothed` held since `initialize`, so every
+        // parameter a plugin reads through `.smoothed` ignores its own GUI —
+        // knobs appear dead while toggles (read via `.value()`) still work.
+        let sr =
+            super::wrapper::unpack_f64(self.inner.sample_rate_bits.load(Ordering::Acquire)) as f32;
+        if sr > 0.0 {
+            unsafe { param.update_smoother(sr, false) };
+        }
 
         // Notify host listeners via AUParameterListenerNotify so automation
         // records the GUI-driven change.
@@ -212,4 +227,147 @@ extern "C" {
         inSendingObject: *mut std::ffi::c_void,
         inParameter: *const AUParameter,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::{AuGuiContext, AuGuiContextInner};
+    use crate::context::gui::GuiContext;
+    use crate::params::internals::ParamPtr;
+    use crate::params::ParamMut;
+    use crate::prelude::*;
+
+    #[derive(Default)]
+    struct EmptyParams;
+
+    unsafe impl Params for EmptyParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    struct TestPlugin {
+        params: Arc<EmptyParams>,
+    }
+
+    impl Default for TestPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(EmptyParams),
+            }
+        }
+    }
+
+    impl Plugin for TestPlugin {
+        const NAME: &'static str = "AU GUI Smoother Test";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/robbert-vdh/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    /// A GUI-driven write must retarget the smoother, not just store the value.
+    ///
+    /// The audio thread reads `.smoothed`; if only the plain value moves, every
+    /// knob in the plugin's own editor is inert while the DSP keeps running on
+    /// whatever `initialize` left behind. `params_by_ptr` is left empty so the
+    /// host-notify branch is skipped and this stays a pure unit test.
+    #[test]
+    fn gui_parameter_write_retargets_the_smoother() {
+        const SAMPLE_RATE: f32 = 48_000.0;
+
+        let param = FloatParam::new("gain", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+            .with_smoother(SmoothingStyle::Linear(1.0));
+        param.update_smoother(SAMPLE_RATE, true);
+        assert_eq!(param.smoothed.next(), 1.0, "smoother starts at the default");
+
+        let inner = Arc::new(AuGuiContextInner {
+            instance_bits: AtomicU64::new(0),
+            params_arc: Arc::new(EmptyParams),
+            params_by_ptr: Vec::new(),
+            sample_rate_bits: Arc::new(AtomicU64::new(super::super::wrapper::pack_f64(
+                SAMPLE_RATE as f64,
+            ))),
+        });
+        let ctx = AuGuiContext::<TestPlugin> {
+            inner,
+            _marker: std::marker::PhantomData,
+        };
+
+        unsafe {
+            ctx.raw_set_parameter_normalized(
+                ParamPtr::FloatParam(&param as *const _ as *mut _),
+                0.0,
+            )
+        };
+
+        assert_eq!(param.value(), 0.0, "plain value follows the GUI write");
+
+        // Linear(1.0) over 48 kHz = 48 steps; drain more than that and the
+        // smoother must have arrived. Without the retarget it never moves.
+        for _ in 0..256 {
+            param.smoothed.next();
+        }
+        assert_eq!(
+            param.smoothed.next(),
+            0.0,
+            "smoother must converge on the GUI-written value"
+        );
+    }
+
+    /// A zero/unset sample rate must not poison the smoother.
+    #[test]
+    fn gui_parameter_write_tolerates_unset_sample_rate() {
+        let param = FloatParam::new("gain", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+            .with_smoother(SmoothingStyle::Linear(1.0));
+
+        let inner = Arc::new(AuGuiContextInner {
+            instance_bits: AtomicU64::new(0),
+            params_arc: Arc::new(EmptyParams),
+            params_by_ptr: Vec::new(),
+            sample_rate_bits: Arc::new(AtomicU64::new(super::super::wrapper::pack_f64(0.0))),
+        });
+        let ctx = AuGuiContext::<TestPlugin> {
+            inner,
+            _marker: std::marker::PhantomData,
+        };
+
+        unsafe {
+            ctx.raw_set_parameter_normalized(
+                ParamPtr::FloatParam(&param as *const _ as *mut _),
+                0.25,
+            )
+        };
+
+        assert_eq!(param.value(), 0.25, "plain value still lands");
+        assert!(
+            ctx.inner.sample_rate_bits.load(Ordering::Acquire)
+                == super::super::wrapper::pack_f64(0.0),
+            "sample rate cell untouched"
+        );
+    }
 }
