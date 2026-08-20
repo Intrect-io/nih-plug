@@ -1614,7 +1614,57 @@ impl<P: AuPlugin> Wrapper<P> {
                             None => return au::kAudioUnitErr_InvalidElement,
                         };
                         if expected != req_ch {
-                            return au::kAudioUnitErr_FormatNotSupported;
+                            // The main input bus selects a layout as well; it is
+                            // not merely validated against whatever the output
+                            // bus already picked.
+                            //
+                            // AU negotiates one scope at a time and hosts
+                            // disagree on the order. `auval`'s channel tests set
+                            // the *input* format first, so a plugin declaring
+                            // both {2,2} and {1,1} was told FormatNotSupported
+                            // for a mono input it fully supports, purely because
+                            // the output scope was still stereo at that moment —
+                            // making the mono layout unreachable and failing
+                            // validation with -10868 in Render Preparation.
+                            //
+                            // Only the main input may do this. Auxiliary
+                            // sidechain elements stay strictly validated: their
+                            // counts never imply a different main layout.
+                            let is_main_input =
+                                current_layout::<P>(this.n_channels()).is_some_and(|layout| {
+                                    layout.main_input_channels.is_some() && element == 0
+                                });
+                            let req = NonZeroU32::new(req_ch).expect("channel count checked above");
+                            let selected = if is_main_input {
+                                layout_for_main_input::<P>(req)
+                            } else {
+                                None
+                            };
+                            // Only accept a selection the rest of the wrapper
+                            // can reproduce. Everything downstream re-derives
+                            // the layout from the output channel count through
+                            // `layout_for_output`, which takes the *first*
+                            // match. For a plugin whose layouts share an output
+                            // count but differ on the input side — say
+                            // `[{in:2,out:2}, {in:1,out:2}]` — storing the
+                            // input-matched layout would leave the derivation
+                            // landing on the other one, so the wrapper would
+                            // report success for a format it then silently
+                            // refuses to honor. Rejecting is what the old code
+                            // did here, and it stays correct.
+                            let accepted = selected.and_then(|layout| {
+                                let out_ch = layout.main_output_channels?;
+                                match layout_for_output::<P>(out_ch) {
+                                    Some(resolved) if std::ptr::eq(resolved, layout) => Some(out_ch),
+                                    _ => None,
+                                }
+                            });
+                            match accepted {
+                                Some(out_ch) => {
+                                    this.n_channels.store(out_ch.get(), Ordering::Release)
+                                }
+                                None => return au::kAudioUnitErr_FormatNotSupported,
+                            }
                         }
                     }
                     au::kAudioUnitScope_Output => return au::kAudioUnitErr_InvalidElement,
@@ -2558,6 +2608,18 @@ fn layout_for_output<P: AuPlugin>(channels: NonZeroU32) -> Option<&'static Audio
         .find(|layout| layout.main_output_channels == Some(channels))
 }
 
+/// Find the declared layout for an AU main *input* channel count.
+///
+/// The counterpart of [`layout_for_output`]. Because AU configures one scope at
+/// a time and hosts differ on which they set first, a layout that is only
+/// reachable through the output scope is effectively unreachable for any host
+/// that starts from the input side.
+fn layout_for_main_input<P: AuPlugin>(channels: NonZeroU32) -> Option<&'static AudioIOLayout> {
+    P::AUDIO_IO_LAYOUTS
+        .iter()
+        .find(|layout| layout.main_input_channels == Some(channels))
+}
+
 fn current_layout<P: AuPlugin>(output_channels: u32) -> Option<&'static AudioIOLayout> {
     NonZeroU32::new(output_channels).and_then(layout_for_output::<P>)
 }
@@ -3376,6 +3438,290 @@ mod tests {
         assert_eq!(
             classify_unit("semitones"),
             au::kAudioUnitParameterUnit_Generic
+        );
+    }
+
+    #[derive(Default)]
+    struct EffectParams;
+
+    unsafe impl Params for EffectParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct TestEffect {
+        params: Arc<EffectParams>,
+    }
+
+    impl Plugin for TestEffect {
+        const NAME: &'static str = "AU Effect Test";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/robbert-vdh/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        // Stereo first, mono second — the shape every stock example plugin uses.
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+            AudioIOLayout {
+                main_input_channels: NonZeroU32::new(2),
+                main_output_channels: NonZeroU32::new(2),
+                ..AudioIOLayout::const_default()
+            },
+            AudioIOLayout {
+                main_input_channels: NonZeroU32::new(1),
+                main_output_channels: NonZeroU32::new(1),
+                ..AudioIOLayout::const_default()
+            },
+        ];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl AuPlugin for TestEffect {
+        const AU_TYPE: [u8; 4] = *b"aufx";
+        const AU_SUBTYPE: [u8; 4] = *b"TstE";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    fn float_asbd(channels: u32) -> au::AudioStreamBasicDescription {
+        au::AudioStreamBasicDescription {
+            mSampleRate: 44100.0,
+            mFormatID: au::kAudioFormatLinearPCM,
+            mFormatFlags: au::kAudioFormatFlagIsFloat
+                | au::kAudioFormatFlagIsPacked
+                | au::kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: 32,
+            mReserved: 0,
+        }
+    }
+
+    fn set_stream_format(
+        wrapper: *mut c_void,
+        scope: au::AudioUnitScope,
+        channels: u32,
+    ) -> au::OSStatus {
+        let asbd = float_asbd(channels);
+        unsafe {
+            Wrapper::<TestEffect>::set_property(
+                wrapper,
+                au::kAudioUnitProperty_StreamFormat,
+                scope,
+                0,
+                &asbd as *const au::AudioStreamBasicDescription as *const c_void,
+                std::mem::size_of::<au::AudioStreamBasicDescription>() as u32,
+            )
+        }
+    }
+
+    fn stream_format_channels(wrapper: *mut c_void, scope: au::AudioUnitScope) -> u32 {
+        let mut asbd = float_asbd(0);
+        let mut size = std::mem::size_of::<au::AudioStreamBasicDescription>() as u32;
+        assert_eq!(
+            unsafe {
+                Wrapper::<TestEffect>::get_property(
+                    wrapper,
+                    au::kAudioUnitProperty_StreamFormat,
+                    scope,
+                    0,
+                    &mut asbd as *mut au::AudioStreamBasicDescription as *mut c_void,
+                    &mut size,
+                )
+            },
+            au::noErr
+        );
+        asbd.mChannelsPerFrame
+    }
+
+    /// Setting the main *input* format must be able to select a layout, not
+    /// just be checked against the one the output scope already implies.
+    ///
+    /// The wrapper starts at two output channels, so before this the only way
+    /// to reach a `{1,1}` layout was to configure the output scope first. Hosts
+    /// do not agree on that order — `auval`'s channel tests set the input format
+    /// first, so a mono layout was reported as `FormatNotSupported` and
+    /// validation died later with `-10868` in Render Preparation.
+    #[test]
+    fn main_input_stream_format_selects_a_matching_layout() {
+        let wrapper = Wrapper::<TestEffect>::new() as *mut c_void;
+
+        // Default is the stereo layout at index 0.
+        assert_eq!(
+            stream_format_channels(wrapper, au::kAudioUnitScope_Output),
+            2
+        );
+
+        // Input-first mono negotiation: accepted, and it moves the whole layout.
+        assert_eq!(
+            set_stream_format(wrapper, au::kAudioUnitScope_Input, 1),
+            au::noErr,
+            "mono input must be accepted while the output is still stereo"
+        );
+        assert_eq!(
+            stream_format_channels(wrapper, au::kAudioUnitScope_Output),
+            1,
+            "selecting the mono input layout must move the output bus with it"
+        );
+        assert_eq!(
+            stream_format_channels(wrapper, au::kAudioUnitScope_Input),
+            1
+        );
+
+        // And back, so the negotiation is not one-way.
+        assert_eq!(
+            set_stream_format(wrapper, au::kAudioUnitScope_Input, 2),
+            au::noErr
+        );
+        assert_eq!(
+            stream_format_channels(wrapper, au::kAudioUnitScope_Output),
+            2
+        );
+    }
+
+    /// A channel count no declared layout offers must still be refused —
+    /// the relaxation above is a layout lookup, not a blanket "accept anything".
+    #[test]
+    fn main_input_stream_format_still_rejects_undeclared_channel_counts() {
+        let wrapper = Wrapper::<TestEffect>::new() as *mut c_void;
+
+        assert_eq!(
+            set_stream_format(wrapper, au::kAudioUnitScope_Input, 4),
+            au::kAudioUnitErr_FormatNotSupported
+        );
+        assert_eq!(
+            stream_format_channels(wrapper, au::kAudioUnitScope_Output),
+            2,
+            "a rejected format must leave the selected layout untouched"
+        );
+    }
+
+    #[derive(Default)]
+    struct AsymmetricEffect {
+        params: Arc<EffectParams>,
+    }
+
+    impl Plugin for AsymmetricEffect {
+        const NAME: &'static str = "AU Asymmetric Test";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/robbert-vdh/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        // Two layouts sharing an output count. `layout_for_output(2)` can only
+        // ever resolve to the first one, so the second is not representable
+        // through the wrapper's output-keyed derivation.
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+            AudioIOLayout {
+                main_input_channels: NonZeroU32::new(2),
+                main_output_channels: NonZeroU32::new(2),
+                ..AudioIOLayout::const_default()
+            },
+            AudioIOLayout {
+                main_input_channels: NonZeroU32::new(1),
+                main_output_channels: NonZeroU32::new(2),
+                ..AudioIOLayout::const_default()
+            },
+        ];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl AuPlugin for AsymmetricEffect {
+        const AU_TYPE: [u8; 4] = *b"aufx";
+        const AU_SUBTYPE: [u8; 4] = *b"TstA";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    /// Selecting by input count must not report success for a layout the
+    /// wrapper cannot then reproduce.
+    ///
+    /// Everything downstream re-derives the layout from the output channel
+    /// count via `layout_for_output`, which takes the first match. When two
+    /// layouts share an output count, the input-matched one is unreachable —
+    /// accepting it would tell the host "yes, 1 channel in" and then run
+    /// `{2,2}` anyway. Rejecting is what the pre-existing code did, and the
+    /// input-side relaxation must not weaken it.
+    #[test]
+    fn main_input_selection_rejects_layouts_it_cannot_reproduce() {
+        let wrapper = Wrapper::<AsymmetricEffect>::new() as *mut c_void;
+        let asbd = au::AudioStreamBasicDescription {
+            mSampleRate: 44100.0,
+            mFormatID: au::kAudioFormatLinearPCM,
+            mFormatFlags: au::kAudioFormatFlagIsFloat
+                | au::kAudioFormatFlagIsPacked
+                | au::kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0,
+        };
+
+        let status = unsafe {
+            Wrapper::<AsymmetricEffect>::set_property(
+                wrapper,
+                au::kAudioUnitProperty_StreamFormat,
+                au::kAudioUnitScope_Input,
+                0,
+                &asbd as *const au::AudioStreamBasicDescription as *const c_void,
+                std::mem::size_of::<au::AudioStreamBasicDescription>() as u32,
+            )
+        };
+        assert_eq!(
+            status,
+            au::kAudioUnitErr_FormatNotSupported,
+            "a layout that output-keyed derivation cannot reach must be refused"
+        );
+    }
+
+    /// The output scope keeps selecting layouts exactly as before.
+    #[test]
+    fn output_stream_format_selection_is_unchanged() {
+        let wrapper = Wrapper::<TestEffect>::new() as *mut c_void;
+
+        assert_eq!(
+            set_stream_format(wrapper, au::kAudioUnitScope_Output, 1),
+            au::noErr
+        );
+        assert_eq!(
+            stream_format_channels(wrapper, au::kAudioUnitScope_Input),
+            1
+        );
+        assert_eq!(
+            set_stream_format(wrapper, au::kAudioUnitScope_Output, 7),
+            au::kAudioUnitErr_FormatNotSupported
         );
     }
 }
