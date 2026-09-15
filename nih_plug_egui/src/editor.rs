@@ -118,33 +118,46 @@ where
                 warmup_frames = warmup_frames.saturating_sub(1);
 
                 // If the window was requested to resize
-                if let Some(new_size) = egui_state.requested_size.swap(None) {
+                if egui_state.requested_size.load().is_some() {
                     // Ask the plugin host to resize to self.size()
                     if context.request_resize() {
-                        // new_size 는 논리 픽셀. baseview window.resize() 와
-                        // egui screen_rect 둘 다 갱신해야 한다.
-                        //
-                        // macOS standalone 에서는 NSWindow::setContentSize_ 로 OS 창은
-                        // 커지지만 WindowEvent::Resized 가 backing-property 변경 때만
-                        // 발생해 egui 의 physical_size/screen_rect 가 갱신되지 않는다
-                        // (커진 창의 좌상단 옛 크기 영역에만 GUI, 나머지 빈 배경).
-                        //
-                        // 그래서 queue.resize(PhySize) 로 egui 의 physical_size 를
-                        // 직접 갱신한다. physical_size 는 물리 픽셀이므로 DPI 배율을
-                        // 곱한다. ViewportCommand::InnerSize(논리) 는 baseview 의
-                        // window.resize() 를 호출해 OS 창 자체를 리사이즈한다.
-                        let ppp = egui_ctx.pixels_per_point();
-                        queue.resize(PhySize::new(
-                            (new_size.0 as f32 * ppp).round() as u32,
-                            (new_size.1 as f32 * ppp).round() as u32,
-                        ));
-                        egui_ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
-                            new_size.0 as f32,
-                            new_size.1 as f32,
-                        )));
+                        // Consume the request *after* the host call. Synchronous
+                        // hosts (standalone, CLAP) read `Editor::size()` inside
+                        // `request_resize()`, so the pending value must still be
+                        // present then. Swapping first made them observe the
+                        // previous size: the egui surface scaled immediately but
+                        // the OS window was resized to the *previous* request,
+                        // lagging one interaction behind (AUD-1611).
+                        if let Some(new_size) = egui_state.requested_size.swap(None) {
+                            // new_size 는 논리 픽셀. baseview window.resize() 와
+                            // egui screen_rect 둘 다 갱신해야 한다.
+                            //
+                            // macOS standalone 에서는 NSWindow::setContentSize_ 로 OS 창은
+                            // 커지지만 WindowEvent::Resized 가 backing-property 변경 때만
+                            // 발생해 egui 의 physical_size/screen_rect 가 갱신되지 않는다
+                            // (커진 창의 좌상단 옛 크기 영역에만 GUI, 나머지 빈 배경).
+                            //
+                            // 그래서 queue.resize(PhySize) 로 egui 의 physical_size 를
+                            // 직접 갱신한다. physical_size 는 물리 픽셀이므로 DPI 배율을
+                            // 곱한다. ViewportCommand::InnerSize(논리) 는 baseview 의
+                            // window.resize() 를 호출해 OS 창 자체를 리사이즈한다.
+                            let ppp = egui_ctx.pixels_per_point();
+                            queue.resize(PhySize::new(
+                                (new_size.0 as f32 * ppp).round() as u32,
+                                (new_size.1 as f32 * ppp).round() as u32,
+                            ));
+                            egui_ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                                new_size.0 as f32,
+                                new_size.1 as f32,
+                            )));
 
-                        // Update the state
-                        egui_state.size.store(new_size);
+                            // Update the state
+                            egui_state.size.store(new_size);
+                        }
+                    } else {
+                        // The host cannot resize (AUv2 has no resize API). Drop
+                        // the request instead of retrying it every frame.
+                        egui_state.requested_size.store(None);
                     }
                 }
 
