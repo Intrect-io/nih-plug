@@ -19,7 +19,7 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, codeql-mini]
     timeout-minutes: 30
     strategy:
       fail-fast: false
