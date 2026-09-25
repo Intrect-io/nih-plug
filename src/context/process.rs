@@ -1,7 +1,7 @@
 //! A context passed during the process function.
 
 use super::PluginApi;
-use crate::prelude::{Plugin, PluginNoteEvent};
+use crate::prelude::{Plugin, PluginNoteEvent, ProcessMode};
 
 /// Contains both context data and callbacks the plugin can use during processing. Most notably this
 /// is how a plugin sends and receives note events, gets transport information, and accesses
@@ -91,6 +91,22 @@ pub trait ProcessContext<P: Plugin> {
     /// runtime allows the host to better optimize polyphonic modulation, or to switch to strictly
     /// monophonic modulation when dropping the capacity down to 1.
     fn set_current_voice_capacity(&self, capacity: u32);
+
+    /// The render mode the host has requested **after** [`Plugin::initialize()`], for plugin APIs
+    /// that let a host switch it mid-session. `None` means the API has no such mechanism, in which
+    /// case [`BufferConfig::process_mode`][crate::prelude::BufferConfig::process_mode] from the
+    /// last `initialize()` call is still authoritative.
+    ///
+    /// CLAP hosts may call `clap_plugin_render::set()` at any time on the main thread, for
+    /// instance to render an offline bounce faster than real time without re-activating the
+    /// plugin. That change only reaches `BufferConfig` on the next `initialize()`, so a plugin
+    /// whose real-time path cannot keep up with faster-than-real-time processing (e.g. one that
+    /// hands audio to a worker thread and polls for results without blocking) can read this to
+    /// switch to a blocking strategy for the duration of the bounce. The value is a lock-free
+    /// atomic load and is safe to call from the audio thread.
+    fn host_render_mode(&self) -> Option<ProcessMode> {
+        None
+    }
 
     // TODO: Add this, this works similar to [GuiContext::set_parameter] but it adds the parameter
     //       change to a queue (or directly to the VST3 plugin's parameter output queues) instead of
