@@ -1,6 +1,7 @@
 #[macro_use]
 mod util;
 
+pub mod aax_params;
 mod context;
 mod descriptor;
 pub mod features;
