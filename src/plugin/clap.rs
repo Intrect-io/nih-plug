@@ -17,6 +17,15 @@ pub trait ClapPlugin: Plugin {
     /// browser.
     const CLAP_FEATURES: &'static [ClapFeature];
 
+    /// Opt into Intrect's private AAX parameter-only delivery extension.
+    ///
+    /// This permits atomic parameter values and GUI parameter gestures to be updated while
+    /// `Plugin::process()` runs. The plugin must read parameters through their atomic getters,
+    /// have thread-safe parameter callbacks, and tolerate a value changing within a block.
+    /// Sample-accurate automation, MIDI and polyphonic modulation are not supported by this
+    /// extension. Standard CLAP `params.flush` retains its normal thread/exclusion contract.
+    const CLAP_AAX_CONCURRENT_PARAMETER_DELIVERY: bool = false;
+
     /// If set, this informs the host about the plugin's capabilities for polyphonic modulation.
     const CLAP_POLY_MODULATION_CONFIG: Option<PolyModulationConfig> = None;
 

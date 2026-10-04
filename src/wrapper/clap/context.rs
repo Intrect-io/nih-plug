@@ -12,7 +12,7 @@ use super::wrapper::{OutputParamEvent, Task, Wrapper};
 use crate::event_loop::EventLoop;
 use crate::prelude::{
     ClapPlugin, GuiContext, InitContext, ParamPtr, PluginApi, PluginNoteEvent, ProcessContext,
-    RemoteControlsContext, RemoteControlsPage, RemoteControlsSection, Transport,
+    ProcessMode, RemoteControlsContext, RemoteControlsPage, RemoteControlsSection, Transport,
 };
 use crate::wrapper::util::strlcpy;
 
@@ -126,6 +126,10 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn set_current_voice_capacity(&self, capacity: u32) {
         self.wrapper.set_current_voice_capacity(capacity)
+    }
+
+    fn host_render_mode(&self) -> Option<ProcessMode> {
+        Some(self.wrapper.current_process_mode.load())
     }
 }
 

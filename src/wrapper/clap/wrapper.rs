@@ -22,9 +22,6 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::audio_ports_config::{
     clap_audio_ports_config, clap_plugin_audio_ports_config, CLAP_EXT_AUDIO_PORTS_CONFIG,
 };
-use clap_sys::ext::remote_controls::{
-    clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
-};
 use clap_sys::ext::gui::{
     clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window, CLAP_EXT_GUI,
     CLAP_WINDOW_API_COCOA, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11,
@@ -39,6 +36,9 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_READONLY,
     CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES,
+};
+use clap_sys::ext::remote_controls::{
+    clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
 };
 use clap_sys::ext::render::{
     clap_plugin_render, clap_plugin_render_mode, CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE,
@@ -72,11 +72,12 @@ use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
+use super::aax_params::{AaxParameterDelivery, ParameterDeliveryGuard, AAX_PARAMETER_DELIVERY_ID};
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
@@ -222,6 +223,11 @@ pub struct Wrapper<P: ClapPlugin> {
     ///      even if it does then that should still not be a problem because the host also reads it
     ///      in the same order, right?
     output_parameter_events: ArrayQueue<OutputParamEvent>,
+    pending_parameter_output: AtomicRefCell<Option<OutputParamEvent>>,
+    parameter_delivery_busy: AtomicBool,
+    parameter_delivery_nonce: AtomicU64,
+    parameter_delivery_token: AtomicU64,
+    parameter_delivery_owner: AtomicCell<Option<ThreadId>>,
 
     host_thread_check: AtomicRefCell<Option<ClapPtr<clap_host_thread_check>>>,
 
@@ -642,6 +648,11 @@ impl<P: ClapPlugin> Wrapper<P> {
             param_ptr_to_hash,
             poly_mod_ids_by_hash,
             output_parameter_events: ArrayQueue::new(OUTPUT_EVENT_QUEUE_CAPACITY),
+            pending_parameter_output: AtomicRefCell::new(None),
+            parameter_delivery_busy: AtomicBool::new(false),
+            parameter_delivery_nonce: AtomicU64::new(0),
+            parameter_delivery_token: AtomicU64::new(0),
+            parameter_delivery_owner: AtomicCell::new(None),
 
             host_thread_check: AtomicRefCell::new(None),
 
@@ -826,8 +837,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(param_ptr) => {
                 match update_type {
                     ClapParamUpdate::PlainValueSet(clap_plain_value) => {
+                        // Single-variant enums advertise [0, 0]. A unit divisor
+                        // keeps their sole plain value normalized without 0/0.
                         let normalized_value = clap_plain_value as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                            / unsafe { param_ptr.step_count() }.unwrap_or(1).max(1) as f32;
 
                         if unsafe { param_ptr.set_normalized_value(normalized_value) } {
                             if let Some(sample_rate) = sample_rate {
@@ -848,7 +861,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     }
                     ClapParamUpdate::PlainValueMod(clap_plain_delta) => {
                         let normalized_delta = clap_plain_delta as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                            / unsafe { param_ptr.step_count() }.unwrap_or(1).max(1) as f32;
 
                         if unsafe { param_ptr.modulate_value(normalized_delta) } {
                             if let Some(sample_rate) = sample_rate {
@@ -982,72 +995,21 @@ impl<P: ClapPlugin> Wrapper<P> {
         current_sample_idx: usize,
         total_buffer_len: usize,
     ) {
-        // We'll always write these events to the first sample, so even when we add note output we
-        // shouldn't have to think about interleaving events here
-        let sample_rate = self.current_buffer_config.load().map(|c| c.sample_rate);
-        while let Some(change) = self.output_parameter_events.pop() {
-            let push_successful = match change {
-                OutputParamEvent::BeginGesture { param_hash } => {
-                    let event = clap_event_param_gesture {
-                        header: clap_event_header {
-                            size: mem::size_of::<clap_event_param_gesture>() as u32,
-                            time: current_sample_idx as u32,
-                            space_id: CLAP_CORE_EVENT_SPACE_ID,
-                            type_: CLAP_EVENT_PARAM_GESTURE_BEGIN,
-                            flags: CLAP_EVENT_IS_LIVE,
-                        },
-                        param_id: param_hash,
-                    };
-
-                    clap_call! { out=>try_push(out, &event.header) }
+        // An opted-in AAX host may drain only parameter output on a background thread.
+        // The audio path tries once and keeps processing notes/audio if that drain owns the gate.
+        let guard = if P::CLAP_AAX_CONCURRENT_PARAMETER_DELIVERY {
+            ParameterDeliveryGuard::try_acquire(&self.parameter_delivery_busy)
+        } else {
+            None
+        };
+        if !P::CLAP_AAX_CONCURRENT_PARAMETER_DELIVERY || guard.is_some() {
+            if !self.handle_out_parameter_events(out, current_sample_idx) {
+                if let Some(host_params) = &*self.host_params.borrow() {
+                    clap_call! { host_params=>request_flush(&*self.host_callback) };
                 }
-                OutputParamEvent::SetValue {
-                    param_hash,
-                    clap_plain_value,
-                } => {
-                    self.update_plain_value_by_hash(
-                        param_hash,
-                        ClapParamUpdate::PlainValueSet(clap_plain_value),
-                        sample_rate,
-                    );
-
-                    let event = clap_event_param_value {
-                        header: clap_event_header {
-                            size: mem::size_of::<clap_event_param_value>() as u32,
-                            time: current_sample_idx as u32,
-                            space_id: CLAP_CORE_EVENT_SPACE_ID,
-                            type_: CLAP_EVENT_PARAM_VALUE,
-                            flags: CLAP_EVENT_IS_LIVE,
-                        },
-                        param_id: param_hash,
-                        cookie: std::ptr::null_mut(),
-                        port_index: -1,
-                        note_id: -1,
-                        channel: -1,
-                        key: -1,
-                        value: clap_plain_value,
-                    };
-
-                    clap_call! { out=>try_push(out, &event.header) }
-                }
-                OutputParamEvent::EndGesture { param_hash } => {
-                    let event = clap_event_param_gesture {
-                        header: clap_event_header {
-                            size: mem::size_of::<clap_event_param_gesture>() as u32,
-                            time: current_sample_idx as u32,
-                            space_id: CLAP_CORE_EVENT_SPACE_ID,
-                            type_: CLAP_EVENT_PARAM_GESTURE_END,
-                            flags: CLAP_EVENT_IS_LIVE,
-                        },
-                        param_id: param_hash,
-                    };
-
-                    clap_call! { out=>try_push(out, &event.header) }
-                }
-            };
-
-            nih_debug_assert!(push_successful);
+            }
         }
+        drop(guard);
 
         // Also send all note events generated by the plugin
         let mut output_events = self.output_events.borrow_mut();
@@ -1441,7 +1403,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     // integer or enum parameters
                     let param_ptr = self.param_by_hash[&event.param_id];
                     let normalized_value =
-                        event.value as f32 / param_ptr.step_count().unwrap_or(1) as f32;
+                        event.value as f32 / param_ptr.step_count().unwrap_or(1).max(1) as f32;
 
                     input_events.push_back(NoteEvent::MonoAutomation {
                         timing,
@@ -1459,8 +1421,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                             // The modulation offset needs to be normalized to account for modulated
                             // integer or enum parameters
                             let param_ptr = self.param_by_hash[&event.param_id];
-                            let normalized_offset =
-                                event.amount as f32 / param_ptr.step_count().unwrap_or(1) as f32;
+                            let normalized_offset = event.amount as f32
+                                / param_ptr.step_count().unwrap_or(1).max(1) as f32;
 
                             // The host may also add key and channel information here, but it may
                             // also pass -1. So not having that information here at all seems like
@@ -2354,6 +2316,14 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.clap_plugin_note_ports as *const _ as *const c_void
         } else if id == CLAP_EXT_PARAMS {
             &wrapper.clap_plugin_params as *const _ as *const c_void
+        } else if id == AAX_PARAMETER_DELIVERY_ID
+            && P::CLAP_AAX_CONCURRENT_PARAMETER_DELIVERY
+            && !P::SAMPLE_ACCURATE_AUTOMATION
+            && P::MIDI_INPUT == MidiConfig::None
+            && P::MIDI_OUTPUT == MidiConfig::None
+            && wrapper.poly_mod_ids_by_hash.is_empty()
+        {
+            &Self::AAX_PARAMETER_DELIVERY as *const _ as *const c_void
         } else if id == CLAP_EXT_REMOTE_CONTROLS {
             &wrapper.clap_plugin_remote_controls as *const _ as *const c_void
         } else if id == CLAP_EXT_RENDER {
@@ -3014,7 +2984,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     dest,
                     // CLAP does not have a separate unit, so we'll include the unit here
                     &param_ptr.normalized_value_to_string(
-                        value as f32 / param_ptr.step_count().unwrap_or(1) as f32,
+                        value as f32 / param_ptr.step_count().unwrap_or(1).max(1) as f32,
                         true,
                     ),
                 );
@@ -3051,6 +3021,208 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             _ => false,
         }
+    }
+
+    /// Drain only parameter gestures and values; the caller owns the parameter delivery gate.
+    /// Never touches process input/output note buffers or the mutable plugin instance.
+    unsafe fn handle_out_parameter_events(
+        &self,
+        out: &clap_output_events,
+        current_sample_idx: usize,
+    ) -> bool {
+        // We'll always write these events to the first sample, so even when we add note output we
+        // shouldn't have to think about interleaving events here
+        let sample_rate = self.current_buffer_config.load().map(|c| c.sample_rate);
+        let mut pending = self.pending_parameter_output.borrow_mut();
+        while let Some(change) = pending
+            .take()
+            .or_else(|| self.output_parameter_events.pop())
+        {
+            let push_successful = match change.clone() {
+                OutputParamEvent::BeginGesture { param_hash } => {
+                    let event = clap_event_param_gesture {
+                        header: clap_event_header {
+                            size: mem::size_of::<clap_event_param_gesture>() as u32,
+                            time: current_sample_idx as u32,
+                            space_id: CLAP_CORE_EVENT_SPACE_ID,
+                            type_: CLAP_EVENT_PARAM_GESTURE_BEGIN,
+                            flags: CLAP_EVENT_IS_LIVE,
+                        },
+                        param_id: param_hash,
+                    };
+
+                    clap_call! { out=>try_push(out, &event.header) }
+                }
+                OutputParamEvent::SetValue {
+                    param_hash,
+                    clap_plain_value,
+                } => {
+                    self.update_plain_value_by_hash(
+                        param_hash,
+                        ClapParamUpdate::PlainValueSet(clap_plain_value),
+                        sample_rate,
+                    );
+
+                    let event = clap_event_param_value {
+                        header: clap_event_header {
+                            size: mem::size_of::<clap_event_param_value>() as u32,
+                            time: current_sample_idx as u32,
+                            space_id: CLAP_CORE_EVENT_SPACE_ID,
+                            type_: CLAP_EVENT_PARAM_VALUE,
+                            flags: CLAP_EVENT_IS_LIVE,
+                        },
+                        param_id: param_hash,
+                        cookie: std::ptr::null_mut(),
+                        port_index: -1,
+                        note_id: -1,
+                        channel: -1,
+                        key: -1,
+                        value: clap_plain_value,
+                    };
+
+                    clap_call! { out=>try_push(out, &event.header) }
+                }
+                OutputParamEvent::EndGesture { param_hash } => {
+                    let event = clap_event_param_gesture {
+                        header: clap_event_header {
+                            size: mem::size_of::<clap_event_param_gesture>() as u32,
+                            time: current_sample_idx as u32,
+                            space_id: CLAP_CORE_EVENT_SPACE_ID,
+                            type_: CLAP_EVENT_PARAM_GESTURE_END,
+                            flags: CLAP_EVENT_IS_LIVE,
+                        },
+                        param_id: param_hash,
+                    };
+
+                    clap_call! { out=>try_push(out, &event.header) }
+                }
+            };
+
+            if !push_successful {
+                // Keep the rejected event ahead of later gestures/values on either drain thread.
+                *pending = Some(change);
+                return false;
+            }
+        }
+        true
+    }
+
+    const AAX_PARAMETER_DELIVERY: AaxParameterDelivery = AaxParameterDelivery {
+        try_begin: Self::aax_parameter_delivery_try_begin,
+        flush: Self::aax_parameter_delivery_flush,
+        end: Self::aax_parameter_delivery_end,
+    };
+
+    unsafe extern "C" fn aax_parameter_delivery_try_begin(plugin: *const clap_plugin) -> u64 {
+        check_null_ptr!(0, plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+        if wrapper
+            .parameter_delivery_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return 0;
+        }
+        let Ok(previous) = wrapper.parameter_delivery_nonce.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| value.checked_add(1),
+        ) else {
+            wrapper
+                .parameter_delivery_busy
+                .store(false, Ordering::Release);
+            return 0;
+        };
+        let token = previous + 1;
+        wrapper
+            .parameter_delivery_owner
+            .store(Some(thread::current().id()));
+        wrapper
+            .parameter_delivery_token
+            .store(token, Ordering::Release);
+        token
+    }
+
+    fn owns_aax_parameter_delivery(&self, token: u64) -> bool {
+        token != 0
+            && self.parameter_delivery_busy.load(Ordering::Acquire)
+            && self.parameter_delivery_token.load(Ordering::Acquire) == token
+            && self.parameter_delivery_owner.load() == Some(thread::current().id())
+    }
+
+    unsafe extern "C" fn aax_parameter_delivery_flush(
+        plugin: *const clap_plugin,
+        token: u64,
+        in_: *const clap_input_events,
+        out: *const clap_output_events,
+    ) -> u32 {
+        check_null_ptr!(0, plugin, (*plugin).plugin_data, in_, out);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+        if !wrapper.owns_aax_parameter_delivery(token) {
+            return 0;
+        }
+        // Validate the whole batch before applying it. This extension is not a general flush.
+        let count = clap_call! { in_=>size(in_) };
+        for index in 0..count {
+            let event = clap_call! { in_=>get(in_, index) };
+            if event.is_null()
+                || (*event).space_id != CLAP_CORE_EVENT_SPACE_ID
+                || (*event).type_ != CLAP_EVENT_PARAM_VALUE
+                || (*event).size < mem::size_of::<clap_event_param_value>() as u32
+            {
+                return 0;
+            }
+            let value = &*(event as *const clap_event_param_value);
+            if value.note_id != -1
+                || value.port_index != -1
+                || value.channel != -1
+                || value.key != -1
+                || !value.value.is_finite()
+            {
+                return 0;
+            }
+            let Some(parameter) = wrapper.param_by_hash.get(&value.param_id) else {
+                return 0;
+            };
+            // Match the advertised CLAP range, before narrowing to f32. This also
+            // excludes finite f64 values that would overflow the atomic parameter.
+            let maximum = parameter.step_count().unwrap_or(1) as f64;
+            if value.value < 0.0 || value.value > maximum {
+                return 0;
+            }
+        }
+        let sample_rate = wrapper.current_buffer_config.load().map(|c| c.sample_rate);
+        for index in 0..count {
+            let event = clap_call! { in_=>get(in_, index) };
+            let value = &*(event as *const clap_event_param_value);
+            wrapper.update_plain_value_by_hash(
+                value.param_id,
+                ClapParamUpdate::PlainValueSet(value.value),
+                sample_rate,
+            );
+        }
+        if wrapper.handle_out_parameter_events(&*out, 0) {
+            2
+        } else {
+            1
+        }
+    }
+
+    unsafe extern "C" fn aax_parameter_delivery_end(
+        plugin: *const clap_plugin,
+        token: u64,
+    ) -> bool {
+        check_null_ptr!(false, plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+        if !wrapper.owns_aax_parameter_delivery(token) {
+            return false;
+        }
+        wrapper.parameter_delivery_owner.store(None);
+        wrapper.parameter_delivery_token.store(0, Ordering::Release);
+        wrapper
+            .parameter_delivery_busy
+            .store(false, Ordering::Release);
+        true
     }
 
     unsafe extern "C" fn ext_params_flush(
@@ -3270,3 +3442,7 @@ unsafe fn query_host_extension<T>(
         None
     }
 }
+
+#[cfg(test)]
+#[path = "aax_parameter_tests.rs"]
+mod aax_parameter_tests;
