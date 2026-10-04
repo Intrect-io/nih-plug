@@ -837,8 +837,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(param_ptr) => {
                 match update_type {
                     ClapParamUpdate::PlainValueSet(clap_plain_value) => {
+                        // Single-variant enums advertise [0, 0]. A unit divisor
+                        // keeps their sole plain value normalized without 0/0.
                         let normalized_value = clap_plain_value as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                            / unsafe { param_ptr.step_count() }.unwrap_or(1).max(1) as f32;
 
                         if unsafe { param_ptr.set_normalized_value(normalized_value) } {
                             if let Some(sample_rate) = sample_rate {
@@ -859,7 +861,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     }
                     ClapParamUpdate::PlainValueMod(clap_plain_delta) => {
                         let normalized_delta = clap_plain_delta as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                            / unsafe { param_ptr.step_count() }.unwrap_or(1).max(1) as f32;
 
                         if unsafe { param_ptr.modulate_value(normalized_delta) } {
                             if let Some(sample_rate) = sample_rate {
@@ -1401,7 +1403,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     // integer or enum parameters
                     let param_ptr = self.param_by_hash[&event.param_id];
                     let normalized_value =
-                        event.value as f32 / param_ptr.step_count().unwrap_or(1) as f32;
+                        event.value as f32 / param_ptr.step_count().unwrap_or(1).max(1) as f32;
 
                     input_events.push_back(NoteEvent::MonoAutomation {
                         timing,
@@ -1419,8 +1421,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                             // The modulation offset needs to be normalized to account for modulated
                             // integer or enum parameters
                             let param_ptr = self.param_by_hash[&event.param_id];
-                            let normalized_offset =
-                                event.amount as f32 / param_ptr.step_count().unwrap_or(1) as f32;
+                            let normalized_offset = event.amount as f32
+                                / param_ptr.step_count().unwrap_or(1).max(1) as f32;
 
                             // The host may also add key and channel information here, but it may
                             // also pass -1. So not having that information here at all seems like
@@ -2982,7 +2984,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     dest,
                     // CLAP does not have a separate unit, so we'll include the unit here
                     &param_ptr.normalized_value_to_string(
-                        value as f32 / param_ptr.step_count().unwrap_or(1) as f32,
+                        value as f32 / param_ptr.step_count().unwrap_or(1).max(1) as f32,
                         true,
                     ),
                 );
@@ -3185,7 +3187,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             // Match the advertised CLAP range, before narrowing to f32. This also
             // excludes finite f64 values that would overflow the atomic parameter.
             let maximum = parameter.step_count().unwrap_or(1) as f64;
-            if maximum == 0.0 || value.value < 0.0 || value.value > maximum {
+            if value.value < 0.0 || value.value > maximum {
                 return 0;
             }
         }

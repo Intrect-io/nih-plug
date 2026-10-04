@@ -1,13 +1,23 @@
 use super::*;
-use crate::prelude::{ClapFeature, FloatParam, FloatRange, Param, ProcessContext};
+use crate::prelude::{ClapFeature, Enum, EnumParam, FloatParam, FloatRange, Param, ProcessContext};
 use std::ptr;
+
+#[derive(Enum, Debug, PartialEq, Clone, Copy)]
+enum SingleVariant {
+    Only,
+}
 
 struct TestParams {
     value: FloatParam,
+    single: Option<EnumParam<SingleVariant>>,
 }
 unsafe impl Params for TestParams {
     fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
-        vec![("value".into(), self.value.as_ptr(), String::new())]
+        let mut params = vec![("value".into(), self.value.as_ptr(), String::new())];
+        if let Some(single) = &self.single {
+            params.push(("single".into(), single.as_ptr(), String::new()));
+        }
+        params
     }
 }
 struct TestPlugin<const ENABLED: bool> {
@@ -18,9 +28,96 @@ impl<const ENABLED: bool> Default for TestPlugin<ENABLED> {
         Self {
             params: Arc::new(TestParams {
                 value: FloatParam::new("Value", 0.25, FloatRange::Linear { min: 0.0, max: 1.0 }),
+                // IntRange rejects zero-width ranges in debug tests, but release
+                // EnumParam still advertises its single variant as CLAP [0, 0].
+                single: if cfg!(debug_assertions) {
+                    None
+                } else {
+                    Some(EnumParam::new("Single", SingleVariant::Only))
+                },
             }),
         }
     }
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn zero_width_advertised_enum_accepts_zero_and_rejects_invalid_batches() {
+    let host = host();
+    let wrapper = unsafe { Wrapper::<TestPlugin<true>>::new(&host) };
+    let plugin = wrapper.clap_plugin.borrow();
+    let value_id = wrapper.param_id_to_hash["value"];
+    let single_id = wrapper.param_id_to_hash["single"];
+    let ext = &Wrapper::<TestPlugin<true>>::AAX_PARAMETER_DELIVERY;
+    let mut info = unsafe { mem::zeroed::<clap_param_info>() };
+    assert!(unsafe { Wrapper::<TestPlugin<true>>::ext_params_get_info(&*plugin, 1, &mut info) });
+    assert_eq!(info.id, single_id);
+    assert_eq!(
+        (info.min_value, info.max_value, info.default_value),
+        (0.0, 0.0, 0.0)
+    );
+    assert_eq!(
+        wrapper
+            .plugin
+            .lock()
+            .params
+            .single
+            .as_ref()
+            .unwrap()
+            .step_count(),
+        Some(0)
+    );
+    let mut received = Vec::<u16>::new();
+    let output = clap_output_events {
+        ctx: &mut received as *mut _ as *mut _,
+        try_push: Some(output_push),
+    };
+    for zero in [0.0, -0.0] {
+        let events = vec![value(value_id, 0.8), value(single_id, zero)];
+        let input = clap_input_events {
+            ctx: &events as *const _ as *mut _,
+            size: Some(input_size),
+            get: Some(input_get),
+        };
+        unsafe {
+            let token = (ext.try_begin)(&*plugin);
+            assert_ne!(token, 0);
+            assert_eq!((ext.flush)(&*plugin, token, &input, &output), 2);
+            assert!((ext.end)(&*plugin, token));
+        }
+        let params = wrapper.plugin.lock().params.clone();
+        assert_eq!(params.value.value(), 0.8);
+        let single = params.single.as_ref().unwrap();
+        assert_eq!(single.value(), SingleVariant::Only);
+        assert_eq!(single.unmodulated_normalized_value(), 0.0);
+        let mut plain = f64::NAN;
+        assert!(unsafe {
+            Wrapper::<TestPlugin<true>>::ext_params_get_value(&*plugin, single_id, &mut plain)
+        });
+        assert_eq!(plain, 0.0);
+    }
+    for invalid in [
+        f64::EPSILON,
+        -f64::EPSILON,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let events = vec![value(value_id, 0.2), value(single_id, invalid)];
+        let input = clap_input_events {
+            ctx: &events as *const _ as *mut _,
+            size: Some(input_size),
+            get: Some(input_get),
+        };
+        unsafe {
+            let token = (ext.try_begin)(&*plugin);
+            assert_ne!(token, 0);
+            assert_eq!((ext.flush)(&*plugin, token, &input, &output), 0);
+            assert!((ext.end)(&*plugin, token));
+        }
+        assert_eq!(wrapper.plugin.lock().params.value.value(), 0.8);
+    }
+    assert!(received.is_empty());
 }
 impl<const ENABLED: bool> Plugin for TestPlugin<ENABLED> {
     const NAME: &'static str = "AAX delivery fixture";
