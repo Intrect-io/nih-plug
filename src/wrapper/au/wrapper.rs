@@ -186,7 +186,8 @@ pub struct Wrapper<P: AuPlugin> {
     initialized: AtomicBool,
 
     /// Host-controlled bypass (`kAudioUnitProperty_BypassEffect`). When set,
-    /// `render()` skips `Plugin::process()` and just passes input → output.
+    /// a declared BYPASS parameter delegates processing to the plugin, which
+    /// owns its latency-aligned dry path. Without one, render skips processing.
     /// If the plugin declares a `ParamFlags::BYPASS` parameter we keep it in
     /// sync so plugins that observe bypass state through their own param see
     /// the toggle too.
@@ -2408,12 +2409,14 @@ impl<P: AuPlugin> Wrapper<P> {
             return upstream_error;
         }
 
-        // Bypass: skip Plugin::process entirely. Input has already been
-        // copied into io_data above (callback path) or sits there in-place
-        // (host path), so the pass-through is implicit — we just don't run
-        // the plugin's DSP.
+        // A declared BYPASS parameter owns the dry path, including delay and
+        // state continuity. Skipping process here bypasses that path too and
+        // returns zero-delay input while the AU still reports DSP latency.
+        // Plugins without a bypass parameter retain implicit pass-through.
 
-        let process_status = if !this.bypass.load(Ordering::Acquire) {
+        let process_status = if this.bypass_param_idx.is_some()
+            || !this.bypass.load(Ordering::Acquire)
+        {
             // SAFETY: aux_buffers is only accessed here (audio thread, no re-entry).
             // We cast to `&'static mut [Buffer<'static>]` to satisfy
             // AuxiliaryBuffers<'_> — the same lifetime-laundering pattern the
@@ -3111,6 +3114,198 @@ mod tests {
 
     use super::*;
     use crate::prelude::*;
+
+    struct BypassParams {
+        bypass: BoolParam,
+    }
+
+    unsafe impl Params for BypassParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![(
+                "bypass".into(),
+                ParamPtr::BoolParam(&self.bypass as *const _ as *mut _),
+                String::new(),
+            )]
+        }
+    }
+
+    struct DelayedBypass<const OWNED: bool> {
+        params: Arc<BypassParams>,
+        history: [[f32; 16]; 2],
+        position: usize,
+        calls: usize,
+    }
+
+    impl<const OWNED: bool> Default for DelayedBypass<OWNED> {
+        fn default() -> Self {
+            let bypass = BoolParam::new("Bypass", false);
+            Self {
+                params: Arc::new(BypassParams {
+                    bypass: if OWNED { bypass.make_bypass() } else { bypass },
+                }),
+                history: [[0.0; 16]; 2],
+                position: 0,
+                calls: 0,
+            }
+        }
+    }
+
+    impl<const OWNED: bool> Plugin for DelayedBypass<OWNED> {
+        const NAME: &'static str = "Delayed AU bypass regression";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/Intrect-io/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+        type SysExMessage = ();
+        type BackgroundTask = ();
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+        fn initialize(
+            &mut self,
+            _: &AudioIOLayout,
+            _: &BufferConfig,
+            context: &mut impl InitContext<Self>,
+        ) -> bool {
+            context.set_latency_samples(16);
+            true
+        }
+        fn reset(&mut self) {
+            self.history = [[0.0; 16]; 2];
+            self.position = 0;
+        }
+        fn process(
+            &mut self,
+            buffer: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            _: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            self.calls += 1;
+            let gain = if self.params.bypass.value() { 1.0 } else { 0.5 };
+            for frame in 0..buffer.samples() {
+                for (channel, samples) in buffer.as_slice().iter_mut().enumerate() {
+                    let delayed = self.history[channel][self.position];
+                    self.history[channel][self.position] = samples[frame];
+                    samples[frame] = delayed * gain;
+                }
+                self.position = (self.position + 1) % 16;
+            }
+            ProcessStatus::Normal
+        }
+    }
+
+    impl<const OWNED: bool> AuPlugin for DelayedBypass<OWNED> {
+        const AU_TYPE: [u8; 4] = *b"aufx";
+        const AU_SUBTYPE: [u8; 4] = *b"TByp";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    fn bypass_sequence<const OWNED: bool>(via_parameter: bool) -> (Vec<[f32; 2]>, usize) {
+        type Timestamp = au::AudioTimeStamp;
+        let wrapper = Wrapper::<DelayedBypass<OWNED>>::new() as *mut c_void;
+        assert_eq!(
+            unsafe { Wrapper::<DelayedBypass<OWNED>>::initialize(wrapper) },
+            au::noErr
+        );
+        let mut rendered = Vec::new();
+        for block in 0..12 {
+            if block == 4 || block == 8 {
+                let value = u32::from(block == 4);
+                let status = if via_parameter {
+                    unsafe {
+                        Wrapper::<DelayedBypass<OWNED>>::set_parameter(
+                            wrapper,
+                            0,
+                            au::kAudioUnitScope_Global,
+                            0,
+                            value as f32,
+                            0,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        Wrapper::<DelayedBypass<OWNED>>::set_property(
+                            wrapper,
+                            au::kAudioUnitProperty_BypassEffect,
+                            au::kAudioUnitScope_Global,
+                            0,
+                            &value as *const _ as *const c_void,
+                            mem::size_of::<u32>() as u32,
+                        )
+                    }
+                };
+                assert_eq!(status, au::noErr);
+            }
+            let mut left: Vec<f32> = (0..8).map(|i| (block * 8 + i + 1) as f32).collect();
+            let mut right: Vec<f32> = left.iter().map(|v| -v).collect();
+            let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
+            let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
+            unsafe {
+                (*list).mNumberBuffers = 2;
+                let slots = (*list).mBuffers.as_mut_ptr();
+                for (i, samples) in [&mut left, &mut right].into_iter().enumerate() {
+                    *slots.add(i) = au::AudioBuffer {
+                        mNumberChannels: 1,
+                        mDataByteSize: 32,
+                        mData: samples.as_mut_ptr() as *mut c_void,
+                    };
+                }
+            }
+            let mut time: Timestamp = unsafe { mem::zeroed() };
+            time.mSampleTime = (block * 8) as f64;
+            time.mFlags = au::kAudioTimeStampSampleTimeValid;
+            let mut flags = 0;
+            assert_eq!(
+                unsafe {
+                    Wrapper::<DelayedBypass<OWNED>>::render(wrapper, &mut flags, &time, 0, 8, list)
+                },
+                au::noErr
+            );
+            rendered.extend(left.into_iter().zip(right).map(|(l, r)| [l, r]));
+        }
+        let calls =
+            unsafe { Wrapper::<DelayedBypass<OWNED>>::from_ptr(wrapper).plugin_mut() }.calls;
+        assert_eq!(
+            unsafe { Wrapper::<DelayedBypass<OWNED>>::close(wrapper) },
+            au::noErr
+        );
+        (rendered, calls)
+    }
+
+    #[test]
+    fn declared_bypass_keeps_dsp_delay_and_history_through_live_toggles() {
+        for via_parameter in [false, true] {
+            let (output, calls) = bypass_sequence::<true>(via_parameter);
+            assert_eq!(calls, 12, "process must continue through host bypass");
+            for (frame, pair) in output.iter().enumerate() {
+                let input = if frame < 16 {
+                    0.0
+                } else {
+                    (frame - 16 + 1) as f32
+                };
+                let gain = if (32..64).contains(&frame) { 1.0 } else { 0.5 };
+                assert_eq!(
+                    *pair,
+                    [input * gain, -input * gain],
+                    "frame {frame}, via_parameter={via_parameter}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_declared_bypass_retains_implicit_passthrough() {
+        let (output, calls) = bypass_sequence::<false>(false);
+        assert_eq!(calls, 8);
+        for (frame, pair) in output.iter().enumerate().take(64).skip(32) {
+            assert_eq!(*pair, [(frame + 1) as f32, -((frame + 1) as f32)]);
+        }
+    }
 
     #[derive(Default)]
     struct InstrumentParams;
