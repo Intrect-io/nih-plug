@@ -14,6 +14,12 @@ state is to list breaking changes.
 
 ### Fixed
 
+- AU host bypass now delegates to a declared `make_bypass()` parameter
+  (`ParamFlags::BYPASS`) instead of skipping DSP, so the plug-in's own dry path
+  keeps its delay and state continuity and host bypass no longer passes through
+  at zero delay while the AU still reports DSP latency (AUD-2060). A plug-in
+  declaring this parameter must implement bypass itself, as with CLAP/VST3.
+  Plug-ins without a declared bypass parameter retain implicit pass-through.
 - macOS egui embedded CLAP editors now implement show/hide by changing their
   own native child view visibility without destroying GUI resources (AUD-2057).
   The additive `Editor::set_visible` hook defaults to unsupported for editors
