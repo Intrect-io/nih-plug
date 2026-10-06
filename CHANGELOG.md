@@ -14,6 +14,10 @@ state is to list breaking changes.
 
 ### Fixed
 
+- macOS egui embedded CLAP editors now implement show/hide by changing their
+  own native child view visibility without destroying GUI resources (AUD-2057).
+  The additive `Editor::set_visible` hook defaults to unsupported for editors
+  and platforms that do not implement visibility control.
 - AU millisecond parameters now advertise the native Milliseconds unit rather
   than Seconds, preserving their raw ranges and default values (AUD-2054).
 
