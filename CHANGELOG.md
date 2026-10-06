@@ -10,6 +10,13 @@ Since there is no stable release yet, the changes are organized per day in
 reverse chronological order. The main purpose of this document in its current
 state is to list breaking changes.
 
+## [2026-10-06]
+
+### Fixed
+
+- AU millisecond parameters now advertise the native Milliseconds unit rather
+  than Seconds, preserving their raw ranges and default values (AUD-2054).
+
 ## [2025-02-23]
 
 ### Breaking changes

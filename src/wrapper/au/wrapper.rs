@@ -2654,18 +2654,24 @@ fn bus_channel_count<P: AuPlugin>(
     }
 }
 
+// au-sys 0.1.1 omits this SDK enum. AudioUnitProperties.h defines
+// kAudioUnitParameterUnit_Milliseconds = 24; raw millisecond values stay unscaled.
+const AU_UNIT_MILLISECONDS: au::AudioUnitParameterUnit = 24;
+
 fn classify_unit(unit: &str) -> au::AudioUnitParameterUnit {
-    let lower = unit.to_ascii_lowercase();
+    let lower = unit.trim().to_ascii_lowercase();
     if lower.contains("db") || lower.contains("decibel") {
         au::kAudioUnitParameterUnit_Decibels
     } else if lower.contains("hz") || lower.contains("hertz") || lower == "khz" {
         au::kAudioUnitParameterUnit_Hertz
     } else if lower.contains('%') || lower.contains("percent") {
         au::kAudioUnitParameterUnit_Percent
-    } else if lower.contains("ms") || lower.contains("sec") || lower.contains("second") {
-        // AU has no kAudioUnitParameterUnit_Milliseconds; map "ms" to Seconds.
-        // Hosts display the raw value, so plugins must expose values in seconds
-        // when they want AU-native time display.
+    } else if matches!(
+        lower.as_str(),
+        "ms" | "msec" | "millisec" | "millisecs" | "millisecond" | "milliseconds"
+    ) {
+        AU_UNIT_MILLISECONDS
+    } else if lower.contains("sec") || lower.contains("second") {
         au::kAudioUnitParameterUnit_Seconds
     } else {
         au::kAudioUnitParameterUnit_Generic
@@ -3422,8 +3428,40 @@ mod tests {
     }
 
     #[test]
+    fn millisecond_metadata_preserves_native_values() {
+        use crate::params::range::FloatRange;
+        use crate::params::{FloatParam, Param};
+        assert_eq!(AU_UNIT_MILLISECONDS, 24);
+        for unit in [
+            " ms", "MS", "msec", "millisec", "millisecs", "millisecond", "milliseconds",
+        ] {
+            let param = FloatParam::new(
+                "Attack",
+                5.0,
+                FloatRange::Linear { min: 0.0, max: 200.0 },
+            )
+            .with_unit(unit);
+            let entry = ParamEntry {
+                id_str: "attack".into(),
+                ptr: param.as_ptr(),
+            };
+            let info = build_parameter_info(&entry);
+            assert_eq!(info.unit, AU_UNIT_MILLISECONDS, "{unit}");
+            assert!(info.unitName.is_null());
+            assert_eq!(info.minValue, 0.0);
+            assert_eq!(info.maxValue, 200.0);
+            assert!((info.defaultValue - 5.0).abs() < 1e-5);
+            // build_parameter_info transfers owned names even when the legacy
+            // wrapper flags do not advertise CFNameRelease.
+            if !info.cfNameString.is_null() {
+                unsafe { core_foundation::base::CFRelease(info.cfNameString as _) };
+            }
+        }
+        assert_eq!(classify_unit("rms"), au::kAudioUnitParameterUnit_Generic);
+    }
+
+    #[test]
     fn classify_unit_seconds() {
-        assert_eq!(classify_unit("ms"), au::kAudioUnitParameterUnit_Seconds);
         assert_eq!(classify_unit("sec"), au::kAudioUnitParameterUnit_Seconds);
         assert_eq!(
             classify_unit("seconds"),
