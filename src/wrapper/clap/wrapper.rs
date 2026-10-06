@@ -2815,15 +2815,29 @@ impl<P: ClapPlugin> Wrapper<P> {
         // This is only relevant for floating windows
     }
 
-    unsafe extern "C" fn ext_gui_show(_plugin: *const clap_plugin) -> bool {
-        // TODO: Does this get used? Is this only for the free-standing window extension? (which we
-        //       don't implement) This wouldn't make any sense for embedded editors.
-        false
+    unsafe extern "C" fn ext_gui_show(plugin: *const clap_plugin) -> bool {
+        Self::set_editor_visible(plugin, true)
     }
 
-    unsafe extern "C" fn ext_gui_hide(_plugin: *const clap_plugin) -> bool {
-        // TODO: Same as the above
-        false
+    unsafe extern "C" fn ext_gui_hide(plugin: *const clap_plugin) -> bool {
+        Self::set_editor_visible(plugin, false)
+    }
+
+    unsafe fn set_editor_visible(plugin: *const clap_plugin, visible: bool) -> bool {
+        // CLAP show/hide apply to embedded editors too. Hosts must re-show the
+        // child after hiding it; merely showing the parent is not that call.
+        check_null_ptr!(false, plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+        let mut handle = wrapper.editor_handle.lock();
+        let Some(handle) = handle.as_mut() else {
+            return false;
+        };
+        let editor = wrapper.editor.borrow();
+        let Some(editor) = editor.as_ref() else {
+            return false;
+        };
+        let editor = editor.lock();
+        editor.set_visible(handle.as_mut(), visible)
     }
 
     unsafe extern "C" fn ext_latency_get(plugin: *const clap_plugin) -> u32 {
