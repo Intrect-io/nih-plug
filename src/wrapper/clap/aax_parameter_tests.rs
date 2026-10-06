@@ -1,6 +1,12 @@
 use super::*;
-use crate::prelude::{ClapFeature, Enum, EnumParam, FloatParam, FloatRange, Param, ProcessContext};
+use crate::prelude::{
+    AsyncExecutor, ClapFeature, Enum, EnumParam, FloatParam, FloatRange, GuiContext, Param,
+    ProcessContext,
+};
+use clap_sys::ext::gui::{clap_window, clap_window_handle, CLAP_WINDOW_API_COCOA};
+use std::any::Any;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Enum, Debug, PartialEq, Clone, Copy)]
 enum SingleVariant {
@@ -582,4 +588,219 @@ fn out_of_range_and_nonfinite_values_reject_the_entire_input_batch() {
         assert_eq!(wrapper.plugin.lock().params.value.value(), 0.25);
         assert!(received.is_empty());
     }
+}
+
+// ─── Editor visibility (AUD-2057) ─────────────────────────────────────────────
+//
+// `ext_gui_show`/`ext_gui_hide` used to return a hardcoded `false`, on the
+// assumption that they only applied to free-standing windows. macOS hosts call
+// `show()` to re-show an embedded editor after hiding it, so answering `false`
+// left the custom GUI invisible. The wrapper must delegate to the editor's
+// `set_visible` and report exactly what the editor said — an editor that cannot
+// change visibility still has to surface `false`.
+
+/// Records every visibility request and answers with a configurable verdict, so
+/// the test can tell "the wrapper asked" apart from "the wrapper liked the
+/// answer". `parking_lot::Mutex` because this is a synchronous single-thread
+/// fixture.
+struct VisibilityEditor {
+    calls: parking_lot::Mutex<Vec<bool>>,
+    verdict: AtomicBool,
+}
+
+impl VisibilityEditor {
+    fn record(&self, visible: bool) -> bool {
+        self.calls.lock().push(visible);
+        self.verdict.load(Ordering::Relaxed)
+    }
+}
+
+impl Editor for VisibilityEditor {
+    fn spawn(
+        &self,
+        _parent: ParentWindowHandle,
+        _context: Arc<dyn GuiContext>,
+    ) -> Box<dyn Any + Send> {
+        Box::new(())
+    }
+
+    fn set_visible(&self, _handle: &mut (dyn Any + Send), visible: bool) -> bool {
+        self.record(visible)
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (100, 100)
+    }
+    fn set_scale_factor(&self, _factor: f32) -> bool {
+        false
+    }
+    fn param_value_changed(&self, _id: &str, _normalized_value: f32) {}
+    fn param_modulation_changed(&self, _id: &str, _modulation_offset: f32) {}
+    fn param_values_changed(&self) {}
+}
+
+struct EditorPlugin {
+    params: Arc<TestParams>,
+    /// Shared with every `editor()` clone the wrapper takes, which is the only
+    /// way for the test to observe the wrapper's own editor instance.
+    editor: Arc<VisibilityEditor>,
+}
+
+impl Default for EditorPlugin {
+    fn default() -> Self {
+        Self {
+            params: Arc::new(TestParams {
+                value: FloatParam::new("Value", 0.25, FloatRange::Linear { min: 0.0, max: 1.0 }),
+                single: None,
+            }),
+            editor: Arc::new(VisibilityEditor {
+                calls: parking_lot::Mutex::new(Vec::new()),
+                verdict: AtomicBool::new(true),
+            }),
+        }
+    }
+}
+
+impl Plugin for EditorPlugin {
+    const NAME: &'static str = "editor visibility fixture";
+    const VENDOR: &'static str = "Intrect";
+    const URL: &'static str = "https://intrect.io";
+    const EMAIL: &'static str = "test@intrect.io";
+    const VERSION: &'static str = "0.0.0";
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(1),
+        main_output_channels: NonZeroU32::new(1),
+        ..AudioIOLayout::const_default()
+    }];
+    type SysExMessage = ();
+    type BackgroundTask = ();
+
+    fn params(&self) -> Arc<dyn Params> {
+        self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        Some(Box::new(VisibilityEditorHandle {
+            shared: self.editor.clone(),
+        }))
+    }
+
+    fn process(
+        &mut self,
+        _: &mut crate::buffer::Buffer,
+        _: &mut AuxiliaryBuffers,
+        _: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        ProcessStatus::Normal
+    }
+}
+
+/// The wrapper owns the editor it gets from `Plugin::editor`, so the fixture
+/// hands out a thin proxy over the shared recorder.
+struct VisibilityEditorHandle {
+    shared: Arc<VisibilityEditor>,
+}
+
+impl Editor for VisibilityEditorHandle {
+    fn spawn(
+        &self,
+        _parent: ParentWindowHandle,
+        _context: Arc<dyn GuiContext>,
+    ) -> Box<dyn Any + Send> {
+        Box::new(())
+    }
+
+    fn set_visible(&self, _handle: &mut (dyn Any + Send), visible: bool) -> bool {
+        self.shared.record(visible)
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (100, 100)
+    }
+    fn set_scale_factor(&self, _factor: f32) -> bool {
+        false
+    }
+    fn param_value_changed(&self, _id: &str, _normalized_value: f32) {}
+    fn param_modulation_changed(&self, _id: &str, _modulation_offset: f32) {}
+    fn param_values_changed(&self) {}
+}
+
+impl ClapPlugin for EditorPlugin {
+    const CLAP_ID: &'static str = "io.intrect.editor-visibility-test";
+    const CLAP_DESCRIPTION: Option<&'static str> = None;
+    const CLAP_MANUAL_URL: Option<&'static str> = None;
+    const CLAP_SUPPORT_URL: Option<&'static str> = None;
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect];
+}
+
+/// Attach an editor the way a host does, then return the wrapper.
+unsafe fn wrapper_with_attached_editor() -> (Arc<Wrapper<EditorPlugin>>, clap_window) {
+    let host = host();
+    let wrapper = unsafe { Wrapper::<EditorPlugin>::new(&host) };
+    let plugin = wrapper.clap_plugin.borrow();
+    let window = clap_window {
+        api: CLAP_WINDOW_API_COCOA.as_ptr(),
+        specific: clap_window_handle {
+            cocoa: ptr::null_mut(),
+        },
+    };
+    assert!(unsafe { Wrapper::<EditorPlugin>::ext_gui_set_parent(&*plugin, &window) });
+    drop(plugin);
+    (wrapper, window)
+}
+
+/// The defect was the hardcoded `false`: the editor was never consulted. Assert
+/// both directions are forwarded in order and that the wrapper relays the
+/// editor's verdict verbatim.
+#[test]
+fn gui_show_and_hide_delegate_to_the_editor_and_relay_its_verdict() {
+    let (wrapper, _) = unsafe { wrapper_with_attached_editor() };
+    let plugin = wrapper.clap_plugin.borrow();
+
+    assert!(unsafe { Wrapper::<EditorPlugin>::ext_gui_show(&*plugin) });
+    assert!(unsafe { Wrapper::<EditorPlugin>::ext_gui_hide(&*plugin) });
+    assert!(unsafe { Wrapper::<EditorPlugin>::ext_gui_show(&*plugin) });
+
+    assert_eq!(
+        *wrapper.plugin.lock().editor.calls.lock(),
+        vec![true, false, true],
+        "show/hide must reach the editor in call order"
+    );
+}
+
+/// An editor that refuses to change visibility must produce `false`, not a
+/// wrapper-side success. This is the half of the contract that the old
+/// hardcoded `false` accidentally satisfied, so it pins that the fix did not
+/// replace a constant with a blind `true`.
+#[test]
+fn gui_show_reports_false_when_the_editor_cannot_change_visibility() {
+    let (wrapper, _) = unsafe { wrapper_with_attached_editor() };
+    // Flip the fixture before the calls under test.
+    wrapper
+        .plugin
+        .lock()
+        .editor
+        .verdict
+        .store(false, Ordering::Relaxed);
+    let plugin = wrapper.clap_plugin.borrow();
+
+    assert!(!unsafe { Wrapper::<EditorPlugin>::ext_gui_show(&*plugin) });
+    assert!(!unsafe { Wrapper::<EditorPlugin>::ext_gui_hide(&*plugin) });
+    assert_eq!(
+        *wrapper.plugin.lock().editor.calls.lock(),
+        vec![true, false]
+    );
+}
+
+/// Without an attached editor the extension must answer `false` rather than
+/// panic on the missing handle.
+#[test]
+fn gui_show_without_an_attached_editor_reports_failure() {
+    let host = host();
+    let wrapper = unsafe { Wrapper::<EditorPlugin>::new(&host) };
+    let plugin = wrapper.clap_plugin.borrow();
+
+    assert!(!unsafe { Wrapper::<EditorPlugin>::ext_gui_show(&*plugin) });
+    assert!(!unsafe { Wrapper::<EditorPlugin>::ext_gui_hide(&*plugin) });
+    assert!(wrapper.plugin.lock().editor.calls.lock().is_empty());
 }
