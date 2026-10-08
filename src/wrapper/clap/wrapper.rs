@@ -152,6 +152,9 @@ pub struct Wrapper<P: ClapPlugin> {
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     buffer_manager: AtomicRefCell<BufferManager>,
+    /// Lifecycle and audio must own the same gate before borrowing mutable state.
+    processing_gate: crate::wrapper::util::processing_gate::ProcessingGate,
+    reset_pending: AtomicBool,
     /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
     /// parameters mid-processing and running into garbled data if the host also tries to load state
     /// at the same time the restoring happens at the end of each processing call. If this zero
@@ -561,6 +564,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::initialize()` so that during the
             // process call buffers can be initialized without any allocations
+            processing_gate: crate::wrapper::util::processing_gate::ProcessingGate::new(),
+            reset_pending: AtomicBool::new(false),
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(
                 0,
                 AudioIOLayout::default(),
@@ -1758,6 +1763,14 @@ impl<P: ClapPlugin> Wrapper<P> {
     ///
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
+        let Some(_processing_guard) = self.processing_gate.lock() else {
+            return false;
+        };
+        self.set_state_inner_exclusive(state)
+    }
+
+    // Caller already owns processing_gate, including state restoration at the end of process().
+    fn set_state_inner_exclusive(&self, state: &mut PluginState) -> bool {
         let audio_io_layout = self.current_audio_io_layout.load();
         let buffer_config = self.current_buffer_config.load();
 
@@ -1853,6 +1866,9 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> bool {
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        let Some(_processing_guard) = wrapper.processing_gate.lock() else {
+            return false;
+        };
 
         let audio_io_layout = wrapper.current_audio_io_layout.load();
         let buffer_config = BufferConfig {
@@ -1892,6 +1908,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
+        let Some(_processing_guard) = wrapper.processing_gate.lock() else {
+            return;
+        };
         wrapper.plugin.lock().deactivate();
     }
 
@@ -1900,6 +1919,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         // updating parameters from the GUI while the processing loop isn't running
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        let Some(_processing_guard) = wrapper.processing_gate.try_lock() else {
+            return false;
+        };
 
         // Always reset the processing status when the plugin gets activated or deactivated
         wrapper.last_process_status.store(ProcessStatus::Normal);
@@ -1907,6 +1929,7 @@ impl<P: ClapPlugin> Wrapper<P> {
 
         // To be consistent with the VST3 wrapper, we'll also reset the buffers here in addition to
         // the dedicated `reset()` function.
+        wrapper.reset_pending.store(false, Ordering::Release);
         process_wrapper(|| wrapper.plugin.lock().reset());
 
         true
@@ -1923,7 +1946,35 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
+        let Some(_processing_guard) = wrapper.processing_gate.try_lock() else {
+            wrapper.reset_pending.store(true, Ordering::Release);
+            return;
+        };
+        wrapper.reset_pending.store(false, Ordering::Release);
         process_wrapper(|| wrapper.plugin.lock().reset());
+    }
+
+    /// Clear every host output without touching wrapper-owned buffers on contention.
+    unsafe fn clear_process_outputs(process: &clap_process) {
+        if process.audio_outputs.is_null() {
+            return;
+        }
+        for port in 0..process.audio_outputs_count as usize {
+            let output = &*process.audio_outputs.add(port);
+            for channel in 0..output.channel_count as usize {
+                if !output.data32.is_null() {
+                    let samples = *output.data32.add(channel);
+                    if !samples.is_null() {
+                        samples.write_bytes(0, process.frames_count as usize);
+                    }
+                } else if !output.data64.is_null() {
+                    let samples = *output.data64.add(channel);
+                    if !samples.is_null() {
+                        samples.write_bytes(0, process.frames_count as usize);
+                    }
+                }
+            }
+        }
     }
 
     unsafe extern "C" fn process(
@@ -1932,6 +1983,13 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> clap_process_status {
         check_null_ptr!(CLAP_PROCESS_ERROR, plugin, (*plugin).plugin_data, process);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        let Some(_processing_guard) = wrapper.processing_gate.try_lock() else {
+            Self::clear_process_outputs(&*process);
+            return CLAP_PROCESS_ERROR;
+        };
+        if wrapper.reset_pending.swap(false, Ordering::AcqRel) {
+            process_wrapper(|| wrapper.plugin.lock().reset());
+        }
 
         // Panic on allocations if the `assert_process_allocs` feature has been enabled, and make
         // sure that FTZ is set up correctly
@@ -2276,7 +2334,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             //        doesn't do that
             let updated_state = permit_alloc(|| wrapper.updated_state_receiver.try_recv());
             if let Ok(mut state) = updated_state {
-                wrapper.set_state_inner(&mut state);
+                wrapper.set_state_inner_exclusive(&mut state);
 
                 // We'll pass the state object back to the GUI thread so deallocation can happen
                 // there without potentially blocking the audio thread
@@ -3246,6 +3304,15 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        // Inactive flush runs on control; active flush is an audio-thread call.
+        let guard = if wrapper.is_processing.load(Ordering::Acquire) {
+            wrapper.processing_gate.try_lock()
+        } else {
+            wrapper.processing_gate.lock()
+        };
+        let Some(_processing_guard) = guard else {
+            return;
+        };
 
         if !in_.is_null() {
             wrapper.handle_in_events(&*in_, 0, 0);

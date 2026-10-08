@@ -590,6 +590,49 @@ fn out_of_range_and_nonfinite_values_reject_the_entire_input_batch() {
     }
 }
 
+#[test]
+fn lifecycle_contention_rejects_activation_and_silences_audio_without_borrowing() {
+    let host = host();
+    let wrapper = unsafe { Wrapper::<TestPlugin<true>>::new(&host) };
+    let plugin = wrapper.clap_plugin.borrow();
+    let guard = wrapper.processing_gate.lock();
+    // These live borrows used to abort activate() at the C ABI boundary.
+    let buffers = wrapper.buffer_manager.borrow_mut();
+    let events = wrapper.input_events.borrow_mut();
+    assert!(!unsafe { Wrapper::<TestPlugin<true>>::activate(&*plugin, 48000.0, 1, 16) });
+    let mut samples = [1.0f32; 16];
+    let mut pointers = [samples.as_mut_ptr()];
+    let mut output = clap_sys::audio_buffer::clap_audio_buffer {
+        data32: pointers.as_mut_ptr(),
+        data64: ptr::null_mut(),
+        channel_count: 1,
+        latency: 0,
+        constant_mask: 0,
+    };
+    let process = clap_process {
+        steady_time: 0,
+        frames_count: 16,
+        transport: ptr::null(),
+        audio_inputs: ptr::null(),
+        audio_outputs: &mut output,
+        audio_inputs_count: 0,
+        audio_outputs_count: 1,
+        in_events: ptr::null(),
+        out_events: ptr::null(),
+    };
+    assert_eq!(
+        unsafe { Wrapper::<TestPlugin<true>>::process(&*plugin, &process) },
+        CLAP_PROCESS_ERROR
+    );
+    assert_eq!(samples, [0.0; 16]);
+    unsafe { Wrapper::<TestPlugin<true>>::reset(&*plugin) };
+    assert!(wrapper.reset_pending.load(Ordering::Acquire));
+    drop(events);
+    drop(buffers);
+    drop(guard);
+    assert!(unsafe { Wrapper::<TestPlugin<true>>::activate(&*plugin, 48000.0, 1, 16) });
+}
+
 // ─── Editor visibility (AUD-2057) ─────────────────────────────────────────────
 //
 // `ext_gui_show`/`ext_gui_hide` used to return a hardcoded `false`, on the

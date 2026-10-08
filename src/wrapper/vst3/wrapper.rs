@@ -10,10 +10,10 @@ use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tr
 use vst3_sys::base::{IBStream, IPluginBase};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
-    kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, Event, EventTypes, IAudioProcessor,
-    IComponent, IEditController, IEventList, IMidiMapping, INoteExpressionController,
-    IParamValueQueue, IParameterChanges, IProcessContextRequirements, IUnitInfo,
-    AudioBusBuffers, LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription,
+    kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, AudioBusBuffers, Event, EventTypes,
+    IAudioProcessor, IComponent, IEditController, IEventList, IMidiMapping,
+    INoteExpressionController, IParamValueQueue, IParameterChanges, IProcessContextRequirements,
+    IUnitInfo, LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription,
     NoteOffEvent, NoteOnEvent, ParameterFlags, PolyPressureEvent, ProgramListInfo, TChar, UnitInfo,
 };
 use vst3_sys::VST3;
@@ -54,6 +54,41 @@ pub struct Wrapper<P: Vst3Plugin> {
 impl<P: Vst3Plugin> Wrapper<P> {
     pub fn new() -> Box<Self> {
         Self::allocate(WrapperInner::new())
+    }
+    unsafe fn clear_process_outputs(data: &vst3_sys::vst::ProcessData) {
+        if data.outputs.is_null() || data.num_samples <= 0 {
+            return;
+        }
+        for port in 0..data.num_outputs.max(0) as usize {
+            let output = &mut *data.outputs.add(port);
+            for channel in 0..output.num_channels.max(0) as usize {
+                if data.symbolic_sample_size == vst3_sys::vst::SymbolicSampleSizes::kSample32 as i32
+                {
+                    let pointers = output.buffers as *mut *mut f32;
+                    if !pointers.is_null() {
+                        let samples = *pointers.add(channel);
+                        if !samples.is_null() {
+                            samples.write_bytes(0, data.num_samples as usize);
+                        }
+                    }
+                } else if data.symbolic_sample_size
+                    == vst3_sys::vst::SymbolicSampleSizes::kSample64 as i32
+                {
+                    let pointers = output.buffers as *mut *mut f64;
+                    if !pointers.is_null() {
+                        let samples = *pointers.add(channel);
+                        if !samples.is_null() {
+                            samples.write_bytes(0, data.num_samples as usize);
+                        }
+                    }
+                }
+            }
+            output.silence_flags = if output.num_channels >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << output.num_channels.max(0)) - 1
+            };
+        }
     }
 }
 
@@ -368,6 +403,9 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
     }
 
     unsafe fn set_active(&self, state: TBool) -> tresult {
+        let Some(_processing_guard) = self.inner.processing_gate.lock() else {
+            return kResultFalse;
+        };
         // We could call initialize in `IAudioProcessor::setup_processing()`, but REAPER will set
         // the bus arrangements between that function and this function. So to be able to handle
         // custom channel layout overrides we need to initialize here.
@@ -905,6 +943,10 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
         // This function is also used to reset buffers on the plugin, so we should do the same
         // thing. We don't call `reset()` in `setup_processing()` for that same reason.
         if state {
+            let Some(_processing_guard) = self.inner.processing_gate.try_lock() else {
+                self.inner.reset_pending.store(true, Ordering::Release);
+                return kResultOk;
+            };
             // HACK: See the comment in `IComponent::setActive()`. This is needed to work around
             //       Ardour bugs.
             let mut plugin = match self.inner.plugin.try_lock() {
@@ -921,6 +963,7 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                 }
             };
 
+            self.inner.reset_pending.store(false, Ordering::Release);
             process_wrapper(|| plugin.reset());
         }
 
@@ -932,6 +975,13 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
     #[allow(clippy::mut_range_bound)]
     unsafe fn process(&self, data: *mut vst3_sys::vst::ProcessData) -> tresult {
         check_null_ptr!(data);
+        let Some(_processing_guard) = self.inner.processing_gate.try_lock() else {
+            Self::clear_process_outputs(&*data);
+            return kResultFalse;
+        };
+        if self.inner.reset_pending.swap(false, Ordering::AcqRel) {
+            process_wrapper(|| self.inner.plugin.lock().reset());
+        }
 
         // Panic on allocations if the `assert_process_allocs` feature has been enabled, and make
         // sure that FTZ is set up correctly
@@ -1630,7 +1680,7 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
             //        doesn't do that
             let updated_state = permit_alloc(|| self.inner.updated_state_receiver.try_recv());
             if let Ok(mut state) = updated_state {
-                self.inner.set_state_inner(&mut state);
+                self.inner.set_state_inner_exclusive(&mut state);
 
                 // We'll pass the state object back to the GUI thread so deallocation can happen
                 // there without potentially blocking the audio thread
@@ -2001,5 +2051,89 @@ mod aux_bus_tests {
             )
         };
         assert_eq!(channel_pointers[0].map(|p| p.num_channels), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::prelude::*;
+    #[derive(Default)]
+    struct EmptyParams {}
+    unsafe impl Params for EmptyParams {
+        fn param_map(&self) -> Vec<(String, crate::params::internals::ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+    #[derive(Default)]
+    struct TestPlugin {
+        params: Arc<EmptyParams>,
+    }
+    impl Plugin for TestPlugin {
+        const NAME: &'static str = "Lifecycle regression";
+        const VENDOR: &'static str = "Intrect";
+        const URL: &'static str = "https://intrect.io";
+        const EMAIL: &'static str = "test@intrect.io";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(1),
+            main_output_channels: NonZeroU32::new(1),
+            ..AudioIOLayout::const_default()
+        }];
+        type SysExMessage = ();
+        type BackgroundTask = ();
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+        fn process(
+            &mut self,
+            _: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            _: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+    impl Vst3Plugin for TestPlugin {
+        const VST3_CLASS_ID: [u8; 16] = *b"LifecycleTest001";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+    }
+    #[test]
+    fn lifecycle_contention_rejects_activation_and_silences_audio() {
+        let wrapper = Wrapper::<TestPlugin>::new();
+        wrapper
+            .inner
+            .current_buffer_config
+            .store(Some(BufferConfig {
+                sample_rate: 48000.0,
+                min_buffer_size: Some(1),
+                max_buffer_size: 16,
+                process_mode: ProcessMode::Realtime,
+            }));
+        let guard = wrapper.inner.processing_gate.lock();
+        let buffers = wrapper.inner.buffer_manager.borrow_mut();
+        let events = wrapper.inner.process_events.borrow_mut();
+        assert_eq!(unsafe { wrapper.set_active(1) }, kResultFalse);
+        let mut samples = [1.0f32; 16];
+        let mut pointers = [samples.as_mut_ptr() as *mut c_void];
+        let mut output = AudioBusBuffers {
+            num_channels: 1,
+            silence_flags: 0,
+            buffers: pointers.as_mut_ptr(),
+        };
+        let mut process: vst3_sys::vst::ProcessData = unsafe { mem::zeroed() };
+        process.num_samples = 16;
+        process.num_outputs = 1;
+        process.outputs = &mut output;
+        process.symbolic_sample_size = vst3_sys::vst::SymbolicSampleSizes::kSample32 as i32;
+        assert_eq!(unsafe { wrapper.process(&mut process) }, kResultFalse);
+        assert_eq!(samples, [0.0; 16]);
+        assert_eq!(output.silence_flags, 1);
+        assert_eq!(unsafe { wrapper.set_processing(1) }, kResultOk);
+        assert!(wrapper.inner.reset_pending.load(Ordering::Acquire));
+        drop(events);
+        drop(buffers);
+        drop(guard);
+        assert_eq!(unsafe { wrapper.set_active(1) }, kResultOk);
     }
 }
