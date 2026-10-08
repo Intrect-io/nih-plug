@@ -8,6 +8,7 @@ use crate::util::permit_alloc;
 pub(crate) mod buffer_management;
 #[cfg(debug_assertions)]
 pub(crate) mod context_checks;
+pub(crate) mod processing_gate;
 
 /// The bit that controls flush-to-zero behavior for denormals in 32 and 64-bit floating point
 /// numbers on x86 family architectures. Rust 1.75 deprecated the built in functions for controlling
