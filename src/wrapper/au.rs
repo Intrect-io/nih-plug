@@ -8,6 +8,8 @@
 mod context;
 mod factory;
 mod midi;
+mod parameter_events;
+mod render_notify;
 mod wrapper;
 
 pub use factory::fourcc;
