@@ -2851,11 +2851,10 @@ pub use Wrapper as AuWrapper;
 //   1. A CFURLRef pointing at the bundle that contains the view factory class.
 //   2. A CFStringRef naming the `NSObject<AUCocoaUIBase>` subclass.
 //
-// IMPORTANT: objc2's `define_class!` does NOT emit __OBJC_CLASS_PROTOCOLS
-// metadata, so `conformsToProtocol:(AUCocoaUIBase)` returns NO in hosts.
-// We use a real Objective-C .m shim (src/wrapper/au/cocoaui.m, compiled via
-// build.rs + cc crate) which declares `@interface ... : NSObject <AUCocoaUIBase>`.
-// This generates proper protocol conformance metadata at compile time.
+// The Objective-C shim registers image-local factory and container classes,
+// including AUCocoaUIBase conformance and the protocol's method encodings.
+// A build-time class name is insufficient: sibling format bundles may contain
+// copies of the identical dylib, while each has its own Rust spawn registry.
 //
 // The shim calls back into Rust via C-ABI functions that look up a reusable
 // editor-spawn template by the host's AudioUnit handle.

@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef NDEBUG
+#error "CocoaUI regression assertions must remain enabled"
+#endif
+
 typedef struct {
     void *image;
     const char *(*className)(void);
@@ -136,10 +140,11 @@ int main(int argc, const char *argv[]) {
             }
             assert(releasedView == nil);
         }
-        assert(a.spawns() == a.closes() && b.spawns() == b.closes());
+        BOOL balanced = a.spawns() == a.closes() && b.spawns() == b.closes();
+        assert(balanced);
         NSDictionary *result = @{
             @"scope": @"production ObjC bridge with fixture Rust callbacks; not plugin/DAW acceptance",
-            @"verdict": @"pass", @"factory_a": @(aName), @"factory_b": @(bName),
+            @"verdict": balanced ? @"pass" : @"fail", @"factory_a": @(aName), @"factory_b": @(bName),
             @"implementation_a": aImage, @"implementation_b": bImage,
             @"spawns_a": @(a.spawns()), @"closes_a": @(a.closes()),
             @"spawns_b": @(b.spawns()), @"closes_b": @(b.closes()),
