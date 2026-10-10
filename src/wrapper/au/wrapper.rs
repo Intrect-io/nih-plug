@@ -69,6 +69,8 @@ use super::context::{
 };
 use super::factory::fourcc;
 use super::midi;
+use super::parameter_events;
+use super::render_notify::{self, RenderNotifications};
 
 /// Payload of `kAudioUnitProperty_MakeConnection`.
 ///
@@ -186,7 +188,8 @@ pub struct Wrapper<P: AuPlugin> {
     initialized: AtomicBool,
 
     /// Host-controlled bypass (`kAudioUnitProperty_BypassEffect`). When set,
-    /// `render()` skips `Plugin::process()` and just passes input → output.
+    /// a declared BYPASS parameter delegates processing to the plugin, which
+    /// owns its latency-aligned dry path. Without one, render skips processing.
     /// If the plugin declares a `ParamFlags::BYPASS` parameter we keep it in
     /// sync so plugins that observe bypass state through their own param see
     /// the toggle too.
@@ -199,6 +202,9 @@ pub struct Wrapper<P: AuPlugin> {
     /// main thread; audio-thread changes (latency, etc.) only set bits in
     /// `pending_notifications` and the next main-thread entry drains them.
     listeners: Mutex<Vec<Listener>>,
+
+    /// Host render observers, snapshotted once for each pre/post pair.
+    render_notifications: RenderNotifications,
 
     /// Bitset of property changes pending main-thread notification.
     /// See `NOTIFY_*` constants.
@@ -570,6 +576,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 (0..n_aux).map(|_| Mutex::new(None)).collect()
             },
             listeners: Mutex::new(Vec::new()),
+            render_notifications: RenderNotifications::new(),
             pending_notifications: AtomicU32::new(0),
             render_state: UnsafeCell::new(RenderState::new()),
             editor,
@@ -800,6 +807,15 @@ impl<P: AuPlugin> Wrapper<P> {
             },
             au::kAudioUnitRenderSelect => unsafe {
                 std::mem::transmute::<au::AudioUnitRenderProc, _>(Self::render)
+            },
+            parameter_events::SCHEDULE_PARAMETERS_SELECT => unsafe {
+                std::mem::transmute::<parameter_events::ScheduleProc, _>(Self::schedule_parameters)
+            },
+            au::kAudioUnitAddRenderNotifySelect => unsafe {
+                std::mem::transmute::<render_notify::NotifyProc, _>(Self::add_render_notify)
+            },
+            au::kAudioUnitRemoveRenderNotifySelect => unsafe {
+                std::mem::transmute::<render_notify::NotifyProc, _>(Self::remove_render_notify)
             },
             au::kAudioUnitAddPropertyListenerSelect => unsafe {
                 std::mem::transmute::<au::AudioUnitAddPropertyListenerProc, _>(
@@ -1966,6 +1982,152 @@ impl<P: AuPlugin> Wrapper<P> {
     /// path. All scratch storage is provisioned in `Initialize`.
     unsafe extern "C" fn render(
         self_ptr: *mut c_void,
+        io_action_flags: *mut au::AudioUnitRenderActionFlags,
+        in_time_stamp: *const au::AudioTimeStamp,
+        in_output_bus_number: au::UInt32,
+        in_number_frames: au::UInt32,
+        io_data: *mut au::AudioBufferList,
+    ) -> au::OSStatus {
+        let this = unsafe { Self::from_ptr(self_ptr) };
+        // AudioUnitRender permits null flags, but the SDK declares timestamp
+        // and ioData nonnull. Reject invalid pointers before host observers run.
+        if io_data.is_null() || in_time_stamp.is_null() {
+            this.set_last_render_error(au::kAudioUnitErr_InvalidParameter);
+            return au::kAudioUnitErr_InvalidParameter;
+        }
+        let notifications = this.render_notifications.snapshot();
+        // AUBase::DoRender uses phase-local flags, not the host flag pointer:
+        // https://github.com/apple/AudioUnitSDK/blob/main/src/AudioUnitSDK/AUBase.cpp
+        // Callback results do not replace render status. Each phase starts from
+        // the host flags, so PreRender never leaks into PostRender or the host.
+        let input_flags = if io_action_flags.is_null() {
+            0
+        } else {
+            unsafe { *io_action_flags }
+        };
+        let mut pre_flags = input_flags | au::kAudioUnitRenderAction_PreRender;
+        for callback in notifications.callbacks() {
+            unsafe {
+                (callback.proc)(
+                    callback.user_data,
+                    &mut pre_flags,
+                    in_time_stamp,
+                    in_output_bus_number,
+                    in_number_frames,
+                    io_data,
+                )
+            };
+        }
+        let status = unsafe {
+            Self::render_audio(
+                self_ptr,
+                io_action_flags,
+                in_time_stamp,
+                in_output_bus_number,
+                in_number_frames,
+                io_data,
+            )
+        };
+        this.set_last_render_error(status);
+        let output_flags = if io_action_flags.is_null() {
+            0
+        } else {
+            unsafe { *io_action_flags }
+        };
+        let mut post_flags = output_flags | au::kAudioUnitRenderAction_PostRender;
+        if status != au::noErr {
+            post_flags |= render_notify::POST_RENDER_ERROR;
+        }
+        for callback in notifications.callbacks() {
+            unsafe {
+                (callback.proc)(
+                    callback.user_data,
+                    &mut post_flags,
+                    in_time_stamp,
+                    in_output_bus_number,
+                    in_number_frames,
+                    io_data,
+                )
+            };
+        }
+        status
+    }
+
+    /// Match AUBase's non-scheduling fallback: immediate events use the same
+    /// setter as AudioUnitSetParameter, including its documented block-level
+    /// timing granularity. We do not advertise CanRamp or pretend to execute
+    /// ramps; those requests fail explicitly instead of silently doing nothing.
+    unsafe extern "C" fn schedule_parameters(
+        self_ptr: *mut c_void,
+        events: *const parameter_events::Event,
+        count: u32,
+    ) -> au::OSStatus {
+        if count == 0 {
+            return au::noErr;
+        }
+        if events.is_null() {
+            return au::kAudioUnitErr_InvalidParameter;
+        }
+        let this = unsafe { Self::from_ptr(self_ptr) };
+        let events = unsafe { std::slice::from_raw_parts(events, count as usize) };
+        // Validate the entire batch before applying any of it.
+        for event in events {
+            if event.event_type != parameter_events::IMMEDIATE
+                || event.scope != au::kAudioUnitScope_Global
+                || event.element != 0
+                || event.parameter as usize >= this.params_by_id.len()
+                || !unsafe { event.values.immediate.value }.is_finite()
+            {
+                return au::kAudioUnitErr_InvalidParameter;
+            }
+        }
+        for event in events {
+            let immediate = unsafe { event.values.immediate };
+            let status = unsafe {
+                Self::set_parameter(
+                    self_ptr,
+                    event.parameter,
+                    event.scope,
+                    event.element,
+                    immediate.value,
+                    immediate.buffer_offset,
+                )
+            };
+            if status != au::noErr {
+                return status;
+            }
+        }
+        au::noErr
+    }
+
+    unsafe extern "C" fn add_render_notify(
+        self_ptr: *mut c_void,
+        proc: Option<au::AURenderCallback>,
+        user_data: *mut c_void,
+    ) -> au::OSStatus {
+        let Some(proc) = proc else {
+            return -50;
+        }; // kAudio_ParamError
+        unsafe { Self::from_ptr(self_ptr) }
+            .render_notifications
+            .update(render_notify::Callback { proc, user_data }, true)
+    }
+
+    unsafe extern "C" fn remove_render_notify(
+        self_ptr: *mut c_void,
+        proc: Option<au::AURenderCallback>,
+        user_data: *mut c_void,
+    ) -> au::OSStatus {
+        let Some(proc) = proc else {
+            return au::noErr;
+        };
+        unsafe { Self::from_ptr(self_ptr) }
+            .render_notifications
+            .update(render_notify::Callback { proc, user_data }, false)
+    }
+
+    unsafe fn render_audio(
+        self_ptr: *mut c_void,
         _io_action_flags: *mut au::AudioUnitRenderActionFlags,
         in_time_stamp: *const au::AudioTimeStamp,
         _in_output_bus_number: au::UInt32,
@@ -2408,12 +2570,14 @@ impl<P: AuPlugin> Wrapper<P> {
             return upstream_error;
         }
 
-        // Bypass: skip Plugin::process entirely. Input has already been
-        // copied into io_data above (callback path) or sits there in-place
-        // (host path), so the pass-through is implicit — we just don't run
-        // the plugin's DSP.
+        // A declared BYPASS parameter owns the dry path, including delay and
+        // state continuity. Skipping process here bypasses that path too and
+        // returns zero-delay input while the AU still reports DSP latency.
+        // Plugins without a bypass parameter retain implicit pass-through.
 
-        let process_status = if !this.bypass.load(Ordering::Acquire) {
+        let process_status = if this.bypass_param_idx.is_some()
+            || !this.bypass.load(Ordering::Acquire)
+        {
             // SAFETY: aux_buffers is only accessed here (audio thread, no re-entry).
             // We cast to `&'static mut [Buffer<'static>]` to satisfy
             // AuxiliaryBuffers<'_> — the same lifetime-laundering pattern the
@@ -2580,9 +2744,9 @@ fn build_parameter_info(entry: &ParamEntry) -> au::AudioUnitParameterInfo {
     info.cfNameString = string_to_cfstring(name_str);
     info.clumpID = 0;
 
-    info.flags = au::kAudioUnitParameterFlag_IsReadable
-        | au::kAudioUnitParameterFlag_IsWritable
-        | au::kAudioUnitParameterFlag_CanRamp;
+    // No intra-buffer ramp implementation exists. Advertising CanRamp made
+    // hosts schedule ramps that the wrapper could not execute (AUD-2105).
+    info.flags = au::kAudioUnitParameterFlag_IsReadable | au::kAudioUnitParameterFlag_IsWritable;
 
     info
 }
@@ -2654,18 +2818,24 @@ fn bus_channel_count<P: AuPlugin>(
     }
 }
 
+// au-sys 0.1.1 omits this SDK enum. AudioUnitProperties.h defines
+// kAudioUnitParameterUnit_Milliseconds = 24; raw millisecond values stay unscaled.
+const AU_UNIT_MILLISECONDS: au::AudioUnitParameterUnit = 24;
+
 fn classify_unit(unit: &str) -> au::AudioUnitParameterUnit {
-    let lower = unit.to_ascii_lowercase();
+    let lower = unit.trim().to_ascii_lowercase();
     if lower.contains("db") || lower.contains("decibel") {
         au::kAudioUnitParameterUnit_Decibels
     } else if lower.contains("hz") || lower.contains("hertz") || lower == "khz" {
         au::kAudioUnitParameterUnit_Hertz
     } else if lower.contains('%') || lower.contains("percent") {
         au::kAudioUnitParameterUnit_Percent
-    } else if lower.contains("ms") || lower.contains("sec") || lower.contains("second") {
-        // AU has no kAudioUnitParameterUnit_Milliseconds; map "ms" to Seconds.
-        // Hosts display the raw value, so plugins must expose values in seconds
-        // when they want AU-native time display.
+    } else if matches!(
+        lower.as_str(),
+        "ms" | "msec" | "millisec" | "millisecs" | "millisecond" | "milliseconds"
+    ) {
+        AU_UNIT_MILLISECONDS
+    } else if lower.contains("sec") || lower.contains("second") {
         au::kAudioUnitParameterUnit_Seconds
     } else {
         au::kAudioUnitParameterUnit_Generic
@@ -3106,6 +3276,395 @@ mod tests {
     use super::*;
     use crate::prelude::*;
 
+    struct BypassParams {
+        bypass: BoolParam,
+    }
+
+    unsafe impl Params for BypassParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![(
+                "bypass".into(),
+                ParamPtr::BoolParam(&self.bypass as *const _ as *mut _),
+                String::new(),
+            )]
+        }
+    }
+
+    struct DelayedBypass<const OWNED: bool> {
+        params: Arc<BypassParams>,
+        history: [[f32; 16]; 2],
+        position: usize,
+        calls: usize,
+    }
+
+    impl<const OWNED: bool> Default for DelayedBypass<OWNED> {
+        fn default() -> Self {
+            let bypass = BoolParam::new("Bypass", false);
+            Self {
+                params: Arc::new(BypassParams {
+                    bypass: if OWNED { bypass.make_bypass() } else { bypass },
+                }),
+                history: [[0.0; 16]; 2],
+                position: 0,
+                calls: 0,
+            }
+        }
+    }
+
+    impl<const OWNED: bool> Plugin for DelayedBypass<OWNED> {
+        const NAME: &'static str = "Delayed AU bypass regression";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/Intrect-io/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+        type SysExMessage = ();
+        type BackgroundTask = ();
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+        fn initialize(
+            &mut self,
+            _: &AudioIOLayout,
+            _: &BufferConfig,
+            context: &mut impl InitContext<Self>,
+        ) -> bool {
+            context.set_latency_samples(16);
+            true
+        }
+        fn reset(&mut self) {
+            self.history = [[0.0; 16]; 2];
+            self.position = 0;
+        }
+        fn process(
+            &mut self,
+            buffer: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            _: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            self.calls += 1;
+            let gain = if self.params.bypass.value() { 1.0 } else { 0.5 };
+            for frame in 0..buffer.samples() {
+                for (channel, samples) in buffer.as_slice().iter_mut().enumerate() {
+                    let delayed = self.history[channel][self.position];
+                    self.history[channel][self.position] = samples[frame];
+                    samples[frame] = delayed * gain;
+                }
+                self.position = (self.position + 1) % 16;
+            }
+            ProcessStatus::Normal
+        }
+    }
+
+    impl<const OWNED: bool> AuPlugin for DelayedBypass<OWNED> {
+        const AU_TYPE: [u8; 4] = *b"aufx";
+        const AU_SUBTYPE: [u8; 4] = *b"TByp";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    #[test]
+    fn scheduled_immediate_parameters_apply_and_unsupported_batches_fail_atomically() {
+        use parameter_events::{Event, Immediate, Values, IMMEDIATE, SCHEDULE_PARAMETERS_SELECT};
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        assert_eq!(mem::size_of::<Event>(), 32);
+        assert_eq!(mem::align_of::<Event>(), 4);
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let schedule: parameter_events::ScheduleProc = unsafe {
+            mem::transmute(
+                TestWrapper::lookup(SCHEDULE_PARAMETERS_SELECT).expect("schedule selector"),
+            )
+        };
+        let event = Event {
+            scope: au::kAudioUnitScope_Global,
+            element: 0,
+            parameter: 0,
+            event_type: IMMEDIATE,
+            values: Values {
+                immediate: Immediate {
+                    buffer_offset: 0,
+                    value: 1.0,
+                },
+            },
+        };
+        assert_eq!(unsafe { schedule(wrapper, ptr::null(), 0) }, au::noErr);
+        assert_eq!(
+            unsafe { schedule(wrapper, ptr::null(), 1) },
+            au::kAudioUnitErr_InvalidParameter
+        );
+        assert_eq!(unsafe { schedule(wrapper, &event, 1) }, au::noErr);
+        let this = unsafe { TestWrapper::from_ptr(wrapper) };
+        assert!(unsafe { &*this.plugin.get() }.params.bypass.value());
+        let info = build_parameter_info(&this.params_by_id[0]);
+        assert_eq!(info.flags & au::kAudioUnitParameterFlag_CanRamp, 0);
+        unsafe { au::cf_release(info.cfNameString as *mut c_void) };
+        let off = Event {
+            values: Values {
+                immediate: Immediate {
+                    buffer_offset: 0,
+                    value: 0.0,
+                },
+            },
+            ..event
+        };
+        for bad in [
+            Event {
+                event_type: 2,
+                ..event
+            },
+            Event {
+                parameter: 99,
+                ..event
+            },
+            Event {
+                scope: au::kAudioUnitScope_Input,
+                ..event
+            },
+            Event {
+                element: 1,
+                ..event
+            },
+            Event {
+                values: Values {
+                    immediate: Immediate {
+                        buffer_offset: 0,
+                        value: f32::NAN,
+                    },
+                },
+                ..event
+            },
+        ] {
+            let batch = [off, bad];
+            assert_eq!(
+                unsafe { schedule(wrapper, batch.as_ptr(), 2) },
+                au::kAudioUnitErr_InvalidParameter
+            );
+            assert!(unsafe { &*this.plugin.get() }.params.bypass.value());
+        }
+        assert_eq!(unsafe { schedule(wrapper, &off, 1) }, au::noErr);
+        assert!(!unsafe { &*this.plugin.get() }.params.bypass.value());
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
+    }
+
+    #[test]
+    fn render_notify_selectors_bracket_audio_and_errors_and_allow_self_removal() {
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        struct Observer {
+            wrapper: *mut c_void,
+            events: Vec<(u32, usize, f64, u32, u32)>,
+            remove_on_pre: bool,
+        }
+        unsafe extern "C" fn notify(
+            user_data: *mut c_void,
+            flags: *mut au::AudioUnitRenderActionFlags,
+            time: *const au::AudioTimeStamp,
+            bus: u32,
+            frames: u32,
+            _: *mut au::AudioBufferList,
+        ) -> au::OSStatus {
+            let observer = unsafe { &mut *(user_data as *mut Observer) };
+            let this = unsafe { TestWrapper::from_ptr(observer.wrapper) };
+            let calls = unsafe { &*this.plugin.get() }.calls;
+            observer.events.push((
+                unsafe { *flags },
+                calls,
+                unsafe { (*time).mSampleTime },
+                bus,
+                frames,
+            ));
+            if observer.remove_on_pre
+                && unsafe { *flags } & au::kAudioUnitRenderAction_PreRender != 0
+            {
+                assert_eq!(
+                    unsafe {
+                        TestWrapper::remove_render_notify(observer.wrapper, Some(notify), user_data)
+                    },
+                    au::noErr
+                );
+            }
+            -123 // Render observers cannot replace the audio render's status.
+        }
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let add: render_notify::NotifyProc = unsafe {
+            mem::transmute(
+                TestWrapper::lookup(au::kAudioUnitAddRenderNotifySelect).expect("add selector"),
+            )
+        };
+        assert!(unsafe { TestWrapper::lookup(au::kAudioUnitRemoveRenderNotifySelect) }.is_some());
+        assert_eq!(unsafe { add(wrapper, None, ptr::null_mut()) }, -50);
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        let mut observer = Observer {
+            wrapper,
+            events: Vec::new(),
+            remove_on_pre: false,
+        };
+        let user_data = &mut observer as *mut _ as *mut c_void;
+        assert_eq!(unsafe { add(wrapper, Some(notify), user_data) }, au::noErr);
+        assert_eq!(unsafe { add(wrapper, Some(notify), user_data) }, au::noErr);
+        let mut channels = [[0.5f32; 8]; 2];
+        let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
+        let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
+        unsafe {
+            (*list).mNumberBuffers = 2;
+            for (i, samples) in channels.iter_mut().enumerate() {
+                *(*list).mBuffers.as_mut_ptr().add(i) = au::AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: 32,
+                    mData: samples.as_mut_ptr() as *mut c_void,
+                };
+            }
+        }
+        let mut time: au::AudioTimeStamp = unsafe { mem::zeroed() };
+        time.mSampleTime = 123.0;
+        let mut flags = au::kAudioUnitRenderAction_OutputIsSilence;
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::noErr
+        );
+        assert_eq!(
+            observer.events,
+            vec![(flags | 4, 0, 123.0, 0, 8), (flags | 8, 1, 123.0, 0, 8)]
+        );
+        assert_eq!(flags, au::kAudioUnitRenderAction_OutputIsSilence);
+        unsafe { TestWrapper::from_ptr(wrapper) }
+            .max_frames_per_slice
+            .store(4, Ordering::Relaxed);
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::kAudioUnitErr_TooManyFramesToProcess
+        );
+        assert_eq!(
+            observer.events.last().unwrap().0,
+            flags | 8 | render_notify::POST_RENDER_ERROR
+        );
+        assert_eq!(
+            unsafe { TestWrapper::from_ptr(wrapper) }
+                .last_render_error
+                .load(Ordering::Relaxed),
+            au::kAudioUnitErr_TooManyFramesToProcess
+        );
+        unsafe { TestWrapper::from_ptr(wrapper) }
+            .max_frames_per_slice
+            .store(8, Ordering::Relaxed);
+        observer.remove_on_pre = true;
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::noErr
+        );
+        assert_eq!(observer.events.len(), 6);
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::noErr
+        );
+        assert_eq!(observer.events.len(), 6);
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
+    }
+
+    fn bypass_sequence<const OWNED: bool>(via_parameter: bool) -> (Vec<[f32; 2]>, usize) {
+        type Timestamp = au::AudioTimeStamp;
+        let wrapper = Wrapper::<DelayedBypass<OWNED>>::new() as *mut c_void;
+        assert_eq!(
+            unsafe { Wrapper::<DelayedBypass<OWNED>>::initialize(wrapper) },
+            au::noErr
+        );
+        let mut rendered = Vec::new();
+        for block in 0..12 {
+            if block == 4 || block == 8 {
+                let value = u32::from(block == 4);
+                let status = if via_parameter {
+                    unsafe {
+                        Wrapper::<DelayedBypass<OWNED>>::set_parameter(
+                            wrapper,
+                            0,
+                            au::kAudioUnitScope_Global,
+                            0,
+                            value as f32,
+                            0,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        Wrapper::<DelayedBypass<OWNED>>::set_property(
+                            wrapper,
+                            au::kAudioUnitProperty_BypassEffect,
+                            au::kAudioUnitScope_Global,
+                            0,
+                            &value as *const _ as *const c_void,
+                            mem::size_of::<u32>() as u32,
+                        )
+                    }
+                };
+                assert_eq!(status, au::noErr);
+            }
+            let mut left: Vec<f32> = (0..8).map(|i| (block * 8 + i + 1) as f32).collect();
+            let mut right: Vec<f32> = left.iter().map(|v| -v).collect();
+            let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
+            let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
+            unsafe {
+                (*list).mNumberBuffers = 2;
+                let slots = (*list).mBuffers.as_mut_ptr();
+                for (i, samples) in [&mut left, &mut right].into_iter().enumerate() {
+                    *slots.add(i) = au::AudioBuffer {
+                        mNumberChannels: 1,
+                        mDataByteSize: 32,
+                        mData: samples.as_mut_ptr() as *mut c_void,
+                    };
+                }
+            }
+            let mut time: Timestamp = unsafe { mem::zeroed() };
+            time.mSampleTime = (block * 8) as f64;
+            time.mFlags = au::kAudioTimeStampSampleTimeValid;
+            let mut flags = 0;
+            assert_eq!(
+                unsafe {
+                    Wrapper::<DelayedBypass<OWNED>>::render(wrapper, &mut flags, &time, 0, 8, list)
+                },
+                au::noErr
+            );
+            rendered.extend(left.into_iter().zip(right).map(|(l, r)| [l, r]));
+        }
+        let calls =
+            unsafe { Wrapper::<DelayedBypass<OWNED>>::from_ptr(wrapper).plugin_mut() }.calls;
+        assert_eq!(
+            unsafe { Wrapper::<DelayedBypass<OWNED>>::close(wrapper) },
+            au::noErr
+        );
+        (rendered, calls)
+    }
+
+    #[test]
+    fn declared_bypass_keeps_dsp_delay_and_history_through_live_toggles() {
+        for via_parameter in [false, true] {
+            let (output, calls) = bypass_sequence::<true>(via_parameter);
+            assert_eq!(calls, 12, "process must continue through host bypass");
+            for (frame, pair) in output.iter().enumerate() {
+                let input = if frame < 16 {
+                    0.0
+                } else {
+                    (frame - 16 + 1) as f32
+                };
+                let gain = if (32..64).contains(&frame) { 1.0 } else { 0.5 };
+                assert_eq!(
+                    *pair,
+                    [input * gain, -input * gain],
+                    "frame {frame}, via_parameter={via_parameter}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_declared_bypass_retains_implicit_passthrough() {
+        let (output, calls) = bypass_sequence::<false>(false);
+        assert_eq!(calls, 8);
+        for (frame, pair) in output.iter().enumerate().take(64).skip(32) {
+            assert_eq!(*pair, [(frame + 1) as f32, -((frame + 1) as f32)]);
+        }
+    }
+
     #[derive(Default)]
     struct InstrumentParams;
 
@@ -3422,8 +3981,39 @@ mod tests {
     }
 
     #[test]
+    fn millisecond_metadata_preserves_native_values() {
+        use crate::params::range::FloatRange;
+        use crate::params::{FloatParam, Param};
+        for unit in [
+            " ms", "MS", "msec", "millisec", "millisecs", "millisecond", "milliseconds",
+        ] {
+            let param = FloatParam::new(
+                "Attack",
+                5.0,
+                FloatRange::Linear { min: 0.0, max: 200.0 },
+            )
+            .with_unit(unit);
+            let entry = ParamEntry {
+                id_str: "attack".into(),
+                ptr: param.as_ptr(),
+            };
+            let info = build_parameter_info(&entry);
+            assert_eq!(info.unit, AU_UNIT_MILLISECONDS, "{unit}");
+            assert!(info.unitName.is_null());
+            assert_eq!(info.minValue, 0.0);
+            assert_eq!(info.maxValue, 200.0);
+            assert!((info.defaultValue - 5.0).abs() < 1e-5);
+            // build_parameter_info transfers owned names even when the legacy
+            // wrapper flags do not advertise CFNameRelease.
+            if !info.cfNameString.is_null() {
+                unsafe { core_foundation::base::CFRelease(info.cfNameString as _) };
+            }
+        }
+        assert_eq!(classify_unit("rms"), au::kAudioUnitParameterUnit_Generic);
+    }
+
+    #[test]
     fn classify_unit_seconds() {
-        assert_eq!(classify_unit("ms"), au::kAudioUnitParameterUnit_Seconds);
         assert_eq!(classify_unit("sec"), au::kAudioUnitParameterUnit_Seconds);
         assert_eq!(
             classify_unit("seconds"),

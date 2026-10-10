@@ -10,6 +10,24 @@ Since there is no stable release yet, the changes are organized per day in
 reverse chronological order. The main purpose of this document in its current
 state is to list breaking changes.
 
+## [2026-10-07]
+
+### Fixed
+
+- AU host bypass now delegates to a declared `make_bypass()` parameter
+  (`ParamFlags::BYPASS`) instead of skipping DSP, so the plug-in's own dry path
+  keeps its delay and state continuity and host bypass no longer passes through
+  at zero delay while the AU still reports DSP latency (AUD-2060). A plug-in
+  declaring this parameter must implement bypass itself, as with CLAP/VST3.
+  Plug-ins without a declared bypass parameter retain implicit pass-through.
+- macOS egui embedded CLAP editors now implement show/hide by changing their
+  own native child view visibility without destroying GUI resources (AUD-2057).
+  The additive `Editor::set_visible` hook defaults to unsupported for editors
+  and platforms that do not implement visibility control.
+- AU millisecond parameters now advertise the native Milliseconds unit rather
+  than Seconds, preserving their raw ranges and default values (AUD-2054).
+  Compound labels such as `ms/oct` use Generic rather than guessing a time unit.
+
 ## [2025-02-23]
 
 ### Breaking changes

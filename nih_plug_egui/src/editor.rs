@@ -170,6 +170,44 @@ where
         })
     }
 
+    fn set_visible(&self, handle: &mut (dyn std::any::Any + Send), visible: bool) -> bool {
+        #[cfg(target_os = "macos")]
+        if objc2::MainThreadMarker::new().is_none() {
+            return false;
+        }
+        let Some(handle) = handle.downcast_mut::<EguiEditorHandle>() else {
+            return false;
+        };
+        if !handle.window.is_open() {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let RawWindowHandle::AppKit(window) = handle.window.raw_window_handle() else {
+                return false;
+            };
+            let view = window.ns_view.cast::<objc2::runtime::AnyObject>();
+            if view.is_null() {
+                return false;
+            }
+            // This is the editor's own child view, never the host parent. Keep
+            // the renderer, timer, parameter state and native resources alive.
+            // This hides drawing but does not stop the baseview timer or promise
+            // CPU savings. isHidden reads this view's own flag, not its ancestors.
+            unsafe {
+                let _: () = objc2::msg_send![view, setHidden: !visible];
+                let hidden: bool = objc2::msg_send![view, isHidden];
+                hidden == !visible
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // open_parented() already made this child visible. These platforms
+            // do not support hiding it yet, so a repeated show is a no-op.
+            visible
+        }
+    }
+
     /// Size of the editor window
     fn size(&self) -> (u32, u32) {
         let new_size = self.egui_state.requested_size.load();
