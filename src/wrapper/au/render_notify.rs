@@ -155,23 +155,37 @@ mod tests {
     #[test]
     fn concurrent_registration_keeps_snapshots_alive() {
         let notifications = RenderNotifications::new();
+        // Compare the value registered by the caller, not a second coercion
+        // of the same function item: optimized builds can duplicate functions
+        // across codegen units and give those coercions different addresses.
+        let registered = std::hint::black_box(Callback {
+            proc: callback,
+            user_data: std::ptr::null_mut(),
+        });
+        assert_eq!(notifications.update(registered, true), au::noErr);
+        let retained = notifications.snapshot();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for _ in 0..10000 {
-                    let cb = Callback {
-                        proc: callback,
-                        user_data: std::ptr::null_mut(),
-                    };
-                    assert_eq!(notifications.update(cb, true), au::noErr);
-                    assert_eq!(notifications.update(cb, false), au::noErr);
+                    assert_eq!(notifications.update(registered, true), au::noErr);
+                    assert_eq!(notifications.update(registered, false), au::noErr);
                 }
             });
             for _ in 0..10000 {
                 let snapshot = notifications.snapshot();
                 for cb in snapshot.callbacks() {
-                    assert_eq!(cb.proc as usize, callback as *const () as usize);
+                    assert_eq!(cb.proc as usize, registered.proc as usize);
+                    assert_eq!(cb.user_data, registered.user_data);
                 }
             }
         });
+        // This snapshot definitely contained the registered callback and must
+        // survive every control-side replacement, regardless of scheduling.
+        assert_eq!(retained.callbacks().len(), 1);
+        assert_eq!(
+            retained.callbacks()[0].proc as usize,
+            registered.proc as usize
+        );
+        assert_eq!(retained.callbacks()[0].user_data, registered.user_data);
     }
 }

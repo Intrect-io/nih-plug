@@ -92,6 +92,10 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: cargo test --locked --features "au,vst3,zstd"
 
+      - name: Test the optimized Audio Unit wrapper
+        if: startsWith(matrix.os, 'macos')
+        run: cargo test --locked --release --lib --features "au,vst3,zstd"
+
       # Copies of one plugin dylib must not share ObjC classes across AU/VST3/CLAP.
       # Also exercise retained Cocoa views after AudioUnit disposal.
       - name: Test Audio Unit CocoaUI image isolation

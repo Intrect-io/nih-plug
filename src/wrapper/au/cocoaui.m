@@ -7,6 +7,7 @@
 @import AudioToolbox;
 #import <AudioUnit/AUCocoaUIView.h>
 #import <objc/runtime.h>
+#include <dispatch/dispatch.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
