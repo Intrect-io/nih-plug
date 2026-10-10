@@ -14,15 +14,24 @@
  * This is essential for hosts such as Live that can interleave CocoaUI
  * discovery for more than one instance or ask for a view more than once.
  *
- * Class name injected at compile time (-DNIH_PLUG_AU_VIEW_CLASS=...) to avoid
- * ObjC class-name collisions when multiple nih-plug plugins are loaded in the
- * same host process.
+ * Factory and container names are injected at compile time. The bundler
+ * builds the AU separately, omitting these classes from sibling formats.
+ * Static class metadata is required for NSBundle classNamed: ownership.
  */
 
 @import AppKit;
 @import AudioToolbox;
 #import <AudioUnit/AUCocoaUIView.h>
 #include <stdbool.h>
+#import <objc/runtime.h>
+
+#ifdef NIH_PLUG_AU_COCOAUI_DISABLED
+// Sibling format images export the AU entry point for format detection, but
+// must not register this AU-only class metadata in the shared ObjC runtime.
+const char *nih_plug_au_cocoaui_class_name(void) { return NULL; }
+void nih_plug_au_release_container(void *container) { (void)container; }
+void nih_plug_au_cocoaui_close_audio_unit_view(void *unit) { (void)unit; }
+#else
 /* Provided by wrapper.rs via extern "C". The editor spawn template remains
  * available for the full AudioUnit lifetime because Live can cache this
  * factory and call it again without re-querying CocoaUI. */
@@ -32,17 +41,17 @@ extern bool nih_plug_au_cocoaui_editor_size_for_audio_unit(
 extern void *nih_plug_au_cocoaui_spawn_for_audio_unit(
     void *parent_ns_view, void *audio_unit);
 
-@class NihPlugAuContainerView;
-
-#ifndef NIH_PLUG_AU_VIEW_CLASS
-#define NIH_PLUG_AU_VIEW_CLASS NihPlugAuViewFactory
+#if !defined(NIH_PLUG_AU_VIEW_CLASS) || !defined(NIH_PLUG_AU_CONTAINER_CLASS)
+#error "AU factory and container names must both be provided by build.rs"
 #endif
+
+@class NIH_PLUG_AU_CONTAINER_CLASS;
 
 /* One strong container per AudioUnit instance. A single global container made
  * opening one instance clear another instance's editor handle. Retaining each
  * returned view also bridges baseview's nested autorelease pool until the host
  * has attached it. */
-static NSMutableDictionary<NSValue *, NihPlugAuContainerView *> *g_containerViews = nil;
+static NSMutableDictionary<NSValue *, NIH_PLUG_AU_CONTAINER_CLASS *> *g_containerViews = nil;
 static NSObject *g_containerLock = nil;
 
 __attribute__((constructor))
@@ -53,7 +62,7 @@ static void _init_container_lock(void) {
 
 /* ── Container NSView — overrides dealloc to drop the Rust editor handle ── */
 
-@interface NihPlugAuContainerView : NSView
+@interface NIH_PLUG_AU_CONTAINER_CLASS : NSView
 /// Opaque pointer to the Wrapper's GuiHandleSlot, set by uiViewForAudioUnit:.
 @property (nonatomic, assign) void *handleSlot;
 @property (nonatomic, assign) void *audioUnit;
@@ -61,7 +70,7 @@ static void _init_container_lock(void) {
 @property (nonatomic, assign) BOOL wasHostedInWindow;
 @end
 
-@implementation NihPlugAuContainerView
+@implementation NIH_PLUG_AU_CONTAINER_CLASS
 
 - (void)closeEditorIfNeeded {
     if (!self.handleSlot) {
@@ -87,7 +96,7 @@ static void _init_container_lock(void) {
 
 - (void)dealloc {
 #ifdef DEBUG
-    NSLog(@"[nih-plug AU] NihPlugAuContainerView dealloc: %p", (__bridge void *)self);
+    NSLog(@"[nih-plug AU] NIH_PLUG_AU_CONTAINER_CLASS dealloc: %p", (__bridge void *)self);
 #endif
     [self closeEditorIfNeeded];
 }
@@ -113,7 +122,7 @@ static void _init_container_lock(void) {
 
     NSValue *key = [NSValue valueWithPointer:(void *)au];
     @synchronized(g_containerLock) {
-        NihPlugAuContainerView *existing = g_containerViews[key];
+        NIH_PLUG_AU_CONTAINER_CLASS *existing = g_containerViews[key];
         if (existing) {
             /* Some hosts invoke the factory twice for one editor-open cycle.
              * Before the view has ever been mounted, returning the same view
@@ -143,7 +152,7 @@ static void _init_container_lock(void) {
         CGFloat h = eh > 0 ? (CGFloat)eh
                   : (preferredSize.height > 0 ? preferredSize.height : 600);
         NSRect frame = NSMakeRect(0, 0, w, h);
-        NihPlugAuContainerView *container = [[NihPlugAuContainerView alloc] initWithFrame:frame];
+        NIH_PLUG_AU_CONTAINER_CLASS *container = [[NIH_PLUG_AU_CONTAINER_CLASS alloc] initWithFrame:frame];
         if (!container) {
             return nil;
         }
@@ -180,7 +189,8 @@ static void _init_container_lock(void) {
  * entry; other AU instances must keep their own visible editors alive.
  */
 void nih_plug_au_release_container(void *container_ns_view) {
-    NihPlugAuContainerView *container = (__bridge NihPlugAuContainerView *)container_ns_view;
+    __unsafe_unretained NIH_PLUG_AU_CONTAINER_CLASS *container =
+        (__bridge NIH_PLUG_AU_CONTAINER_CLASS *)container_ns_view;
     NSValue *key = [NSValue valueWithPointer:container.audioUnit];
     @synchronized(g_containerLock) {
         if (g_containerViews[key] == container) {
@@ -198,6 +208,17 @@ void nih_plug_au_cocoaui_close_audio_unit_view(void *audio_unit) {
     }
     NSValue *key = [NSValue valueWithPointer:audio_unit];
     @synchronized(g_containerLock) {
-        [g_containerViews removeObjectForKey:key];
+        NIH_PLUG_AU_CONTAINER_CLASS *container = g_containerViews[key];
+        if (container) {
+            // A host may retain the view after AudioUnit disposal. Clear the
+            // slot while its Rust Wrapper is alive, before releasing our view.
+            [container closeEditorIfNeeded];
+            [g_containerViews removeObjectForKey:key];
+        }
     }
 }
+
+const char *nih_plug_au_cocoaui_class_name(void) {
+    return class_getName([NIH_PLUG_AU_VIEW_CLASS class]);
+}
+#endif

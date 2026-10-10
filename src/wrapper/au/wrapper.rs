@@ -2851,17 +2851,15 @@ pub use Wrapper as AuWrapper;
 //   1. A CFURLRef pointing at the bundle that contains the view factory class.
 //   2. A CFStringRef naming the `NSObject<AUCocoaUIBase>` subclass.
 //
-// IMPORTANT: objc2's `define_class!` does NOT emit __OBJC_CLASS_PROTOCOLS
-// metadata, so `conformsToProtocol:(AUCocoaUIBase)` returns NO in hosts.
-// We use a real Objective-C .m shim (src/wrapper/au/cocoaui.m, compiled via
-// build.rs + cc crate) which declares `@interface ... : NSObject <AUCocoaUIBase>`.
-// This generates proper protocol conformance metadata at compile time.
+// The Objective-C shim provides static factory/container class metadata so
+// NSBundle classNamed: can find the class in the advertised bundle. The bundler
+// builds this AU image separately, omitting these classes from sibling formats.
 //
 // The shim calls back into Rust via C-ABI functions that look up a reusable
 // editor-spawn template by the host's AudioUnit handle.
 mod cocoaui {
     use std::collections::HashMap;
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void, CStr};
     use std::sync::atomic::Ordering as AtomicOrdering;
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2897,6 +2895,7 @@ mod cocoaui {
 
     // ── Globals defined in cocoaui.m ───────────────────────────────────────────
     extern "C" {
+        fn nih_plug_au_cocoaui_class_name() -> *const c_char;
         fn nih_plug_au_release_container(container_ns_view: *mut c_void);
         fn nih_plug_au_cocoaui_close_audio_unit_view(audio_unit: *mut c_void);
     }
@@ -3009,13 +3008,17 @@ mod cocoaui {
 
     // ── Public entry point ─────────────────────────────────────────────────────
 
-    const VIEW_CLASS_NAME: &str = env!("NIH_PLUG_AU_VIEW_CLASS");
-
     /// Build an `AUCocoaViewInfo` for `this` wrapper.
     pub fn cocoaui_view_info<P: AuPlugin>(this: &Wrapper<P>) -> Option<au::AUCocoaViewInfo> {
         au_log!("[nih-plug AU] cocoaui_view_info: called");
         let editor = this.editor.as_ref()?;
         let gui_ctx_inner = this.gui_context_inner.as_ref()?;
+
+        let class_name_ptr = unsafe { nih_plug_au_cocoaui_class_name() };
+        if class_name_ptr.is_null() {
+            return None;
+        }
+        let class_name = unsafe { CStr::from_ptr(class_name_ptr) }.to_str().ok()?;
 
         // Store editor size in the pending packet (Ableton passes preferredSize={0,0}).
         let (ew, eh) = editor.lock().unwrap().size();
@@ -3068,7 +3071,7 @@ mod cocoaui {
             }
         };
 
-        let class_name_ref = unsafe { au::cf_string_create(VIEW_CLASS_NAME) };
+        let class_name_ref = unsafe { au::cf_string_create(class_name) };
         if class_name_ref.is_null() {
             unsafe {
                 au::cf_release(bundle_url_ref as *mut c_void);
@@ -3082,7 +3085,7 @@ mod cocoaui {
 
         au_log!(
             "[nih-plug AU] cocoaui_view_info: class={} bundle={:?}",
-            VIEW_CLASS_NAME,
+            class_name,
             bundle_url_ref
         );
         Some(au::AUCocoaViewInfo {

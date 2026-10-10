@@ -16,32 +16,38 @@ fn main() {
 
     let shim = "src/wrapper/au/cocoaui.m";
     println!("cargo:rerun-if-changed={shim}");
+    println!("cargo:rerun-if-env-changed=NIH_PLUG_AU_COCOAUI_PACKAGE");
 
-    // Derive a stable class-name suffix from the OUT_DIR path so that two
-    // nih-plug plugins loaded in the same host process get distinct ObjC
-    // class names (ObjC class names are global within a process).
-    let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
-    let mut h = DefaultHasher::new();
-    out_dir.hash(&mut h);
-    let suffix = h.finish();
-    let class_name = format!("NihPlugAuViewFactory_{suffix:016x}");
-
-    cc::Build::new()
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let au_package = std::env::var("NIH_PLUG_AU_COCOAUI_PACKAGE").ok();
+    let mut shim_build = cc::Build::new();
+    shim_build
         .file(shim)
         .flag("-fobjc-arc")
         .flag("-fmodules")
         .flag("-fvisibility=default")
-        .flag("-mmacosx-version-min=11.0")
-        .define("NIH_PLUG_AU_VIEW_CLASS", class_name.as_str())
-        .compile("nih_plug_cocoaui");
-
-    // Export the class name so wrapper.rs can read it at runtime.
-    println!("cargo:rustc-env=NIH_PLUG_AU_VIEW_CLASS={class_name}");
+        .flag("-mmacosx-version-min=11.0");
+    if au_package.as_deref() == Some("") {
+        // xtask first builds sibling formats without AU-only ObjC classes.
+        shim_build.define("NIH_PLUG_AU_COCOAUI_DISABLED", "1");
+    } else {
+        // Each separately bundled AU package needs its own static metadata.
+        // Dynamically registered classes cannot satisfy NSBundle classNamed:.
+        let mut h = DefaultHasher::new();
+        out_dir.hash(&mut h);
+        au_package.hash(&mut h);
+        let suffix = h.finish();
+        let factory = format!("NihPlugAuViewFactory_{suffix:016x}");
+        let container = format!("NihPlugAuContainerView_{suffix:016x}");
+        shim_build
+            .define("NIH_PLUG_AU_VIEW_CLASS", factory.as_str())
+            .define("NIH_PLUG_AU_CONTAINER_CLASS", container.as_str());
+    }
+    shim_build.compile("nih_plug_cocoaui");
 
     // Expose the .a path via the `links` DEP mechanism so downstream crates
     // (e.g. de-artifact-vst3) can pass -force_load at their own link step.
     // (cargo:rustc-link-arg from a dependency's build.rs is not propagated.)
-    let out_dir = std::env::var("OUT_DIR").unwrap();
     let lib_path = std::path::Path::new(&out_dir).join("libnih_plug_cocoaui.a");
     println!("cargo:cocoaui_lib={}", lib_path.display());
 }

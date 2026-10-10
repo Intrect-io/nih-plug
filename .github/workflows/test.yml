@@ -92,6 +92,18 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: cargo test --locked --features "au,vst3,zstd"
 
+      - name: Test the optimized Audio Unit wrapper
+        if: startsWith(matrix.os, 'macos')
+        run: cargo test --locked --release --lib --features "au,vst3,zstd"
+
+      # Copies of one plugin dylib must not share ObjC classes across AU/VST3/CLAP.
+      # Also exercise retained Cocoa views after AudioUnit disposal.
+      - name: Test Audio Unit CocoaUI image isolation
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          bash tests/au_cocoaui/run.sh "${RUNNER_TEMP}/nih-plug-cocoaui-image-isolation"
+          bash tests/au_cocoaui/bundle_contract.sh "${RUNNER_TEMP}/nih-plug-cocoaui-bundle-contract"
+
       # Unit tests cover the selector and packet conversion edge cases. This
       # also loads the generated aumu through AudioComponent, sends MIDI into
       # it, renders non-silent audio, and receives the MIDI output callback.
