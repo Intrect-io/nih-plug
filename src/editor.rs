@@ -42,10 +42,12 @@ pub trait Editor: Send {
 
     /// Show or hide an existing embedded editor without destroying its resources.
     /// The wrapper calls this on the main thread with the handle returned by
-    /// `spawn`. Return false when this editor/platform cannot change visibility;
-    /// do not report success without performing the operation.
-    fn set_visible(&self, _handle: &mut (dyn Any + Send), _visible: bool) -> bool {
-        false
+    /// `spawn`. The default assumes `spawn` creates a visible editor: showing it
+    /// again succeeds, but hiding it is unsupported. Editors that can hide their
+    /// child window must override this and report whether the requested state
+    /// was reached, including failures to show the window again.
+    fn set_visible(&self, _handle: &mut (dyn Any + Send), visible: bool) -> bool {
+        visible
     }
 
     /// Returns the (current) size of the editor in pixels as a `(width, height)` pair. This size

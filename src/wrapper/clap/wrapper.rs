@@ -3460,3 +3460,7 @@ unsafe fn query_host_extension<T>(
 #[cfg(test)]
 #[path = "aax_parameter_tests.rs"]
 mod aax_parameter_tests;
+
+#[cfg(test)]
+#[path = "gui_visibility_tests.rs"]
+mod gui_visibility_tests;

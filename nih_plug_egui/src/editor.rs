@@ -202,8 +202,9 @@ where
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = visible;
-            false
+            // open_parented() already made this child visible. These platforms
+            // do not support hiding it yet, so a repeated show is a no-op.
+            visible
         }
     }
 
