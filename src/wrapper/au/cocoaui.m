@@ -1,93 +1,142 @@
 /**
- * AU v2 CocoaUI bridge. Register both classes per loaded image, rather than
- * per build: AU, VST3 and CLAP bundles can contain copies of the same dylib.
- * Each class's IMPs must call that image's Rust spawn/close registry.
+ * AU v2 CocoaUI view factory — ObjC shim.
+ *
+ * `define_class!` (objc2/Rust) does NOT emit __OBJC_CLASS_PROTOCOLS metadata,
+ * so hosts reject the factory via `conformsToProtocol:` before ever calling
+ * `interfaceVersion` or `uiViewForAudioUnit:withSize:`.
+ *
+ * Compiling @interface ... : NSObject <AUCocoaUIBase> in real ObjC generates
+ * the protocol-conformance metadata that hosts require.
+ *
+ * DESIGN: The host calls [[ClassName alloc] init] independently — we cannot
+ * store state on the factory before `uiViewForAudioUnit:withSize:` fires.
+ * Rust therefore keeps pending spawn closures keyed by the AudioUnit handle.
+ * This is essential for hosts such as Live that can interleave CocoaUI
+ * discovery for more than one instance or ask for a view more than once.
+ *
+ * Factory and container names are injected at compile time. The bundler
+ * builds the AU separately, omitting these classes from sibling formats.
+ * Static class metadata is required for NSBundle classNamed: ownership.
  */
+
 @import AppKit;
 @import AudioToolbox;
 #import <AudioUnit/AUCocoaUIView.h>
-#import <objc/runtime.h>
-#include <dispatch/dispatch.h>
 #include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
+#import <objc/runtime.h>
 
-extern void nih_plug_au_cocoaui_close_view(void *container_ns_view, void *handle_slot);
+#ifdef NIH_PLUG_AU_COCOAUI_DISABLED
+// Sibling format images export the AU entry point for format detection, but
+// must not register this AU-only class metadata in the shared ObjC runtime.
+const char *nih_plug_au_cocoaui_class_name(void) { return NULL; }
+void nih_plug_au_release_container(void *container) { (void)container; }
+void nih_plug_au_cocoaui_close_audio_unit_view(void *unit) { (void)unit; }
+#else
+/* Provided by wrapper.rs via extern "C". The editor spawn template remains
+ * available for the full AudioUnit lifetime because Live can cache this
+ * factory and call it again without re-querying CocoaUI. */
+extern void  nih_plug_au_cocoaui_close_view(void *container_ns_view, void *handle_slot);
 extern bool nih_plug_au_cocoaui_editor_size_for_audio_unit(
     void *audio_unit, uint32_t *out_width, uint32_t *out_height);
 extern void *nih_plug_au_cocoaui_spawn_for_audio_unit(
     void *parent_ns_view, void *audio_unit);
 
-typedef struct {
-    void *handleSlot;
-    void *audioUnit;
-    BOOL wasHostedInWindow;
-} NihPlugAuContainerState;
+#if !defined(NIH_PLUG_AU_VIEW_CLASS) || !defined(NIH_PLUG_AU_CONTAINER_CLASS)
+#error "AU factory and container names must both be provided by build.rs"
+#endif
 
-static NSMutableDictionary<NSValue *, NSView *> *g_containerViews;
-static NSObject *g_containerLock;
-static Class g_containerClass;
-static Class g_factoryClass;
-static ptrdiff_t g_stateOffset;
-static IMP g_superDealloc;
-static IMP g_superViewDidMoveToWindow;
-static char g_imageToken;
+@class NIH_PLUG_AU_CONTAINER_CLASS;
 
-static NihPlugAuContainerState *containerState(__unsafe_unretained NSView *view) {
-    return (NihPlugAuContainerState *)((uint8_t *)(__bridge void *)view + g_stateOffset);
+/* One strong container per AudioUnit instance. A single global container made
+ * opening one instance clear another instance's editor handle. Retaining each
+ * returned view also bridges baseview's nested autorelease pool until the host
+ * has attached it. */
+static NSMutableDictionary<NSValue *, NIH_PLUG_AU_CONTAINER_CLASS *> *g_containerViews = nil;
+static NSObject *g_containerLock = nil;
+
+__attribute__((constructor))
+static void _init_container_lock(void) {
+    g_containerLock = [NSObject new];
+    g_containerViews = [NSMutableDictionary new];
 }
 
-static void closeEditorIfNeeded(__unsafe_unretained NSView *view) {
-    NihPlugAuContainerState *state = containerState(view);
-    if (!state->handleSlot) {
+/* ── Container NSView — overrides dealloc to drop the Rust editor handle ── */
+
+@interface NIH_PLUG_AU_CONTAINER_CLASS : NSView
+/// Opaque pointer to the Wrapper's GuiHandleSlot, set by uiViewForAudioUnit:.
+@property (nonatomic, assign) void *handleSlot;
+@property (nonatomic, assign) void *audioUnit;
+/// Becomes true only after the host has actually mounted this view in a window.
+@property (nonatomic, assign) BOOL wasHostedInWindow;
+@end
+
+@implementation NIH_PLUG_AU_CONTAINER_CLASS
+
+- (void)closeEditorIfNeeded {
+    if (!self.handleSlot) {
         return;
     }
-    void *handleSlot = state->handleSlot;
-    state->handleSlot = NULL;
-    nih_plug_au_cocoaui_close_view((__bridge void *)view, handleSlot);
+    void *handleSlot = self.handleSlot;
+    self.handleSlot = NULL;
+    nih_plug_au_cocoaui_close_view((__bridge void *)self, handleSlot);
 }
 
-static void containerViewDidMoveToWindow(NSView *self, SEL cmd) {
-    ((void (*)(__unsafe_unretained id, SEL))g_superViewDidMoveToWindow)(self, cmd);
-    NihPlugAuContainerState *state = containerState(self);
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
     if (self.window) {
-        state->wasHostedInWindow = YES;
-    } else if (state->wasHostedInWindow) {
-        // A new Cocoa view starts detached. Close only after it was mounted.
-        state->wasHostedInWindow = NO;
-        closeEditorIfNeeded(self);
+        self.wasHostedInWindow = YES;
+    } else if (self.wasHostedInWindow) {
+        /* A returned Cocoa view starts detached, so only treat a nil window as
+         * close after it has been mounted at least once. Live removes the view
+         * when the editor closes while the AU instance itself remains alive. */
+        self.wasHostedInWindow = NO;
+        [self closeEditorIfNeeded];
     }
 }
 
-// A C IMP is not an ARC -dealloc implementation: forward explicitly, and do
-// not retain its receiver (including through the function pointer's type).
-static void containerDealloc(__unsafe_unretained NSView *self, SEL cmd) {
-    closeEditorIfNeeded(self);
-    ((void (*)(__unsafe_unretained id, SEL))g_superDealloc)(self, cmd);
+- (void)dealloc {
+#ifdef DEBUG
+    NSLog(@"[nih-plug AU] NIH_PLUG_AU_CONTAINER_CLASS dealloc: %p", (__bridge void *)self);
+#endif
+    [self closeEditorIfNeeded];
 }
 
-static unsigned factoryInterfaceVersion(id self, SEL cmd) {
-    (void)self;
-    (void)cmd;
+@end
+
+/* ── Factory NSObject conforming to AUCocoaUIBase ───────────────────────── */
+
+@interface NIH_PLUG_AU_VIEW_CLASS : NSObject <AUCocoaUIBase>
+@end
+
+@implementation NIH_PLUG_AU_VIEW_CLASS
+
+- (unsigned)interfaceVersion {
     return 0;
 }
 
-static NSView *factoryView(id self, SEL cmd, AudioUnit au, NSSize preferredSize) {
-    (void)self;
-    (void)cmd;
+- (NSView *)uiViewForAudioUnit:(AudioUnit)au withSize:(NSSize)preferredSize {
+#ifdef DEBUG
+    NSLog(@"[nih-plug AU] uiViewForAudioUnit:withSize: au=%p size=%.0fx%.0f",
+          (void *)au, preferredSize.width, preferredSize.height);
+#endif
+
     NSValue *key = [NSValue valueWithPointer:(void *)au];
     @synchronized(g_containerLock) {
-        NSView *existing = g_containerViews[key];
+        NIH_PLUG_AU_CONTAINER_CLASS *existing = g_containerViews[key];
         if (existing) {
-            NihPlugAuContainerState *state = containerState(existing);
+            /* Some hosts invoke the factory twice for one editor-open cycle.
+             * Before the view has ever been mounted, returning the same view
+             * is valid and avoids a nil second result after the pending closure
+             * was consumed. After it has been mounted, a detached or hidden
+             * view is a completed editor session: Live may retain it instead
+             * of removing it from the hierarchy when the wrench is closed. */
             BOOL detached = existing.window == nil;
             BOOL hidden = existing.window != nil && !existing.window.isVisible;
-            // Preserve repeated factory calls before first mount, and an open
-            // editor. A cached factory can reopen a completed editor session.
-            if (!state->wasHostedInWindow || (!detached && !hidden)) {
+            if (!existing.wasHostedInWindow || (!detached && !hidden)) {
                 return existing;
             }
-            closeEditorIfNeeded(existing);
+
+            [existing closeEditorIfNeeded];
             existing = nil;
         }
 
@@ -96,107 +145,53 @@ static NSView *factoryView(id self, SEL cmd, AudioUnit au, NSSize preferredSize)
         if (!nih_plug_au_cocoaui_editor_size_for_audio_unit((void *)au, &ew, &eh)) {
             return nil;
         }
+
+        /* Use the plugin's declared size; Live passes preferredSize={0,0}. */
         CGFloat w = ew > 0 ? (CGFloat)ew
-                  : (preferredSize.width > 0 ? preferredSize.width : 800);
+                  : (preferredSize.width  > 0 ? preferredSize.width  : 800);
         CGFloat h = eh > 0 ? (CGFloat)eh
                   : (preferredSize.height > 0 ? preferredSize.height : 600);
-        NSView *container = [[g_containerClass alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+        NSRect frame = NSMakeRect(0, 0, w, h);
+        NIH_PLUG_AU_CONTAINER_CLASS *container = [[NIH_PLUG_AU_CONTAINER_CLASS alloc] initWithFrame:frame];
         if (!container) {
             return nil;
         }
-        NihPlugAuContainerState *state = containerState(container);
-        state->audioUnit = (void *)au;
-        void *handleSlot = nih_plug_au_cocoaui_spawn_for_audio_unit(
+        container.audioUnit = (void *)au;
+
+#ifdef DEBUG
+        NSLog(@"[nih-plug AU] uiViewForAudioUnit: container=%p, spawning editor", (__bridge void *)container);
+#endif
+        void *handle_slot = nih_plug_au_cocoaui_spawn_for_audio_unit(
             (__bridge void *)container, (void *)au);
-        if (!handleSlot) {
-            // Failed spawning must not cache a permanently blank view.
+        if (!handle_slot) {
+            /* The editor was not spawned, so this container hosts nothing. Caching it would
+             * make every later factory call for this AudioUnit return the same permanently
+             * blank view, so report the failure and let the host retry instead. */
+#ifdef DEBUG
+            NSLog(@"[nih-plug AU] uiViewForAudioUnit: editor spawn failed, discarding container");
+#endif
             return nil;
         }
-        state->handleSlot = handleSlot;
+
+        container.handleSlot = handle_slot;
         g_containerViews[key] = container;
+#ifdef DEBUG
+        NSLog(@"[nih-plug AU] uiViewForAudioUnit: done, returning container");
+#endif
         return container;
     }
 }
 
-static void registerImageClasses(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_containerLock = [NSObject new];
-        g_containerViews = [NSMutableDictionary new];
-        char containerName[96];
-        char factoryName[96];
-        Class container;
-        Class factory;
-        unsigned collision = 0;
-        for (;;) {
-            // Image-local storage has a different address even for copies of
-            // the identical dylib. Do not reuse a class left by an old load.
-            snprintf(containerName, sizeof(containerName), "NihPlugAuContainer_%llx_%u",
-                     (unsigned long long)(uintptr_t)&g_imageToken, collision);
-            snprintf(factoryName, sizeof(factoryName), "NihPlugAuViewFactory_%llx_%u",
-                     (unsigned long long)(uintptr_t)&g_imageToken, collision);
-            container = objc_allocateClassPair([NSView class], containerName, 0);
-            factory = objc_allocateClassPair([NSObject class], factoryName, 0);
-            if (container && factory) {
-                break;
-            }
-            if (container) objc_disposeClassPair(container);
-            if (factory) objc_disposeClassPair(factory);
-            // Allocation can also fail for reasons other than a name collision.
-            if (!objc_lookUpClass(containerName) && !objc_lookUpClass(factoryName)) {
-                NSLog(@"[nih-plug AU] cannot allocate CocoaUI classes");
-                return;
-            }
-            collision++;
-        }
+@end
 
-        uint8_t alignment = 0;
-        for (size_t bytes = _Alignof(NihPlugAuContainerState); bytes > 1; bytes >>= 1) {
-            alignment++;
-        }
-        SEL deallocSelector = sel_registerName("dealloc");
-        SEL movedSelector = @selector(viewDidMoveToWindow);
-        SEL versionSelector = @selector(interfaceVersion);
-        SEL viewSelector = @selector(uiViewForAudioUnit:withSize:);
-        Protocol *protocol = @protocol(AUCocoaUIBase);
-        struct objc_method_description versionMethod =
-            protocol_getMethodDescription(protocol, versionSelector, YES, YES);
-        struct objc_method_description viewMethod =
-            protocol_getMethodDescription(protocol, viewSelector, YES, YES);
-        g_superDealloc = class_getMethodImplementation([NSView class], deallocSelector);
-        g_superViewDidMoveToWindow = class_getMethodImplementation([NSView class], movedSelector);
-        BOOL ready = versionMethod.types && viewMethod.types
-            && class_addIvar(container, "_nihPlugState", sizeof(NihPlugAuContainerState),
-                             alignment, @encode(NihPlugAuContainerState))
-            && class_addMethod(container, movedSelector, (IMP)containerViewDidMoveToWindow, "v@:")
-            && class_addMethod(container, deallocSelector, (IMP)containerDealloc, "v@:")
-            && class_addProtocol(factory, protocol)
-            && class_addMethod(factory, versionSelector, (IMP)factoryInterfaceVersion, versionMethod.types)
-            && class_addMethod(factory, viewSelector, (IMP)factoryView, viewMethod.types);
-        if (!ready) {
-            objc_disposeClassPair(factory);
-            objc_disposeClassPair(container);
-            NSLog(@"[nih-plug AU] cannot register CocoaUI methods or protocol");
-            return;
-        }
-        objc_registerClassPair(container);
-        objc_registerClassPair(factory);
-        g_stateOffset = ivar_getOffset(class_getInstanceVariable(container, "_nihPlugState"));
-        g_containerClass = container;
-        g_factoryClass = factory;
-    });
-}
-
-// The host must receive the name registered by this loaded image.
-const char *nih_plug_au_cocoaui_class_name(void) {
-    registerImageClasses();
-    return g_factoryClass ? class_getName(g_factoryClass) : NULL;
-}
-
-// This may run during dealloc. A strong local would retain a dying object.
+/*
+ * Called from the container dealloc path. Remove only the matching instance
+ * entry; other AU instances must keep their own visible editors alive.
+ */
 void nih_plug_au_release_container(void *container_ns_view) {
-    __unsafe_unretained NSView *container = (__bridge NSView *)container_ns_view;
-    NSValue *key = [NSValue valueWithPointer:containerState(container)->audioUnit];
+    __unsafe_unretained NIH_PLUG_AU_CONTAINER_CLASS *container =
+        (__bridge NIH_PLUG_AU_CONTAINER_CLASS *)container_ns_view;
+    NSValue *key = [NSValue valueWithPointer:container.audioUnit];
     @synchronized(g_containerLock) {
         if (g_containerViews[key] == container) {
             [g_containerViews removeObjectForKey:key];
@@ -204,19 +199,26 @@ void nih_plug_au_release_container(void *container_ns_view) {
     }
 }
 
+/* Called by Wrapper::close. This is the explicit lifecycle event that lets us
+ * release the per-instance strong view reference without affecting another
+ * instance's editor. */
 void nih_plug_au_cocoaui_close_audio_unit_view(void *audio_unit) {
     if (!audio_unit) {
         return;
     }
     NSValue *key = [NSValue valueWithPointer:audio_unit];
     @synchronized(g_containerLock) {
-        NSView *container = g_containerViews[key];
+        NIH_PLUG_AU_CONTAINER_CLASS *container = g_containerViews[key];
         if (container) {
-            // A host can retain the Cocoa view past AudioUnit disposal. Clear
-            // the slot while its Rust Wrapper is still alive, before releasing
-            // our reference, so later detach/dealloc cannot call a stale slot.
-            closeEditorIfNeeded(container);
+            // A host may retain the view after AudioUnit disposal. Clear the
+            // slot while its Rust Wrapper is alive, before releasing our view.
+            [container closeEditorIfNeeded];
             [g_containerViews removeObjectForKey:key];
         }
     }
 }
+
+const char *nih_plug_au_cocoaui_class_name(void) {
+    return class_getName([NIH_PLUG_AU_VIEW_CLASS class]);
+}
+#endif

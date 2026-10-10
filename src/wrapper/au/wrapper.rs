@@ -2851,10 +2851,9 @@ pub use Wrapper as AuWrapper;
 //   1. A CFURLRef pointing at the bundle that contains the view factory class.
 //   2. A CFStringRef naming the `NSObject<AUCocoaUIBase>` subclass.
 //
-// The Objective-C shim registers image-local factory and container classes,
-// including AUCocoaUIBase conformance and the protocol's method encodings.
-// A build-time class name is insufficient: sibling format bundles may contain
-// copies of the identical dylib, while each has its own Rust spawn registry.
+// The Objective-C shim provides static factory/container class metadata so
+// NSBundle classNamed: can find the class in the advertised bundle. The bundler
+// builds this AU image separately, omitting these classes from sibling formats.
 //
 // The shim calls back into Rust via C-ABI functions that look up a reusable
 // editor-spawn template by the host's AudioUnit handle.

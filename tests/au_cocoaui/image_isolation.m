@@ -42,12 +42,46 @@ static NSString *implementationImage(Class c, SEL selector) {
     return @(info.dli_fname);
 }
 
+static NSBundle *bundleForImage(const char *path) {
+    NSString *bundlePath = @((path));
+    for (unsigned i = 0; i < 3; i++) {
+        bundlePath = bundlePath.stringByDeletingLastPathComponent;
+    }
+    NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
+    assert(bundle);
+    return bundle;
+}
+
+static Bridge loadSibling(const char *path) {
+    Bridge b = loadBridge(path);
+    assert(b.className() == NULL);
+    unsigned count = 0;
+    const char **names = objc_copyClassNamesForImage(path, &count);
+    for (unsigned i = 0; i < count; i++) {
+        assert(strncmp(names[i], "NihPlugAu", strlen("NihPlugAu")) != 0);
+    }
+    free(names);
+    return b;
+}
+
 int main(int argc, const char *argv[]) {
-    assert(argc == 4);
+    assert(argc == 7);
     @autoreleasepool {
         [NSApplication sharedApplication];
-        Bridge a = loadBridge(argv[1]);
-        Bridge b = loadBridge(argv[2]);
+        BOOL siblingsFirst = strcmp(argv[1], "siblings-first") == 0;
+        assert(siblingsFirst || strcmp(argv[1], "au-first") == 0);
+        Bridge vst = {0};
+        Bridge clap = {0};
+        if (siblingsFirst) {
+            vst = loadSibling(argv[4]);
+            clap = loadSibling(argv[5]);
+        }
+        Bridge a = loadBridge(argv[2]);
+        if (!siblingsFirst) {
+            vst = loadSibling(argv[4]);
+            clap = loadSibling(argv[5]);
+        }
+        Bridge b = loadBridge(argv[3]);
         const char *aName = a.className();
         const char *bName = b.className();
         assert(aName && bName && strcmp(aName, bName) != 0);
@@ -56,13 +90,23 @@ int main(int argc, const char *argv[]) {
         Class aClass = objc_lookUpClass(aName);
         Class bClass = objc_lookUpClass(bName);
         assert(aClass && bClass && aClass != bClass);
+        // A host may resolve the factory from its advertised bundle instead
+        // of the global registry. Runtime-created classes fail this contract.
+        NSBundle *aBundle = bundleForImage(argv[2]);
+        NSBundle *bBundle = bundleForImage(argv[3]);
+        assert([aBundle classNamed:@(aName)] == aClass);
+        assert([bBundle classNamed:@(bName)] == bClass);
+        assert([aBundle classNamed:@(bName)] == Nil);
+        assert([bBundle classNamed:@(aName)] == Nil);
+        assert(strcmp(class_getImageName(aClass), argv[2]) == 0);
+        assert(strcmp(class_getImageName(bClass), argv[3]) == 0);
         assert(class_conformsToProtocol(aClass, @protocol(AUCocoaUIBase)));
         assert(class_conformsToProtocol(bClass, @protocol(AUCocoaUIBase)));
         SEL viewSelector = @selector(uiViewForAudioUnit:withSize:);
         NSString *aImage = implementationImage(aClass, viewSelector);
         NSString *bImage = implementationImage(bClass, viewSelector);
-        assert([aImage isEqualToString:@(argv[1])]);
-        assert([bImage isEqualToString:@(argv[2])]);
+        assert([aImage isEqualToString:@(argv[2])]);
+        assert([bImage isEqualToString:@(argv[3])]);
 
         id<AUCocoaUIBase> fa = [[aClass alloc] init];
         id<AUCocoaUIBase> fb = [[bClass alloc] init];
@@ -126,8 +170,8 @@ int main(int argc, const char *argv[]) {
         b.closeUnit((void *)u1);
         b1 = nil;
 
-        // Autorelease drainage and repeated close/reopen exercise the C dealloc
-        // IMP as well as the dictionary's per-AU strong reference.
+        // Autorelease drainage and repeated close/reopen exercise dealloc as
+        // well as the dictionary's per-AU strong reference.
         for (unsigned i = 0; i < 100; i++) {
             __weak NSView *releasedView = nil;
             @autoreleasepool {
@@ -142,10 +186,14 @@ int main(int argc, const char *argv[]) {
         }
         BOOL balanced = a.spawns() == a.closes() && b.spawns() == b.closes();
         assert(balanced);
+        assert(vst.spawns() == 0 && vst.closes() == 0);
+        assert(clap.spawns() == 0 && clap.closes() == 0);
         NSDictionary *result = @{
             @"scope": @"production ObjC bridge with fixture Rust callbacks; not plugin/DAW acceptance",
             @"verdict": balanced ? @"pass" : @"fail", @"factory_a": @(aName), @"factory_b": @(bName),
             @"implementation_a": aImage, @"implementation_b": bImage,
+            @"load_order": @(argv[1]), @"bundle_lookup": @YES,
+            @"sibling_au_classes": @0, @"sibling_spawns": @(vst.spawns() + clap.spawns()),
             @"spawns_a": @(a.spawns()), @"closes_a": @(a.closes()),
             @"spawns_b": @(b.spawns()), @"closes_b": @(b.closes()),
             @"reopen_cycles": @100
@@ -154,8 +202,8 @@ int main(int argc, const char *argv[]) {
         NSData *json = [NSJSONSerialization dataWithJSONObject:result
             options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:&error];
         assert(json && !error);
-        assert([json writeToFile:@(argv[3]) options:NSDataWritingAtomic error:&error] && !error);
-        puts("PASS: per-image CocoaUI and cached-factory lifecycle");
+        assert([json writeToFile:@(argv[6]) options:NSDataWritingAtomic error:&error] && !error);
+        puts("PASS: static bundle CocoaUI, load orders and cached-factory lifecycle");
     }
     return 0;
 }

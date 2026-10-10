@@ -100,7 +100,9 @@ jobs:
       # Also exercise retained Cocoa views after AudioUnit disposal.
       - name: Test Audio Unit CocoaUI image isolation
         if: startsWith(matrix.os, 'macos')
-        run: bash tests/au_cocoaui/run.sh "${RUNNER_TEMP}/nih-plug-cocoaui-image-isolation"
+        run: |
+          bash tests/au_cocoaui/run.sh "${RUNNER_TEMP}/nih-plug-cocoaui-image-isolation"
+          bash tests/au_cocoaui/bundle_contract.sh "${RUNNER_TEMP}/nih-plug-cocoaui-bundle-contract"
 
       # Unit tests cover the selector and packet conversion edge cases. This
       # also loads the generated aumu through AudioComponent, sends MIDI into
