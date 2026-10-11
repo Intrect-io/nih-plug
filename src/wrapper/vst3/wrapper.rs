@@ -10,10 +10,10 @@ use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tr
 use vst3_sys::base::{IBStream, IPluginBase};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
-    kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, Event, EventTypes, IAudioProcessor,
-    IComponent, IEditController, IEventList, IMidiMapping, INoteExpressionController,
-    IParamValueQueue, IParameterChanges, IProcessContextRequirements, IUnitInfo,
-    AudioBusBuffers, LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription,
+    kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, AudioBusBuffers, Event, EventTypes,
+    IAudioProcessor, IComponent, IEditController, IEventList, IMidiMapping,
+    INoteExpressionController, IParamValueQueue, IParameterChanges, IProcessContextRequirements,
+    IUnitInfo, LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription,
     NoteOffEvent, NoteOnEvent, ParameterFlags, PolyPressureEvent, ProgramListInfo, TChar, UnitInfo,
 };
 use vst3_sys::VST3;
@@ -54,6 +54,18 @@ pub struct Wrapper<P: Vst3Plugin> {
 impl<P: Vst3Plugin> Wrapper<P> {
     pub fn new() -> Box<Self> {
         Self::allocate(WrapperInner::new())
+    }
+
+    fn process_mode_from_host(mode: i32) -> ProcessMode {
+        match mode {
+            n if n == ProcessModes::kRealtime as i32 => ProcessMode::Realtime,
+            n if n == ProcessModes::kPrefetch as i32 => ProcessMode::Buffered,
+            n if n == ProcessModes::kOffline as i32 => ProcessMode::Offline,
+            n => {
+                nih_debug_assert_failure!("Unknown rendering mode '{}', defaulting to realtime", n);
+                ProcessMode::Realtime
+            }
+        }
     }
 }
 
@@ -870,24 +882,15 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
             vst3_sys::vst::SymbolicSampleSizes::kSample32 as i32
         );
 
-        // This is needed when activating the plugin and when restoring state
+        let mode = Self::process_mode_from_host(setup.process_mode);
+
+        // Activation must receive this setup's mode, including the first offline setup.
         self.inner.current_buffer_config.store(Some(BufferConfig {
             sample_rate: setup.sample_rate as f32,
             min_buffer_size: None,
             max_buffer_size: setup.max_samples_per_block as u32,
-            process_mode: self.inner.current_process_mode.load(),
+            process_mode: mode,
         }));
-
-        let mode = match setup.process_mode {
-            n if n == ProcessModes::kRealtime as i32 => ProcessMode::Realtime,
-            n if n == ProcessModes::kPrefetch as i32 => ProcessMode::Buffered,
-            n if n == ProcessModes::kOffline as i32 => ProcessMode::Offline,
-            n => {
-                nih_debug_assert_failure!("Unknown rendering mode '{}', defaulting to realtime", n);
-                ProcessMode::Realtime
-            }
-        };
-        self.inner.current_process_mode.store(mode);
 
         // Initializing the plugin happens in `IAudioProcessor::set_active()` because the host may
         // still change the channel layouts at this point
@@ -938,6 +941,8 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
         process_wrapper(|| {
             // We need to handle incoming automation first
             let data = &*data;
+            // Realtime/prefetch can switch without a new setupProcessing call.
+            let process_mode = Self::process_mode_from_host(data.process_mode);
             let sample_rate = self
                 .inner
                 .current_buffer_config
@@ -1373,7 +1378,7 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                             inputs: buffers.aux_inputs,
                             outputs: buffers.aux_outputs,
                         };
-                        let mut context = self.inner.make_process_context(transport);
+                        let mut context = self.inner.make_process_context(transport, process_mode);
                         let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
                         self.inner.last_process_status.store(result);
                         result
