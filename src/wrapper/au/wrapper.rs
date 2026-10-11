@@ -200,6 +200,13 @@ pub struct Wrapper<P: AuPlugin> {
     /// the toggle too.
     bypass: AtomicBool,
 
+    /// Host-controlled offline rendering (`kAudioUnitProperty_OfflineRender`).
+    /// Hosts may toggle it while initialized, for instance around a bounce, so
+    /// render reads it per block and reports it through
+    /// `ProcessContext::host_render_mode()`. `Initialize` also feeds it into
+    /// `BufferConfig::process_mode`.
+    offline_render: AtomicBool,
+
     /// Index of the BYPASS-flagged param in `params_by_id`, if any.
     bypass_param_idx: Option<usize>,
 
@@ -532,6 +539,7 @@ impl<P: AuPlugin> Wrapper<P> {
             last_render_error: AtomicI32::new(au::noErr),
             initialized: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
+            offline_render: AtomicBool::new(false),
             bypass_param_idx,
             plugin: UnsafeCell::new(plugin),
             params_by_id,
@@ -621,6 +629,14 @@ impl<P: AuPlugin> Wrapper<P> {
     #[inline]
     fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
+    }
+    #[inline]
+    fn process_mode(&self) -> ProcessMode {
+        if self.offline_render.load(Ordering::Acquire) {
+            ProcessMode::Offline
+        } else {
+            ProcessMode::Realtime
+        }
     }
 
     /// Mark `mask` of property bits as needing notification. Cheap atomic OR;
@@ -776,7 +792,7 @@ impl<P: AuPlugin> Wrapper<P> {
             sample_rate: sr as f32,
             min_buffer_size: None,
             max_buffer_size: max_frames,
-            process_mode: ProcessMode::Realtime,
+            process_mode: this.process_mode(),
         };
 
         let mut ctx = AuInitContext::<P> {
@@ -991,7 +1007,7 @@ impl<P: AuPlugin> Wrapper<P> {
                 sample_rate: sr as f32,
                 min_buffer_size: None,
                 max_buffer_size: self.max_frames_per_slice(),
-                process_mode: ProcessMode::Realtime,
+                process_mode: self.process_mode(),
             })
         } else {
             None
@@ -1103,6 +1119,9 @@ impl<P: AuPlugin> Wrapper<P> {
                 respond(std::mem::size_of::<AudioUnitConnection>() as u32, true)
             }
             au::kAudioUnitProperty_BypassEffect if scope == au::kAudioUnitScope_Global => {
+                respond(std::mem::size_of::<au::UInt32>() as u32, true)
+            }
+            au::kAudioUnitProperty_OfflineRender if scope == au::kAudioUnitScope_Global => {
                 respond(std::mem::size_of::<au::UInt32>() as u32, true)
             }
             au::kAudioUnitProperty_LastRenderError if scope == au::kAudioUnitScope_Global => {
@@ -1341,6 +1360,15 @@ impl<P: AuPlugin> Wrapper<P> {
                 } else {
                     0
                 };
+                unsafe {
+                    *(out_data as *mut au::UInt32) = on;
+                    *io_data_size = std::mem::size_of::<au::UInt32>() as u32;
+                }
+                au::noErr
+            }
+            au::kAudioUnitProperty_OfflineRender if scope == au::kAudioUnitScope_Global => {
+                require_output!(au::UInt32);
+                let on = u32::from(this.offline_render.load(Ordering::Acquire));
                 unsafe {
                     *(out_data as *mut au::UInt32) = on;
                     *io_data_size = std::mem::size_of::<au::UInt32>() as u32;
@@ -1632,6 +1660,14 @@ impl<P: AuPlugin> Wrapper<P> {
                         }
                     }
                 }
+                au::noErr
+            }
+            // Unlike the stream configuration this may change while initialized: hosts
+            // flip it around a bounce without re-initializing the unit.
+            au::kAudioUnitProperty_OfflineRender if scope == au::kAudioUnitScope_Global => {
+                payload!(au::UInt32);
+                let v = unsafe { *(in_data as *const au::UInt32) };
+                this.offline_render.store(v != 0, Ordering::Release);
                 au::noErr
             }
             au::kAudioUnitProperty_MakeConnection if scope == au::kAudioUnitScope_Input => {
@@ -2501,6 +2537,7 @@ impl<P: AuPlugin> Wrapper<P> {
             let mut process_ctx = AuProcessContext::<P> {
                 sink: this.sink.clone(),
                 transport,
+                process_mode: this.process_mode(),
                 input_events: &mut midi_state.input_events,
                 output_events: &mut midi_state.output_events,
                 _marker: PhantomData,
@@ -3575,6 +3612,196 @@ mod tests {
         }
     }
 
+    /// Records the render mode the wrapper reports through both the
+    /// `initialize()` buffer config and the process context.
+    #[derive(Default)]
+    struct ModeProbe {
+        params: Arc<InstrumentParams>,
+        initialized_with: Vec<ProcessMode>,
+        processed_with: Vec<Option<ProcessMode>>,
+    }
+
+    impl Plugin for ModeProbe {
+        const NAME: &'static str = "AU offline render probe";
+        const VENDOR: &'static str = "NIH-plug";
+        const URL: &'static str = "https://github.com/Intrect-io/nih-plug";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+        type SysExMessage = ();
+        type BackgroundTask = ();
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+        fn initialize(
+            &mut self,
+            _: &AudioIOLayout,
+            buffer_config: &BufferConfig,
+            _: &mut impl InitContext<Self>,
+        ) -> bool {
+            self.initialized_with.push(buffer_config.process_mode);
+            true
+        }
+        fn process(
+            &mut self,
+            _: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            self.processed_with.push(context.host_render_mode());
+            ProcessStatus::Normal
+        }
+    }
+
+    impl AuPlugin for ModeProbe {
+        const AU_TYPE: [u8; 4] = *b"aufx";
+        const AU_SUBTYPE: [u8; 4] = *b"TOfl";
+        const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    /// Hosts such as Logic set `kAudioUnitProperty_OfflineRender` for a bounce,
+    /// possibly while the unit is already initialized. Plugins that trade output
+    /// completeness for real-time safety rely on seeing that as `Offline`.
+    #[test]
+    fn offline_render_property_drives_reported_process_mode() {
+        type TestWrapper = Wrapper<ModeProbe>;
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let set = |scope: au::AudioUnitScope, value: u32, size: usize| unsafe {
+            TestWrapper::set_property(
+                wrapper,
+                au::kAudioUnitProperty_OfflineRender,
+                scope,
+                0,
+                &value as *const u32 as *const c_void,
+                size as u32,
+            )
+        };
+        let get = |scope: au::AudioUnitScope| {
+            let mut value = u32::MAX;
+            let mut size = mem::size_of::<u32>() as u32;
+            let status = unsafe {
+                TestWrapper::get_property(
+                    wrapper,
+                    au::kAudioUnitProperty_OfflineRender,
+                    scope,
+                    0,
+                    &mut value as *mut u32 as *mut c_void,
+                    &mut size,
+                )
+            };
+            (status, value, size)
+        };
+        let render = || {
+            let mut channels = [[0.25f32; 8]; 2];
+            let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
+            let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
+            unsafe {
+                (*list).mNumberBuffers = 2;
+                for (i, samples) in channels.iter_mut().enumerate() {
+                    *(*list).mBuffers.as_mut_ptr().add(i) = au::AudioBuffer {
+                        mNumberChannels: 1,
+                        mDataByteSize: 32,
+                        mData: samples.as_mut_ptr() as *mut c_void,
+                    };
+                }
+            }
+            let mut time: au::AudioTimeStamp = unsafe { mem::zeroed() };
+            time.mFlags = au::kAudioTimeStampSampleTimeValid;
+            let mut flags = 0;
+            assert_eq!(
+                unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+                au::noErr
+            );
+        };
+        let probe = || unsafe { &*TestWrapper::from_ptr(wrapper).plugin.get() };
+
+        // Property info: a writable UInt32 on the global scope only.
+        let mut size = 0;
+        let mut writable = 0;
+        assert_eq!(
+            unsafe {
+                TestWrapper::get_property_info(
+                    wrapper,
+                    au::kAudioUnitProperty_OfflineRender,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &mut size,
+                    &mut writable,
+                )
+            },
+            au::noErr
+        );
+        assert_eq!(size, mem::size_of::<u32>() as u32);
+        assert_eq!(writable, 1);
+        for scope in [au::kAudioUnitScope_Input, au::kAudioUnitScope_Output] {
+            assert_eq!(
+                unsafe {
+                    TestWrapper::get_property_info(
+                        wrapper,
+                        au::kAudioUnitProperty_OfflineRender,
+                        scope,
+                        0,
+                        &mut size,
+                        &mut writable,
+                    )
+                },
+                au::kAudioUnitErr_InvalidProperty
+            );
+            assert_eq!(get(scope).0, au::kAudioUnitErr_InvalidProperty);
+            assert_eq!(set(scope, 1, 4), au::kAudioUnitErr_InvalidProperty);
+        }
+
+        // Get/Set round trip, defaulting to real-time rendering.
+        assert_eq!(get(au::kAudioUnitScope_Global), (au::noErr, 0, 4));
+        assert_eq!(
+            set(au::kAudioUnitScope_Global, 1, 2),
+            au::kAudioUnitErr_InvalidPropertyValue
+        );
+        assert_eq!(get(au::kAudioUnitScope_Global), (au::noErr, 0, 4));
+
+        // Set before Initialize: `BufferConfig::process_mode` sees it.
+        assert_eq!(set(au::kAudioUnitScope_Global, 1, 4), au::noErr);
+        assert_eq!(get(au::kAudioUnitScope_Global), (au::noErr, 1, 4));
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(probe().initialized_with, [ProcessMode::Offline]);
+        render();
+        assert_eq!(probe().processed_with, [Some(ProcessMode::Offline)]);
+
+        // Toggled between renders without re-initialising: the process
+        // context follows the property on the very next block.
+        assert_eq!(set(au::kAudioUnitScope_Global, 0, 4), au::noErr);
+        assert_eq!(get(au::kAudioUnitScope_Global), (au::noErr, 0, 4));
+        render();
+        assert_eq!(set(au::kAudioUnitScope_Global, 1, 4), au::noErr);
+        render();
+        assert_eq!(set(au::kAudioUnitScope_Global, 0, 4), au::noErr);
+        render();
+        assert_eq!(
+            probe().processed_with,
+            [
+                Some(ProcessMode::Offline),
+                Some(ProcessMode::Realtime),
+                Some(ProcessMode::Offline),
+                Some(ProcessMode::Realtime),
+            ]
+        );
+        assert_eq!(probe().initialized_with, [ProcessMode::Offline]);
+
+        // A cleared property before re-initialising yields a real-time config.
+        assert_eq!(unsafe { TestWrapper::uninitialize(wrapper) }, au::noErr);
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(
+            probe().initialized_with,
+            [ProcessMode::Offline, ProcessMode::Realtime]
+        );
+
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
+    }
+
     #[derive(Default)]
     struct InstrumentParams;
 
@@ -3706,6 +3933,10 @@ mod tests {
             ),
             (
                 au::kAudioUnitProperty_InPlaceProcessing,
+                au::kAudioUnitScope_Global,
+            ),
+            (
+                au::kAudioUnitProperty_OfflineRender,
                 au::kAudioUnitScope_Global,
             ),
         ];
