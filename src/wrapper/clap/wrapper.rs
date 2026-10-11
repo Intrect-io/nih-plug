@@ -101,6 +101,13 @@ use crate::wrapper::util::{
 /// more than this many parameters at a time will cause changes to get lost.
 const OUTPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivationState {
+    Inactive,
+    Activating,
+    Active,
+}
+
 pub struct Wrapper<P: ClapPlugin> {
     /// A reference to this object, upgraded to an `Arc<Self>` for the GUI context.
     this: AtomicRefCell<Weak<Self>>,
@@ -127,6 +134,10 @@ pub struct Wrapper<P: ClapPlugin> {
     editor_scaling_factor: AtomicF32,
 
     is_processing: AtomicBool,
+    /// A stopped audio callback is still active until `clap_plugin::deactivate()`.
+    activation_state: AtomicCell<ActivationState>,
+    /// Retain changes until they can be announced inside `clap_plugin::activate()`.
+    latency_changed_pending: AtomicBool,
     /// The current IO configuration, modified through the `clap_plugin_audio_ports_config`
     /// extension. Initialized to the plugin's first audio IO configuration.
     current_audio_io_layout: AtomicCell<AudioIOLayout>,
@@ -395,22 +406,31 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     }
                 }
             }
-            Task::LatencyChanged => match &*self.host_latency.borrow() {
-                Some(host_latency) => {
-                    nih_debug_assert!(is_gui_thread);
-
-                    // XXX: The CLAP docs mention that you should request a restart if this happens
-                    //      while the plugin is activated (which is not entirely the same thing as
-                    //      is processing, but we'll treat it as the same thing). In practice just
-                    //      calling the latency changed function also seems to work just fine.
-                    if self.is_processing.load(Ordering::SeqCst) {
-                        unsafe_clap_call! { &*self.host_callback=>request_restart(&*self.host_callback) };
-                    } else {
-                        unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
+            Task::LatencyChanged => {
+                let activation_state = self.activation_state.load();
+                if activation_state == ActivationState::Inactive
+                    || !self.latency_changed_pending.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                match &*self.host_latency.borrow() {
+                    Some(host_latency) => {
+                        nih_debug_assert!(is_gui_thread);
+                        if activation_state == ActivationState::Activating {
+                            // Clear before the host callback: a reentrant update must stay pending.
+                            self.latency_changed_pending.store(false, Ordering::SeqCst);
+                            unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
+                        } else {
+                            // Keep the change pending: restart requests do not announce the
+                            // new latency, so the next activation must still notify the host.
+                            unsafe_clap_call! { &*self.host_callback=>request_restart(&*self.host_callback) };
+                        }
+                    }
+                    None => {
+                        nih_debug_assert_failure!("Host does not support the latency extension")
                     }
                 }
-                None => nih_debug_assert_failure!("Host does not support the latency extension"),
-            },
+            }
             Task::VoiceInfoChanged => match &*self.host_voice_info.borrow() {
                 Some(host_voice_info) => {
                     nih_debug_assert!(is_gui_thread);
@@ -550,6 +570,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             editor_scaling_factor: AtomicF32::new(1.0),
 
             is_processing: AtomicBool::new(false),
+            activation_state: AtomicCell::new(ActivationState::Inactive),
+            latency_changed_pending: AtomicBool::new(false),
             current_audio_io_layout: AtomicCell::new(
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
@@ -1718,6 +1740,12 @@ impl<P: ClapPlugin> Wrapper<P> {
         //      to keep doing it this way to stay consistent with VST3.
         let old_latency = self.current_latency.swap(samples, Ordering::SeqCst);
         if old_latency != samples {
+            self.latency_changed_pending.store(true, Ordering::SeqCst);
+        }
+        if old_latency != samples
+            || (self.activation_state.load() == ActivationState::Activating
+                && self.latency_changed_pending.load(Ordering::SeqCst))
+        {
             let task_posted = self.schedule_gui(Task::LatencyChanged);
             nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
@@ -1867,31 +1895,38 @@ impl<P: ClapPlugin> Wrapper<P> {
             param.update_smoother(buffer_config.sample_rate, true);
         }
 
-        // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
-        let mut init_context = wrapper.make_init_context();
-        let mut plugin = wrapper.plugin.lock();
-        if plugin.initialize(&audio_io_layout, &buffer_config, &mut init_context) {
-            // NOTE: `Plugin::reset()` is called in `clap_plugin::start_processing()` instead of in
-            //       this function
-
-            // This preallocates enough space so we can transform all of the host's raw channel
-            // pointers into a set of `Buffer` objects for the plugin's main and auxiliary IO
-            *wrapper.buffer_manager.borrow_mut() =
-                BufferManager::for_audio_io_layout(max_frames_count as usize, audio_io_layout);
-
-            // Also store this for later, so we can reinitialize the plugin after restoring state
-            wrapper.current_buffer_config.store(Some(buffer_config));
-
-            true
-        } else {
-            false
+        wrapper.activation_state.store(ActivationState::Activating);
+        let success = {
+            // Drop the plugin lock and then the pending init requests while still inside activate.
+            let mut init_context = wrapper.make_init_context();
+            let mut plugin = wrapper.plugin.lock();
+            let success = plugin.initialize(&audio_io_layout, &buffer_config, &mut init_context);
+            if success {
+                // `Plugin::reset()` is called in `clap_plugin::start_processing()`.
+                *wrapper.buffer_manager.borrow_mut() =
+                    BufferManager::for_audio_io_layout(max_frames_count as usize, audio_io_layout);
+                wrapper.current_buffer_config.store(Some(buffer_config));
+            }
+            success
+        };
+        if success && wrapper.latency_changed_pending.load(Ordering::SeqCst) {
+            // A previous inactive/active update may already hold the requested value, so
+            // initialize does not need to call set_latency_samples again to announce it.
+            wrapper.execute(Task::LatencyChanged, true);
         }
+        wrapper.activation_state.store(if success {
+            ActivationState::Active
+        } else {
+            ActivationState::Inactive
+        });
+        success
     }
 
     unsafe extern "C" fn deactivate(plugin: *const clap_plugin) {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
+        wrapper.activation_state.store(ActivationState::Inactive);
         wrapper.plugin.lock().deactivate();
     }
 
@@ -3393,6 +3428,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(mut state) => {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
+                    let task_posted = wrapper.schedule_gui(Task::RescanParamValues);
+                    nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
                 }
 
@@ -3464,3 +3501,7 @@ mod aax_parameter_tests;
 #[cfg(test)]
 #[path = "gui_visibility_tests.rs"]
 mod gui_visibility_tests;
+
+#[cfg(test)]
+#[path = "host_contract_tests.rs"]
+mod host_contract_tests;
