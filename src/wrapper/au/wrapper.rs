@@ -70,6 +70,11 @@ use super::context::{
 use super::factory::fourcc;
 use super::midi;
 use super::parameter_events;
+use super::property_notifications::{
+    Listener, PropertyNotifications, NOTIFY_BYPASS_EFFECT, NOTIFY_LAST_RENDER_ERROR,
+    NOTIFY_LATENCY, NOTIFY_MAX_FRAMES_PER_SLICE, NOTIFY_PRESENT_PRESET, NOTIFY_STREAM_FORMAT,
+    NOTIFY_TAIL_TIME,
+};
 use super::render_notify::{self, RenderNotifications};
 
 /// Payload of `kAudioUnitProperty_MakeConnection`.
@@ -198,17 +203,11 @@ pub struct Wrapper<P: AuPlugin> {
     /// Index of the BYPASS-flagged param in `params_by_id`, if any.
     bypass_param_idx: Option<usize>,
 
-    /// Property listeners registered by the host. Notifications fire on the
-    /// main thread; audio-thread changes (latency, etc.) only set bits in
-    /// `pending_notifications` and the next main-thread entry drains them.
-    listeners: Mutex<Vec<Listener>>,
+    /// Independently owned main-thread property notification state.
+    property_notifications: Arc<PropertyNotifications>,
 
     /// Host render observers, snapshotted once for each pre/post pair.
     render_notifications: RenderNotifications,
-
-    /// Bitset of property changes pending main-thread notification.
-    /// See `NOTIFY_*` constants.
-    pending_notifications: AtomicU32,
 
     /// The plugin instance. Kept for the entire lifetime of the wrapper so
     /// the `ParamPtr` raw pointers in `params_by_id` remain valid.
@@ -437,30 +436,6 @@ struct ParamEntry {
     ptr: ParamPtr,
 }
 
-/// One registered host property listener. The `proc` is called whenever the
-/// matching property changes. The host owns `user_data`; we only forward it.
-#[derive(Copy, Clone)]
-struct Listener {
-    property_id: au::AudioUnitPropertyID,
-    proc: au::AudioUnitPropertyListenerProc,
-    user_data: *mut c_void,
-}
-
-// SAFETY: `proc` is a function pointer (Send/Sync trivially), `user_data` is
-// host-owned opaque storage we never dereference, only forward.
-unsafe impl Send for Listener {}
-unsafe impl Sync for Listener {}
-
-// Bits in `pending_notifications`. Each bit maps to a property whose listeners
-// must be called from the main thread.
-const NOTIFY_LATENCY: u32 = 1 << 0;
-const NOTIFY_STREAM_FORMAT: u32 = 1 << 1;
-const NOTIFY_BYPASS_EFFECT: u32 = 1 << 2;
-const NOTIFY_MAX_FRAMES_PER_SLICE: u32 = 1 << 3;
-const NOTIFY_TAIL_TIME: u32 = 1 << 4;
-const NOTIFY_LAST_RENDER_ERROR: u32 = 1 << 5;
-const NOTIFY_PRESENT_PRESET: u32 = 1 << 6;
-
 /// AU's conventional name for "the current state is not a stored preset".
 /// Matches Apple's `AUBase`, which initialises its present preset to
 /// `{ presetNumber: -1, presetName: CFSTR("Untitled") }`.
@@ -575,9 +550,8 @@ impl<P: AuPlugin> Wrapper<P> {
                     .unwrap_or(0);
                 (0..n_aux).map(|_| Mutex::new(None)).collect()
             },
-            listeners: Mutex::new(Vec::new()),
+            property_notifications: PropertyNotifications::new(),
             render_notifications: RenderNotifications::new(),
-            pending_notifications: AtomicU32::new(0),
             render_state: UnsafeCell::new(RenderState::new()),
             editor,
             editor_handle: GuiHandleSlot::new(),
@@ -653,78 +627,7 @@ impl<P: AuPlugin> Wrapper<P> {
     /// callable from any thread.
     #[inline]
     fn mark_pending(&self, mask: u32) {
-        self.pending_notifications.fetch_or(mask, Ordering::Release);
-    }
-
-    /// Drain any pending notifications and call registered listeners.
-    /// **Must be called from the main thread only** — host listener procs
-    /// generally are not audio-safe. Called from main-thread entry points
-    /// (`get_property`, `set_property`, `initialize`, etc.).
-    fn drain_notifications(&self) {
-        let pending = self.pending_notifications.swap(0, Ordering::AcqRel);
-        if pending == 0 {
-            return;
-        }
-        let instance = self.instance.load(Ordering::Acquire) as usize as au::AudioUnit;
-        if instance.is_null() {
-            return;
-        }
-        // Snapshot listeners so the lock isn't held across host callbacks.
-        let listeners = match self.listeners.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => return,
-        };
-        let fire = |id: au::AudioUnitPropertyID, scope: au::AudioUnitScope| {
-            for l in &listeners {
-                if l.property_id == id {
-                    // SAFETY: host owns user_data; instance is the same
-                    // AudioUnit handle the host registered against.
-                    unsafe {
-                        (l.proc)(l.user_data, instance, id, scope, 0);
-                    }
-                }
-            }
-        };
-        if pending & NOTIFY_LATENCY != 0 {
-            fire(au::kAudioUnitProperty_Latency, au::kAudioUnitScope_Global);
-        }
-        if pending & NOTIFY_STREAM_FORMAT != 0 {
-            fire(
-                au::kAudioUnitProperty_StreamFormat,
-                au::kAudioUnitScope_Output,
-            );
-            fire(
-                au::kAudioUnitProperty_StreamFormat,
-                au::kAudioUnitScope_Input,
-            );
-        }
-        if pending & NOTIFY_BYPASS_EFFECT != 0 {
-            fire(
-                au::kAudioUnitProperty_BypassEffect,
-                au::kAudioUnitScope_Global,
-            );
-        }
-        if pending & NOTIFY_MAX_FRAMES_PER_SLICE != 0 {
-            fire(
-                au::kAudioUnitProperty_MaximumFramesPerSlice,
-                au::kAudioUnitScope_Global,
-            );
-        }
-        if pending & NOTIFY_TAIL_TIME != 0 {
-            fire(au::kAudioUnitProperty_TailTime, au::kAudioUnitScope_Global);
-        }
-        if pending & NOTIFY_LAST_RENDER_ERROR != 0 {
-            fire(
-                au::kAudioUnitProperty_LastRenderError,
-                au::kAudioUnitScope_Global,
-            );
-        }
-        if pending & NOTIFY_PRESENT_PRESET != 0 {
-            fire(
-                au::kAudioUnitProperty_PresentPreset,
-                au::kAudioUnitScope_Global,
-            );
-        }
+        self.property_notifications.mark(mask);
     }
 
     /// SAFETY: caller must guarantee no other reference (mut or shared) to
@@ -753,6 +656,9 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn open(self_ptr: *mut c_void, instance: au::AudioUnit) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
         let bits = instance as usize as u64;
+        if !this.property_notifications.start(instance) {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        }
         this.instance.store(bits, Ordering::Release);
         // Update gui_context_inner so any later GUI spawn sees the real handle.
         if let Some(inner) = &this.gui_context_inner {
@@ -764,6 +670,7 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn close(self_ptr: *mut c_void) -> au::OSStatus {
         // Drop editor handle before the wrapper is destroyed.
         let this = unsafe { Self::from_ptr(self_ptr) };
+        this.property_notifications.stop();
         if this.initialized.swap(false, Ordering::AcqRel) {
             // Hosts are allowed to dispose an initialized AudioUnit without a
             // preceding Uninitialize call. Keep Plugin's lifecycle balanced.
@@ -914,7 +821,6 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         this.initialized.store(true, Ordering::Release);
-        this.drain_notifications();
         au::noErr
     }
 
@@ -1275,7 +1181,6 @@ impl<P: AuPlugin> Wrapper<P> {
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
         // Main-thread entry: drain any audio-thread-marked notifications.
-        this.drain_notifications();
 
         if out_data.is_null() || io_data_size.is_null() {
             return au::kAudioUnitErr_InvalidParameter;
@@ -1549,8 +1454,7 @@ impl<P: AuPlugin> Wrapper<P> {
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
         let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
-        // Drain after the change so listeners see the new value.
-        this.drain_notifications();
+        // The main-run-loop notifier delivers this after the setter returns.
         status
     }
 
@@ -1671,7 +1575,9 @@ impl<P: AuPlugin> Wrapper<P> {
                             let accepted = selected.and_then(|layout| {
                                 let out_ch = layout.main_output_channels?;
                                 match layout_for_output::<P>(out_ch) {
-                                    Some(resolved) if std::ptr::eq(resolved, layout) => Some(out_ch),
+                                    Some(resolved) if std::ptr::eq(resolved, layout) => {
+                                        Some(out_ch)
+                                    }
                                     _ => None,
                                 }
                             });
@@ -2656,7 +2562,7 @@ impl<P: AuPlugin> Wrapper<P> {
             this.set_latency_seconds(new_l);
             if (prev_l - new_l).abs() > f64::EPSILON {
                 // We're on the audio thread; just mark pending. The next
-                // main-thread property/lifecycle call will drain it.
+                // main-run-loop timer will deliver it without another host query.
                 this.mark_pending(NOTIFY_LATENCY);
             }
         }
@@ -2672,7 +2578,7 @@ impl<P: AuPlugin> Wrapper<P> {
         user_data: *mut c_void,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
-        if let Ok(mut guard) = this.listeners.lock() {
+        if let Ok(mut guard) = this.property_notifications.listeners.lock() {
             guard.push(Listener {
                 property_id: id,
                 proc,
@@ -2689,13 +2595,14 @@ impl<P: AuPlugin> Wrapper<P> {
         user_data: *mut c_void,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
-        let proc_addr = proc as usize;
-        if let Ok(mut guard) = this.listeners.lock() {
-            guard.retain(|l| {
-                !(l.property_id == id && (l.proc as usize) == proc_addr && l.user_data == user_data)
-            });
+        if this
+            .property_notifications
+            .remove_listener(id, proc, user_data)
+        {
+            au::noErr
+        } else {
+            au::kAudioUnitErr_CannotDoInCurrentContext
         }
-        au::noErr
     }
 }
 
@@ -3988,12 +3895,21 @@ mod tests {
         use crate::params::range::FloatRange;
         use crate::params::{FloatParam, Param};
         for unit in [
-            " ms", "MS", "msec", "millisec", "millisecs", "millisecond", "milliseconds",
+            " ms",
+            "MS",
+            "msec",
+            "millisec",
+            "millisecs",
+            "millisecond",
+            "milliseconds",
         ] {
             let param = FloatParam::new(
                 "Attack",
                 5.0,
-                FloatRange::Linear { min: 0.0, max: 200.0 },
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 200.0,
+                },
             )
             .with_unit(unit);
             let entry = ParamEntry {
