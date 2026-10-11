@@ -9,6 +9,21 @@ mkdir -p "$BUILD_ROOT"
 RUN_DIR="$(mktemp -d "$BUILD_ROOT/run-XXXXXX")"
 export CARGO_TARGET_DIR="$ROOT_DIR/target"
 
+# 리다이렉트한 컴파일/네이티브 실패의 원본 로그도 CI stdout에 남긴다.
+report_failure() {
+    local status=$?
+    if [[ "$status" -ne 0 ]]; then
+        local log
+        for log in "$RUN_DIR/lifetime.log" "$RUN_DIR/fixture-build.log" "$RUN_DIR/result.json"; do
+            if [[ -f "$log" ]]; then
+                cat "$log" >&2 || echo "Cannot read diagnostic log: $log" >&2
+            fi
+        done
+    fi
+    return "$status"
+}
+trap report_failure EXIT
+
 cd "$ROOT_DIR"
 cargo run --locked --example au_property_notification_lifetime --features au \
     > "$RUN_DIR/lifetime.log" 2>&1

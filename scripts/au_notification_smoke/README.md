@@ -33,3 +33,8 @@ The fixture reports 9112 or 28693 samples at 48kHz; it does not implement that
 audio delay. These tests prove notification/lifetime contracts, not signal
 latency, a DAW's PDC behavior, installed bundle discovery, or audible quality.
 Product UAT must separately verify the rebuilt installed plugin.
+
+The fixture lock uses the root lock's `time 0.3.37` family to support the CI
+`nightly-2025-01-01` compiler (Rust 1.85). `time 0.3.55` requires Rust 1.88 and
+failed the native fixture build before execution. The smoke script prints its
+preserved compilation/result logs on failure while keeping the failure status.
