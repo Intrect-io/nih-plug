@@ -1,14 +1,20 @@
 // 실제 notification 모듈의 메인 run loop / 종료 경합 회귀 검사.
 // listener 정의와 bit mapping도 같은 실제 모듈을 사용하며 오디오 출력은 판정하지 않는다.
+#[cfg(target_os = "macos")]
 use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoopRunInMode};
+#[cfg(target_os = "macos")]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+#[cfg(target_os = "macos")]
 #[path = "../src/wrapper/au/property_notifications.rs"]
 mod property_notifications;
+#[cfg(target_os = "macos")]
 use property_notifications::{Listener, PropertyNotifications, NOTIFY_LATENCY};
+#[cfg(target_os = "macos")]
 static CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn listener(
     _: *mut std::ffi::c_void,
     _: au_sys::AudioUnit,
@@ -19,11 +25,13 @@ unsafe extern "C" fn listener(
     assert_ne!(libc::pthread_main_np(), 0);
     CALLS.fetch_add(1, Ordering::SeqCst);
 }
+#[cfg(target_os = "macos")]
 fn pump() {
     unsafe {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.06, 0);
     }
 }
+#[cfg(target_os = "macos")]
 fn main() {
     let state = PropertyNotifications::new();
     let weak = Arc::downgrade(&state);
@@ -177,4 +185,10 @@ fn main() {
         assert!(weak.upgrade().is_none());
     }
     println!("PASS: delivery/coalescing/main-thread/removal/close/reentrant-close/concurrent-close/concurrent-removal/Arc reclamation");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("AU notification lifetime regression requires macOS");
+    std::process::exit(1);
 }
