@@ -175,3 +175,7 @@ strip = "none"
 # retune rides on the same commit.
 [patch."https://github.com/RustAudio/baseview.git"]
 baseview = { git = "https://github.com/Intrect-io/baseview.git", rev = "11cb5d195309a3d76bde73c31da984445f175d19" }
+
+[[example]]
+name = "au_property_notification_lifetime"
+required-features = ["au"]

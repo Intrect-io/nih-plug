@@ -96,6 +96,12 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: cargo test --locked --release --lib --features "au,vst3,zstd"
 
+      # Render changes must notify the host without a subsequent property query.
+      # Also check listener removal and disposal while a callback is in flight.
+      - name: Test Audio Unit property notification delivery
+        if: startsWith(matrix.os, 'macos')
+        run: bash scripts/au_notification_smoke.sh
+
       # Copies of one plugin dylib must not share ObjC classes across AU/VST3/CLAP.
       # Also exercise retained Cocoa views after AudioUnit disposal.
       - name: Test Audio Unit CocoaUI image isolation
