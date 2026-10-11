@@ -71,8 +71,6 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The current buffer configuration, containing the sample rate and the maximum block size.
     /// Will be set in `IAudioProcessor::setupProcessing()`.
     pub current_buffer_config: AtomicCell<Option<BufferConfig>>,
-    /// The current audio processing mode. Set in `IAudioProcessor::setup_processing()`.
-    pub current_process_mode: AtomicCell<ProcessMode>,
     /// The last process status returned by the plugin. This is used for tail handling.
     pub last_process_status: AtomicCell<ProcessStatus>,
     /// The current latency in samples, as set by the plugin through the [`InitContext`] and the
@@ -296,7 +294,6 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
             current_buffer_config: AtomicCell::new(None),
-            current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::initialize()` so that during the
@@ -372,12 +369,17 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
-    pub fn make_process_context(&self, transport: Transport) -> WrapperProcessContext<'_, P> {
+    pub fn make_process_context(
+        &self,
+        transport: Transport,
+        process_mode: ProcessMode,
+    ) -> WrapperProcessContext<'_, P> {
         WrapperProcessContext {
             inner: self,
             input_events_guard: self.input_events.borrow_mut(),
             output_events_guard: self.output_events.borrow_mut(),
             transport,
+            process_mode,
         }
     }
 

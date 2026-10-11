@@ -10,6 +10,9 @@ pub mod subcategories;
 mod view;
 mod wrapper;
 
+#[cfg(test)]
+mod setup_processing_tests;
+
 /// Re-export for the wrapper.
 pub use factory::PluginInfo;
 pub use vst3_sys;
