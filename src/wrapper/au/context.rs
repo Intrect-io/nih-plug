@@ -12,7 +12,7 @@ use crate::context::process::{ProcessContext, Transport};
 use crate::context::PluginApi;
 use crate::params::internals::ParamPtr;
 use crate::plugin::Plugin;
-use crate::prelude::PluginNoteEvent;
+use crate::prelude::{PluginNoteEvent, ProcessMode};
 use crate::wrapper::state::PluginState;
 
 /// Cell shared between the wrapper and its `InitContext` / `ProcessContext`
@@ -56,6 +56,8 @@ impl<P: Plugin> InitContext<P> for AuInitContext<P> {
 pub(super) struct AuProcessContext<'a, P: Plugin> {
     pub sink: Arc<ContextSink>,
     pub transport: Transport,
+    /// `kAudioUnitProperty_OfflineRender` as of the start of this render block.
+    pub process_mode: ProcessMode,
     pub input_events: &'a mut VecDeque<PluginNoteEvent<P>>,
     pub output_events: &'a mut VecDeque<PluginNoteEvent<P>>,
     pub _marker: std::marker::PhantomData<P>,
@@ -64,6 +66,10 @@ pub(super) struct AuProcessContext<'a, P: Plugin> {
 impl<P: Plugin> ProcessContext<P> for AuProcessContext<'_, P> {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Au
+    }
+
+    fn host_render_mode(&self) -> Option<ProcessMode> {
+        Some(self.process_mode)
     }
 
     fn execute_background(&self, _task: P::BackgroundTask) {}
