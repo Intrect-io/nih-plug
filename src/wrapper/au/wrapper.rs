@@ -1468,8 +1468,16 @@ impl<P: AuPlugin> Wrapper<P> {
         in_data_size: au::UInt32,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        // Own the notification state before the change: a listener may dispose the AU, so the
+        // drain below must not touch `this` (the Wrapper) once host code has run.
+        let notifications = Arc::clone(&this.property_notifications);
         let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
-        // The main-run-loop notifier delivers this after the setter returns.
+        // AUBase::SetProperty notifies its listeners before returning, and hosts and validators
+        // (auval: "Changing max frames property did not fire off a property changed
+        // notification") check right after the call without running the main loop, so the
+        // timer alone is too late here. `drain` is a no-op off the main thread and while
+        // another delivery is in progress; whatever it skips stays pending for the timer.
+        notifications.drain();
         status
     }
 
