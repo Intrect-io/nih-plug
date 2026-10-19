@@ -214,12 +214,11 @@ pub struct Wrapper<P: AuPlugin> {
     ///
     /// Wrapped in `UnsafeCell` because `Plugin::initialize` / `process` /
     /// `reset` / `deactivate` take `&mut self`, but we only ever expose `&Self`
-    /// from `from_ptr`. AU's threading model guarantees these methods are not
-    /// concurrent with each other (Initialize/Uninitialize/Reset run on main,
-    /// process runs on audio thread, and the host serialises lifecycle vs.
-    /// render via `Initialize`/`Uninitialize` boundaries — render can only
-    /// happen between them).
+    /// from `from_ptr`. processing_gate excludes lifecycle mutation and
+    /// reentrant render before any mutable reference is constructed.
     plugin: UnsafeCell<Box<P>>,
+    /// Lifecycle and audio must own the same gate before borrowing mutable state.
+    processing_gate: crate::wrapper::util::processing_gate::ProcessingGate,
 
     /// Parameter handles in declaration order. The AU parameter ID is the
     /// index into this vec. Built once in `new()`, then read-only.
@@ -275,8 +274,7 @@ pub struct Wrapper<P: AuPlugin> {
     /// and the persistent `Buffer<'static>` whose channel slot vector is
     /// pre-sized in `Initialize`.
     ///
-    /// `UnsafeCell` because only `render()` touches it after `Initialize`,
-    /// and AU does not re-enter render.
+    /// `UnsafeCell` accesses require processing_gate, including lifecycle calls.
     render_state: UnsafeCell<RenderState<P>>,
 
     /// The plugin's `Editor` instance, if the plugin provides one.
@@ -447,8 +445,8 @@ const DEFAULT_PRESET_NAME: &str = "Untitled";
 /// - `plugin` and `input_scratch` are `UnsafeCell`-wrapped, accessed only
 ///   through `&mut` borrows constructed during a single audio-thread render
 ///   call (`input_scratch`) or during main-thread lifecycle calls that AU
-///   serialises against render (`plugin`). The host contract forbids
-///   `Initialize` / `Uninitialize` / `Reset` concurrent with `Render`.
+///   excludes with processing_gate (`plugin`). Lifecycle callbacks and render
+///   must acquire the gate before constructing these mutable references.
 /// - `ParamPtr` in `params_by_id` is built once and read-only thereafter;
 ///   per nih-plug contract, `set_normalized_value` and the value getters
 ///   are themselves thread-safe.
@@ -533,6 +531,7 @@ impl<P: AuPlugin> Wrapper<P> {
             initialized: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
             bypass_param_idx,
+            processing_gate: crate::wrapper::util::processing_gate::ProcessingGate::new(),
             plugin: UnsafeCell::new(plugin),
             params_by_id,
             host_callbacks: Mutex::new(None),
@@ -670,6 +669,11 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn close(self_ptr: *mut c_void) -> au::OSStatus {
         // Drop editor handle before the wrapper is destroyed.
         let this = unsafe { Self::from_ptr(self_ptr) };
+        // Close is a non-audio lifecycle call; wait for an in-flight render.
+        let Some(processing_guard) = this.processing_gate.lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
+        // Only once Close is known to proceed: a rejected Close keeps notifications running.
         this.property_notifications.stop();
         if this.initialized.swap(false, Ordering::AcqRel) {
             // Hosts are allowed to dispose an initialized AudioUnit without a
@@ -680,6 +684,8 @@ impl<P: AuPlugin> Wrapper<P> {
         let instance = this.instance.swap(0, Ordering::AcqRel) as usize as *mut c_void;
         cocoaui::close_audio_unit_view(instance);
         this.editor_handle.clear();
+        // Release the guard before freeing its mutex. Hosts must not start new calls after Close.
+        drop(processing_guard);
         unsafe {
             let _ = Box::from_raw(self_ptr as *mut Self);
         }
@@ -763,6 +769,9 @@ impl<P: AuPlugin> Wrapper<P> {
     /// from those and forward to `Plugin::initialize`.
     unsafe extern "C" fn initialize(self_ptr: *mut c_void) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        let Some(_processing_guard) = this.processing_gate.lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
 
         let n_ch = this.n_channels().max(1);
         let chans = NonZeroU32::new(n_ch).expect("n_ch is clamped to at least one");
@@ -783,7 +792,7 @@ impl<P: AuPlugin> Wrapper<P> {
             sink: this.sink.clone(),
             _marker: PhantomData,
         };
-        // SAFETY: AU forbids Initialize concurrent with Render.
+        // SAFETY: processing_gate excludes Render and other lifecycle callbacks.
         let plugin = unsafe { this.plugin_mut() };
         let ok = plugin.initialize(&selected_layout, &buffer_config, &mut ctx);
         if !ok {
@@ -826,12 +835,15 @@ impl<P: AuPlugin> Wrapper<P> {
 
     unsafe extern "C" fn uninitialize(self_ptr: *mut c_void) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        let Some(_processing_guard) = this.processing_gate.lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
         if this
             .initialized
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // SAFETY: AU forbids Uninitialize concurrent with Render.
+            // SAFETY: processing_gate excludes Render and other lifecycle callbacks.
             unsafe { this.plugin_mut() }.deactivate();
         }
         this.midi_input.clear();
@@ -845,7 +857,10 @@ impl<P: AuPlugin> Wrapper<P> {
         _element: au::AudioUnitElement,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
-        // SAFETY: AU calls Reset on the main thread, serialised against render.
+        let Some(_processing_guard) = this.processing_gate.try_lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
+        // SAFETY: processing_gate excludes concurrent mutation.
         unsafe { this.plugin_mut() }.reset();
         this.midi_input.clear();
         unsafe { this.render_state_mut() }.midi.clear();
@@ -1453,8 +1468,17 @@ impl<P: AuPlugin> Wrapper<P> {
         in_data_size: au::UInt32,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        // Own the notification state before the change: a listener may dispose the AU, so the
+        // drain below must not touch `this` (the Wrapper) once host code has run.
+        let notifications = Arc::clone(&this.property_notifications);
         let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
-        // The main-run-loop notifier delivers this after the setter returns.
+        // AUBase::SetProperty notifies its listeners before returning, and hosts and validators
+        // (auval: "Changing max frames property did not fire off a property changed
+        // notification") check right after the call without running the main loop, so the
+        // timer alone is too late here. Apple's validator makes this call off the main thread, so
+        // deliver on the calling thread (a control thread, never render). A delivery already in
+        // progress makes this a no-op; whatever it skips stays pending for the timer.
+        notifications.drain_from_control_call();
         status
     }
 
@@ -2047,6 +2071,12 @@ impl<P: AuPlugin> Wrapper<P> {
             return au::kAudioUnitErr_InvalidParameter;
         }
 
+        let Some(_processing_guard) = this.processing_gate.try_lock() else {
+            unsafe { zero_buffer_list(io_data, in_number_frames) };
+            this.set_last_render_error(au::kAudioUnitErr_CannotDoInCurrentContext);
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
+
         if !this.is_initialized() {
             unsafe { zero_buffer_list(io_data, in_number_frames) };
             return au::noErr;
@@ -2093,8 +2123,8 @@ impl<P: AuPlugin> Wrapper<P> {
             })
             .flatten();
 
-        // SAFETY: render is not re-entered; we are the sole owner of
-        // RenderState for the duration of this call.
+        // SAFETY: processing_gate excludes reentrant render and lifecycle mutation
+        // for the duration of this call.
         let rs = unsafe { this.render_state_mut() };
 
         // ── 1) Pull main input from whichever wiring the host installed. ──
@@ -3274,6 +3304,98 @@ mod tests {
         const AU_TYPE: [u8; 4] = *b"aufx";
         const AU_SUBTYPE: [u8; 4] = *b"TByp";
         const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    #[test]
+    fn set_property_notifies_its_listener_before_returning() {
+        // Apple's AU validation sets MaximumFramesPerSlice off the main thread and checks its
+        // listener right after the call; a timer-only delivery fails it (AUD-716).
+        type W = Wrapper<DelayedBypass<true>>;
+        static FIRED: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn listener(
+            _: *mut c_void,
+            _: au::AudioUnit,
+            id: au::AudioUnitPropertyID,
+            _: au::AudioUnitScope,
+            _: au::AudioUnitElement,
+        ) {
+            if id == au::kAudioUnitProperty_MaximumFramesPerSlice {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let pointer = W::new() as *mut c_void;
+        // Any non-null handle: delivery only forwards it to the listener.
+        let instance = 0x10 as au::AudioUnit;
+        assert_eq!(unsafe { W::open(pointer, instance) }, au::noErr);
+        assert_eq!(
+            unsafe {
+                W::add_property_listener(
+                    pointer,
+                    au::kAudioUnitProperty_MaximumFramesPerSlice,
+                    listener,
+                    ptr::null_mut(),
+                )
+            },
+            au::noErr
+        );
+        let frames: au::UInt32 = 777;
+        assert_eq!(
+            unsafe {
+                W::set_property(
+                    pointer,
+                    au::kAudioUnitProperty_MaximumFramesPerSlice,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &frames as *const au::UInt32 as *const c_void,
+                    mem::size_of::<au::UInt32>() as au::UInt32,
+                )
+            },
+            au::noErr
+        );
+        assert_eq!(FIRED.load(Ordering::SeqCst), 1);
+        assert_eq!(unsafe { W::close(pointer) }, au::noErr);
+    }
+
+    #[test]
+    fn lifecycle_contention_rejects_mutation_and_silences_render() {
+        type W = Wrapper<DelayedBypass<true>>;
+        let pointer = W::new() as *mut c_void;
+        let this = unsafe { W::from_ptr(pointer) };
+        let guard = this.processing_gate.lock();
+        assert_eq!(
+            unsafe { W::initialize(pointer) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        assert_eq!(
+            unsafe { W::uninitialize(pointer) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        assert_eq!(
+            unsafe { W::reset(pointer, 0, 0) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        let mut samples = [1.0f32; 8];
+        let mut list = au::AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [au::AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: 32,
+                mData: samples.as_mut_ptr().cast(),
+            }],
+        };
+        let mut flags = 0;
+        // render() rejects a null timestamp before anything else (the SDK declares it nonnull),
+        // so pass a valid one to reach the lifecycle-contention path this test is about.
+        let time: au::AudioTimeStamp = unsafe { mem::zeroed() };
+        assert_eq!(
+            unsafe { W::render(pointer, &mut flags, &time, 0, 8, &mut list) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        assert_eq!(samples, [0.0; 8]);
+        assert!(!this.is_initialized());
+        drop(guard);
+        assert_eq!(unsafe { W::initialize(pointer) }, au::noErr);
+        assert_eq!(unsafe { W::close(pointer) }, au::noErr);
     }
 
     #[test]

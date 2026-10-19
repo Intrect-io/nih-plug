@@ -170,11 +170,20 @@ impl PropertyNotifications {
     pub(super) fn mark(&self, mask: u32) {
         self.pending.fetch_or(mask, Ordering::Release);
     }
+    /// Timer delivery: main thread only.
     pub(super) fn drain(&self) {
         // Host callbacks must never run on a render/worker thread.
         if unsafe { libc::pthread_main_np() } == 0 {
             return;
         }
+        self.dispatch();
+    }
+    /// Delivery from a host control call (`AudioUnitSetProperty`), on whichever thread the host
+    /// made it, as `AUBase::PropertyChanged` does. Never call this from render.
+    pub(super) fn drain_from_control_call(&self) {
+        self.dispatch();
+    }
+    fn dispatch(&self) {
         if self
             .dispatching
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)

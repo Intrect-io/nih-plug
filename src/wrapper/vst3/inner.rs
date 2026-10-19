@@ -81,6 +81,9 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     pub buffer_manager: AtomicRefCell<BufferManager>,
+    /// Lifecycle and audio must own the same gate before borrowing mutable state.
+    pub processing_gate: crate::wrapper::util::processing_gate::ProcessingGate,
+    pub reset_pending: AtomicBool,
     /// The incoming events for the plugin, if `P::ACCEPTS_MIDI` is set. If
     /// `P::SAMPLE_ACCURATE_AUTOMATION`, this is also read in lockstep with the parameter change
     /// block splitting.
@@ -301,6 +304,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::initialize()` so that during the
             // process call buffers can be initialized without any allocations
+            processing_gate: crate::wrapper::util::processing_gate::ProcessingGate::new(),
+            reset_pending: AtomicBool::new(false),
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(
                 0,
                 AudioIOLayout::default(),
@@ -547,6 +552,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     ///
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
+        let Some(_processing_guard) = self.processing_gate.lock() else {
+            return false;
+        };
+        self.set_state_inner_exclusive(state)
+    }
+
+    // Caller already owns processing_gate, including audio-thread state restoration.
+    pub(super) fn set_state_inner_exclusive(&self, state: &mut PluginState) -> bool {
         let audio_io_layout = self.current_audio_io_layout.load();
         let buffer_config = self.current_buffer_config.load();
 
