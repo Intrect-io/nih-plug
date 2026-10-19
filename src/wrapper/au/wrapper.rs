@@ -1475,9 +1475,10 @@ impl<P: AuPlugin> Wrapper<P> {
         // AUBase::SetProperty notifies its listeners before returning, and hosts and validators
         // (auval: "Changing max frames property did not fire off a property changed
         // notification") check right after the call without running the main loop, so the
-        // timer alone is too late here. `drain` is a no-op off the main thread and while
-        // another delivery is in progress; whatever it skips stays pending for the timer.
-        notifications.drain();
+        // timer alone is too late here. Apple's validator makes this call off the main thread, so
+        // deliver on the calling thread (a control thread, never render). A delivery already in
+        // progress makes this a no-op; whatever it skips stays pending for the timer.
+        notifications.drain_from_control_call();
         status
     }
 
@@ -3303,6 +3304,56 @@ mod tests {
         const AU_TYPE: [u8; 4] = *b"aufx";
         const AU_SUBTYPE: [u8; 4] = *b"TByp";
         const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    #[test]
+    fn set_property_notifies_its_listener_before_returning() {
+        // Apple's AU validation sets MaximumFramesPerSlice off the main thread and checks its
+        // listener right after the call; a timer-only delivery fails it (AUD-716).
+        type W = Wrapper<DelayedBypass<true>>;
+        static FIRED: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn listener(
+            _: *mut c_void,
+            _: au::AudioUnit,
+            id: au::AudioUnitPropertyID,
+            _: au::AudioUnitScope,
+            _: au::AudioUnitElement,
+        ) {
+            if id == au::kAudioUnitProperty_MaximumFramesPerSlice {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let pointer = W::new() as *mut c_void;
+        // Any non-null handle: delivery only forwards it to the listener.
+        let instance = 0x10 as au::AudioUnit;
+        assert_eq!(unsafe { W::open(pointer, instance) }, au::noErr);
+        assert_eq!(
+            unsafe {
+                W::add_property_listener(
+                    pointer,
+                    au::kAudioUnitProperty_MaximumFramesPerSlice,
+                    listener,
+                    ptr::null_mut(),
+                )
+            },
+            au::noErr
+        );
+        let frames: au::UInt32 = 777;
+        assert_eq!(
+            unsafe {
+                W::set_property(
+                    pointer,
+                    au::kAudioUnitProperty_MaximumFramesPerSlice,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &frames as *const au::UInt32 as *const c_void,
+                    mem::size_of::<au::UInt32>() as au::UInt32,
+                )
+            },
+            au::noErr
+        );
+        assert_eq!(FIRED.load(Ordering::SeqCst), 1);
+        assert_eq!(unsafe { W::close(pointer) }, au::noErr);
     }
 
     #[test]
