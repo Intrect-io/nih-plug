@@ -182,9 +182,8 @@ pub fn main_with_args(command_name: &str, args: impl IntoIterator<Item = String>
 
 /// Change the current directory into the Cargo workspace's root.
 ///
-/// This is using a heuristic to find the workspace root. It considers all ancestor directories of
-/// either `CARGO_MANIFEST_DIR` or the current directory, and finds the leftmost one containing a
-/// `Cargo.toml` file.
+/// Resolve the nearest manifest through Cargo. A nested checkout or test fixture
+/// may have another workspace above it, so the outermost manifest is not its root.
 pub fn chdir_workspace_root() -> Result<()> {
     // This is either the directory of the xtask binary when using `nih_plug_xtask` normally, or any
     // random project when using it through `cargo nih-plug`.
@@ -196,12 +195,10 @@ pub fn chdir_workspace_root() -> Result<()> {
              found",
         )?;
 
-    let workspace_root = project_dir
+    let manifest_path = project_dir
         .ancestors()
-        .filter(|dir| dir.join("Cargo.toml").exists())
-        // The ancestors are ordered starting from `project_dir` going up to the filesystem root. So
-        // this is the leftmost matching ancestor.
-        .last()
+        .map(|dir| dir.join("Cargo.toml"))
+        .find(|manifest| manifest.exists())
         .with_context(|| {
             format!(
                 "Could not find a 'Cargo.toml' file in '{}' or any of its parent directories",
@@ -209,7 +206,13 @@ pub fn chdir_workspace_root() -> Result<()> {
             )
         })?;
 
-    std::env::set_current_dir(workspace_root)
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .no_deps()
+        .exec()
+        .context("Could not resolve the Cargo workspace root")?;
+
+    std::env::set_current_dir(metadata.workspace_root.as_std_path())
         .context("Could not change to workspace root directory")
 }
 
@@ -217,9 +220,16 @@ pub fn chdir_workspace_root() -> Result<()> {
 /// before calling [`bundle()`]. This requires the current working directory to have been set to
 /// the workspace's root using [`chdir_workspace_root()`].
 pub fn build(packages: &[String], args: &[String]) -> Result<()> {
+    build_with_au_package(packages, args, "")
+}
+
+/// An empty package omits AU-only ObjC classes from sibling format binaries.
+/// A named package builds static metadata for that AU's own bundle.
+fn build_with_au_package(packages: &[String], args: &[String], au_package: &str) -> Result<()> {
     let package_args = packages.iter().flat_map(|package| ["-p", package]);
 
     let status = Command::new("cargo")
+        .env("NIH_PLUG_AU_COCOAUI_PACKAGE", au_package)
         .arg("build")
         .args(package_args)
         .args(args)
@@ -246,6 +256,8 @@ pub fn build(packages: &[String], args: &[String]) -> Result<()> {
 /// Normally this respects the `--target` option for cross compilation. If the `universal` option is
 /// specified instead, then this will assume both `x86_64-apple-darwin` and `aarch64-apple-darwin`
 /// have been built and it will try to lipo those together instead.
+/// Audio Units are rebuilt with package-specific static CocoaUI metadata after
+/// copying the sibling formats, which were built without those ObjC classes.
 pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool) -> Result<()> {
     let package_version = package_version(Path::new("./Cargo.toml"), package)?;
     let mut build_type_dir = "debug";
@@ -330,6 +342,7 @@ pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool
                 &package_version,
                 &[&x86_64_lib_path, &aarch64_lib_path],
                 CompilationTarget::MacOSUniversal,
+                args,
             )?;
         }
     } else {
@@ -369,6 +382,7 @@ to your Cargo.toml file?"#,
                 &package_version,
                 &[&lib_path],
                 compilation_target,
+                args,
             )?;
         }
     }
@@ -485,6 +499,7 @@ fn bundle_plugin(
     package_version: &str,
     lib_paths: &[&Path],
     compilation_target: CompilationTarget,
+    build_args: &[String],
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
     let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
@@ -614,6 +629,22 @@ fn bundle_plugin(
                  [{package}.au] section. Add type/subtype/manufacturer four-character codes."
                 )
             })?;
+
+        // The initial binary is copied into CLAP/VST bundles above without
+        // AU-only class metadata. Rebuild this package for its own AU bundle;
+        // copying one dylib into all formats makes their ObjC names collide.
+        // Preserve the caller's profile, features and target, including both
+        // slices of a universal build, in the existing Cargo target directory.
+        let au_packages = [package.to_owned()];
+        if matches!(compilation_target, CompilationTarget::MacOSUniversal) {
+            for target in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
+                let mut args = build_args.to_vec();
+                args.push(format!("--target={target}"));
+                build_with_au_package(&au_packages, &args, package)?;
+            }
+        } else {
+            build_with_au_package(&au_packages, build_args, package)?;
+        }
 
         let au_lib_path =
             bundle_home_dir.join(au_bundle_library_name(&bundle_name, compilation_target));

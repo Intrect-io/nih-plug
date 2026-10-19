@@ -1,0 +1,10 @@
+[package]
+name="au-notification-fixture"
+version="0.1.0"
+edition="2021"
+publish=false
+[workspace]
+[lib]
+crate-type=["cdylib"]
+[dependencies]
+nih_plug={path="../../..",default-features=false,features=["au"]}

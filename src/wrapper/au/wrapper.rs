@@ -69,6 +69,13 @@ use super::context::{
 };
 use super::factory::fourcc;
 use super::midi;
+use super::parameter_events;
+use super::property_notifications::{
+    Listener, PropertyNotifications, NOTIFY_BYPASS_EFFECT, NOTIFY_LAST_RENDER_ERROR,
+    NOTIFY_LATENCY, NOTIFY_MAX_FRAMES_PER_SLICE, NOTIFY_PRESENT_PRESET, NOTIFY_STREAM_FORMAT,
+    NOTIFY_TAIL_TIME,
+};
+use super::render_notify::{self, RenderNotifications};
 
 /// Payload of `kAudioUnitProperty_MakeConnection`.
 ///
@@ -196,14 +203,11 @@ pub struct Wrapper<P: AuPlugin> {
     /// Index of the BYPASS-flagged param in `params_by_id`, if any.
     bypass_param_idx: Option<usize>,
 
-    /// Property listeners registered by the host. Notifications fire on the
-    /// main thread; audio-thread changes (latency, etc.) only set bits in
-    /// `pending_notifications` and the next main-thread entry drains them.
-    listeners: Mutex<Vec<Listener>>,
+    /// Independently owned main-thread property notification state.
+    property_notifications: Arc<PropertyNotifications>,
 
-    /// Bitset of property changes pending main-thread notification.
-    /// See `NOTIFY_*` constants.
-    pending_notifications: AtomicU32,
+    /// Host render observers, snapshotted once for each pre/post pair.
+    render_notifications: RenderNotifications,
 
     /// The plugin instance. Kept for the entire lifetime of the wrapper so
     /// the `ParamPtr` raw pointers in `params_by_id` remain valid.
@@ -430,30 +434,6 @@ struct ParamEntry {
     ptr: ParamPtr,
 }
 
-/// One registered host property listener. The `proc` is called whenever the
-/// matching property changes. The host owns `user_data`; we only forward it.
-#[derive(Copy, Clone)]
-struct Listener {
-    property_id: au::AudioUnitPropertyID,
-    proc: au::AudioUnitPropertyListenerProc,
-    user_data: *mut c_void,
-}
-
-// SAFETY: `proc` is a function pointer (Send/Sync trivially), `user_data` is
-// host-owned opaque storage we never dereference, only forward.
-unsafe impl Send for Listener {}
-unsafe impl Sync for Listener {}
-
-// Bits in `pending_notifications`. Each bit maps to a property whose listeners
-// must be called from the main thread.
-const NOTIFY_LATENCY: u32 = 1 << 0;
-const NOTIFY_STREAM_FORMAT: u32 = 1 << 1;
-const NOTIFY_BYPASS_EFFECT: u32 = 1 << 2;
-const NOTIFY_MAX_FRAMES_PER_SLICE: u32 = 1 << 3;
-const NOTIFY_TAIL_TIME: u32 = 1 << 4;
-const NOTIFY_LAST_RENDER_ERROR: u32 = 1 << 5;
-const NOTIFY_PRESENT_PRESET: u32 = 1 << 6;
-
 /// AU's conventional name for "the current state is not a stored preset".
 /// Matches Apple's `AUBase`, which initialises its present preset to
 /// `{ presetNumber: -1, presetName: CFSTR("Untitled") }`.
@@ -569,8 +549,8 @@ impl<P: AuPlugin> Wrapper<P> {
                     .unwrap_or(0);
                 (0..n_aux).map(|_| Mutex::new(None)).collect()
             },
-            listeners: Mutex::new(Vec::new()),
-            pending_notifications: AtomicU32::new(0),
+            property_notifications: PropertyNotifications::new(),
+            render_notifications: RenderNotifications::new(),
             render_state: UnsafeCell::new(RenderState::new()),
             editor,
             editor_handle: GuiHandleSlot::new(),
@@ -646,78 +626,7 @@ impl<P: AuPlugin> Wrapper<P> {
     /// callable from any thread.
     #[inline]
     fn mark_pending(&self, mask: u32) {
-        self.pending_notifications.fetch_or(mask, Ordering::Release);
-    }
-
-    /// Drain any pending notifications and call registered listeners.
-    /// **Must be called from the main thread only** — host listener procs
-    /// generally are not audio-safe. Called from main-thread entry points
-    /// (`get_property`, `set_property`, `initialize`, etc.).
-    fn drain_notifications(&self) {
-        let pending = self.pending_notifications.swap(0, Ordering::AcqRel);
-        if pending == 0 {
-            return;
-        }
-        let instance = self.instance.load(Ordering::Acquire) as usize as au::AudioUnit;
-        if instance.is_null() {
-            return;
-        }
-        // Snapshot listeners so the lock isn't held across host callbacks.
-        let listeners = match self.listeners.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => return,
-        };
-        let fire = |id: au::AudioUnitPropertyID, scope: au::AudioUnitScope| {
-            for l in &listeners {
-                if l.property_id == id {
-                    // SAFETY: host owns user_data; instance is the same
-                    // AudioUnit handle the host registered against.
-                    unsafe {
-                        (l.proc)(l.user_data, instance, id, scope, 0);
-                    }
-                }
-            }
-        };
-        if pending & NOTIFY_LATENCY != 0 {
-            fire(au::kAudioUnitProperty_Latency, au::kAudioUnitScope_Global);
-        }
-        if pending & NOTIFY_STREAM_FORMAT != 0 {
-            fire(
-                au::kAudioUnitProperty_StreamFormat,
-                au::kAudioUnitScope_Output,
-            );
-            fire(
-                au::kAudioUnitProperty_StreamFormat,
-                au::kAudioUnitScope_Input,
-            );
-        }
-        if pending & NOTIFY_BYPASS_EFFECT != 0 {
-            fire(
-                au::kAudioUnitProperty_BypassEffect,
-                au::kAudioUnitScope_Global,
-            );
-        }
-        if pending & NOTIFY_MAX_FRAMES_PER_SLICE != 0 {
-            fire(
-                au::kAudioUnitProperty_MaximumFramesPerSlice,
-                au::kAudioUnitScope_Global,
-            );
-        }
-        if pending & NOTIFY_TAIL_TIME != 0 {
-            fire(au::kAudioUnitProperty_TailTime, au::kAudioUnitScope_Global);
-        }
-        if pending & NOTIFY_LAST_RENDER_ERROR != 0 {
-            fire(
-                au::kAudioUnitProperty_LastRenderError,
-                au::kAudioUnitScope_Global,
-            );
-        }
-        if pending & NOTIFY_PRESENT_PRESET != 0 {
-            fire(
-                au::kAudioUnitProperty_PresentPreset,
-                au::kAudioUnitScope_Global,
-            );
-        }
+        self.property_notifications.mark(mask);
     }
 
     /// SAFETY: caller must guarantee no other reference (mut or shared) to
@@ -746,6 +655,9 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn open(self_ptr: *mut c_void, instance: au::AudioUnit) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
         let bits = instance as usize as u64;
+        if !this.property_notifications.start(instance) {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        }
         this.instance.store(bits, Ordering::Release);
         // Update gui_context_inner so any later GUI spawn sees the real handle.
         if let Some(inner) = &this.gui_context_inner {
@@ -761,6 +673,8 @@ impl<P: AuPlugin> Wrapper<P> {
         let Some(processing_guard) = this.processing_gate.lock() else {
             return au::kAudioUnitErr_CannotDoInCurrentContext;
         };
+        // Only once Close is known to proceed: a rejected Close keeps notifications running.
+        this.property_notifications.stop();
         if this.initialized.swap(false, Ordering::AcqRel) {
             // Hosts are allowed to dispose an initialized AudioUnit without a
             // preceding Uninitialize call. Keep Plugin's lifecycle balanced.
@@ -806,6 +720,15 @@ impl<P: AuPlugin> Wrapper<P> {
             },
             au::kAudioUnitRenderSelect => unsafe {
                 std::mem::transmute::<au::AudioUnitRenderProc, _>(Self::render)
+            },
+            parameter_events::SCHEDULE_PARAMETERS_SELECT => unsafe {
+                std::mem::transmute::<parameter_events::ScheduleProc, _>(Self::schedule_parameters)
+            },
+            au::kAudioUnitAddRenderNotifySelect => unsafe {
+                std::mem::transmute::<render_notify::NotifyProc, _>(Self::add_render_notify)
+            },
+            au::kAudioUnitRemoveRenderNotifySelect => unsafe {
+                std::mem::transmute::<render_notify::NotifyProc, _>(Self::remove_render_notify)
             },
             au::kAudioUnitAddPropertyListenerSelect => unsafe {
                 std::mem::transmute::<au::AudioUnitAddPropertyListenerProc, _>(
@@ -907,7 +830,6 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         this.initialized.store(true, Ordering::Release);
-        this.drain_notifications();
         au::noErr
     }
 
@@ -1274,7 +1196,6 @@ impl<P: AuPlugin> Wrapper<P> {
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
         // Main-thread entry: drain any audio-thread-marked notifications.
-        this.drain_notifications();
 
         if out_data.is_null() || io_data_size.is_null() {
             return au::kAudioUnitErr_InvalidParameter;
@@ -1548,8 +1469,7 @@ impl<P: AuPlugin> Wrapper<P> {
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
         let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
-        // Drain after the change so listeners see the new value.
-        this.drain_notifications();
+        // The main-run-loop notifier delivers this after the setter returns.
         status
     }
 
@@ -1982,6 +1902,152 @@ impl<P: AuPlugin> Wrapper<P> {
     /// Allocation: this function performs no heap allocations on the hot
     /// path. All scratch storage is provisioned in `Initialize`.
     unsafe extern "C" fn render(
+        self_ptr: *mut c_void,
+        io_action_flags: *mut au::AudioUnitRenderActionFlags,
+        in_time_stamp: *const au::AudioTimeStamp,
+        in_output_bus_number: au::UInt32,
+        in_number_frames: au::UInt32,
+        io_data: *mut au::AudioBufferList,
+    ) -> au::OSStatus {
+        let this = unsafe { Self::from_ptr(self_ptr) };
+        // AudioUnitRender permits null flags, but the SDK declares timestamp
+        // and ioData nonnull. Reject invalid pointers before host observers run.
+        if io_data.is_null() || in_time_stamp.is_null() {
+            this.set_last_render_error(au::kAudioUnitErr_InvalidParameter);
+            return au::kAudioUnitErr_InvalidParameter;
+        }
+        let notifications = this.render_notifications.snapshot();
+        // AUBase::DoRender uses phase-local flags, not the host flag pointer:
+        // https://github.com/apple/AudioUnitSDK/blob/main/src/AudioUnitSDK/AUBase.cpp
+        // Callback results do not replace render status. Each phase starts from
+        // the host flags, so PreRender never leaks into PostRender or the host.
+        let input_flags = if io_action_flags.is_null() {
+            0
+        } else {
+            unsafe { *io_action_flags }
+        };
+        let mut pre_flags = input_flags | au::kAudioUnitRenderAction_PreRender;
+        for callback in notifications.callbacks() {
+            unsafe {
+                (callback.proc)(
+                    callback.user_data,
+                    &mut pre_flags,
+                    in_time_stamp,
+                    in_output_bus_number,
+                    in_number_frames,
+                    io_data,
+                )
+            };
+        }
+        let status = unsafe {
+            Self::render_audio(
+                self_ptr,
+                io_action_flags,
+                in_time_stamp,
+                in_output_bus_number,
+                in_number_frames,
+                io_data,
+            )
+        };
+        this.set_last_render_error(status);
+        let output_flags = if io_action_flags.is_null() {
+            0
+        } else {
+            unsafe { *io_action_flags }
+        };
+        let mut post_flags = output_flags | au::kAudioUnitRenderAction_PostRender;
+        if status != au::noErr {
+            post_flags |= render_notify::POST_RENDER_ERROR;
+        }
+        for callback in notifications.callbacks() {
+            unsafe {
+                (callback.proc)(
+                    callback.user_data,
+                    &mut post_flags,
+                    in_time_stamp,
+                    in_output_bus_number,
+                    in_number_frames,
+                    io_data,
+                )
+            };
+        }
+        status
+    }
+
+    /// Match AUBase's non-scheduling fallback: immediate events use the same
+    /// setter as AudioUnitSetParameter, including its documented block-level
+    /// timing granularity. We do not advertise CanRamp or pretend to execute
+    /// ramps; those requests fail explicitly instead of silently doing nothing.
+    unsafe extern "C" fn schedule_parameters(
+        self_ptr: *mut c_void,
+        events: *const parameter_events::Event,
+        count: u32,
+    ) -> au::OSStatus {
+        if count == 0 {
+            return au::noErr;
+        }
+        if events.is_null() {
+            return au::kAudioUnitErr_InvalidParameter;
+        }
+        let this = unsafe { Self::from_ptr(self_ptr) };
+        let events = unsafe { std::slice::from_raw_parts(events, count as usize) };
+        // Validate the entire batch before applying any of it.
+        for event in events {
+            if event.event_type != parameter_events::IMMEDIATE
+                || event.scope != au::kAudioUnitScope_Global
+                || event.element != 0
+                || event.parameter as usize >= this.params_by_id.len()
+                || !unsafe { event.values.immediate.value }.is_finite()
+            {
+                return au::kAudioUnitErr_InvalidParameter;
+            }
+        }
+        for event in events {
+            let immediate = unsafe { event.values.immediate };
+            let status = unsafe {
+                Self::set_parameter(
+                    self_ptr,
+                    event.parameter,
+                    event.scope,
+                    event.element,
+                    immediate.value,
+                    immediate.buffer_offset,
+                )
+            };
+            if status != au::noErr {
+                return status;
+            }
+        }
+        au::noErr
+    }
+
+    unsafe extern "C" fn add_render_notify(
+        self_ptr: *mut c_void,
+        proc: Option<au::AURenderCallback>,
+        user_data: *mut c_void,
+    ) -> au::OSStatus {
+        let Some(proc) = proc else {
+            return -50;
+        }; // kAudio_ParamError
+        unsafe { Self::from_ptr(self_ptr) }
+            .render_notifications
+            .update(render_notify::Callback { proc, user_data }, true)
+    }
+
+    unsafe extern "C" fn remove_render_notify(
+        self_ptr: *mut c_void,
+        proc: Option<au::AURenderCallback>,
+        user_data: *mut c_void,
+    ) -> au::OSStatus {
+        let Some(proc) = proc else {
+            return au::noErr;
+        };
+        unsafe { Self::from_ptr(self_ptr) }
+            .render_notifications
+            .update(render_notify::Callback { proc, user_data }, false)
+    }
+
+    unsafe fn render_audio(
         self_ptr: *mut c_void,
         _io_action_flags: *mut au::AudioUnitRenderActionFlags,
         in_time_stamp: *const au::AudioTimeStamp,
@@ -2517,7 +2583,7 @@ impl<P: AuPlugin> Wrapper<P> {
             this.set_latency_seconds(new_l);
             if (prev_l - new_l).abs() > f64::EPSILON {
                 // We're on the audio thread; just mark pending. The next
-                // main-thread property/lifecycle call will drain it.
+                // main-run-loop timer will deliver it without another host query.
                 this.mark_pending(NOTIFY_LATENCY);
             }
         }
@@ -2533,7 +2599,7 @@ impl<P: AuPlugin> Wrapper<P> {
         user_data: *mut c_void,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
-        if let Ok(mut guard) = this.listeners.lock() {
+        if let Ok(mut guard) = this.property_notifications.listeners.lock() {
             guard.push(Listener {
                 property_id: id,
                 proc,
@@ -2550,13 +2616,14 @@ impl<P: AuPlugin> Wrapper<P> {
         user_data: *mut c_void,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
-        let proc_addr = proc as usize;
-        if let Ok(mut guard) = this.listeners.lock() {
-            guard.retain(|l| {
-                !(l.property_id == id && (l.proc as usize) == proc_addr && l.user_data == user_data)
-            });
+        if this
+            .property_notifications
+            .remove_listener(id, proc, user_data)
+        {
+            au::noErr
+        } else {
+            au::kAudioUnitErr_CannotDoInCurrentContext
         }
-        au::noErr
     }
 }
 
@@ -2605,9 +2672,9 @@ fn build_parameter_info(entry: &ParamEntry) -> au::AudioUnitParameterInfo {
     info.cfNameString = string_to_cfstring(name_str);
     info.clumpID = 0;
 
-    info.flags = au::kAudioUnitParameterFlag_IsReadable
-        | au::kAudioUnitParameterFlag_IsWritable
-        | au::kAudioUnitParameterFlag_CanRamp;
+    // No intra-buffer ramp implementation exists. Advertising CanRamp made
+    // hosts schedule ramps that the wrapper could not execute (AUD-2105).
+    info.flags = au::kAudioUnitParameterFlag_IsReadable | au::kAudioUnitParameterFlag_IsWritable;
 
     info
 }
@@ -2712,17 +2779,15 @@ pub use Wrapper as AuWrapper;
 //   1. A CFURLRef pointing at the bundle that contains the view factory class.
 //   2. A CFStringRef naming the `NSObject<AUCocoaUIBase>` subclass.
 //
-// IMPORTANT: objc2's `define_class!` does NOT emit __OBJC_CLASS_PROTOCOLS
-// metadata, so `conformsToProtocol:(AUCocoaUIBase)` returns NO in hosts.
-// We use a real Objective-C .m shim (src/wrapper/au/cocoaui.m, compiled via
-// build.rs + cc crate) which declares `@interface ... : NSObject <AUCocoaUIBase>`.
-// This generates proper protocol conformance metadata at compile time.
+// The Objective-C shim provides static factory/container class metadata so
+// NSBundle classNamed: can find the class in the advertised bundle. The bundler
+// builds this AU image separately, omitting these classes from sibling formats.
 //
 // The shim calls back into Rust via C-ABI functions that look up a reusable
 // editor-spawn template by the host's AudioUnit handle.
 mod cocoaui {
     use std::collections::HashMap;
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void, CStr};
     use std::sync::atomic::Ordering as AtomicOrdering;
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2758,6 +2823,7 @@ mod cocoaui {
 
     // ── Globals defined in cocoaui.m ───────────────────────────────────────────
     extern "C" {
+        fn nih_plug_au_cocoaui_class_name() -> *const c_char;
         fn nih_plug_au_release_container(container_ns_view: *mut c_void);
         fn nih_plug_au_cocoaui_close_audio_unit_view(audio_unit: *mut c_void);
     }
@@ -2870,13 +2936,17 @@ mod cocoaui {
 
     // ── Public entry point ─────────────────────────────────────────────────────
 
-    const VIEW_CLASS_NAME: &str = env!("NIH_PLUG_AU_VIEW_CLASS");
-
     /// Build an `AUCocoaViewInfo` for `this` wrapper.
     pub fn cocoaui_view_info<P: AuPlugin>(this: &Wrapper<P>) -> Option<au::AUCocoaViewInfo> {
         au_log!("[nih-plug AU] cocoaui_view_info: called");
         let editor = this.editor.as_ref()?;
         let gui_ctx_inner = this.gui_context_inner.as_ref()?;
+
+        let class_name_ptr = unsafe { nih_plug_au_cocoaui_class_name() };
+        if class_name_ptr.is_null() {
+            return None;
+        }
+        let class_name = unsafe { CStr::from_ptr(class_name_ptr) }.to_str().ok()?;
 
         // Store editor size in the pending packet (Ableton passes preferredSize={0,0}).
         let (ew, eh) = editor.lock().unwrap().size();
@@ -2929,7 +2999,7 @@ mod cocoaui {
             }
         };
 
-        let class_name_ref = unsafe { au::cf_string_create(VIEW_CLASS_NAME) };
+        let class_name_ref = unsafe { au::cf_string_create(class_name) };
         if class_name_ref.is_null() {
             unsafe {
                 au::cf_release(bundle_url_ref as *mut c_void);
@@ -2943,7 +3013,7 @@ mod cocoaui {
 
         au_log!(
             "[nih-plug AU] cocoaui_view_info: class={} bundle={:?}",
-            VIEW_CLASS_NAME,
+            class_name,
             bundle_url_ref
         );
         Some(au::AUCocoaViewInfo {
@@ -3255,8 +3325,11 @@ mod tests {
             }],
         };
         let mut flags = 0;
+        // render() rejects a null timestamp before anything else (the SDK declares it nonnull),
+        // so pass a valid one to reach the lifecycle-contention path this test is about.
+        let time: au::AudioTimeStamp = unsafe { mem::zeroed() };
         assert_eq!(
-            unsafe { W::render(pointer, &mut flags, std::ptr::null(), 0, 8, &mut list) },
+            unsafe { W::render(pointer, &mut flags, &time, 0, 8, &mut list) },
             au::kAudioUnitErr_CannotDoInCurrentContext
         );
         assert_eq!(samples, [0.0; 8]);
@@ -3264,6 +3337,203 @@ mod tests {
         drop(guard);
         assert_eq!(unsafe { W::initialize(pointer) }, au::noErr);
         assert_eq!(unsafe { W::close(pointer) }, au::noErr);
+    }
+
+    #[test]
+    fn scheduled_immediate_parameters_apply_and_unsupported_batches_fail_atomically() {
+        use parameter_events::{Event, Immediate, Values, IMMEDIATE, SCHEDULE_PARAMETERS_SELECT};
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        assert_eq!(mem::size_of::<Event>(), 32);
+        assert_eq!(mem::align_of::<Event>(), 4);
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let schedule: parameter_events::ScheduleProc = unsafe {
+            mem::transmute(
+                TestWrapper::lookup(SCHEDULE_PARAMETERS_SELECT).expect("schedule selector"),
+            )
+        };
+        let event = Event {
+            scope: au::kAudioUnitScope_Global,
+            element: 0,
+            parameter: 0,
+            event_type: IMMEDIATE,
+            values: Values {
+                immediate: Immediate {
+                    buffer_offset: 0,
+                    value: 1.0,
+                },
+            },
+        };
+        assert_eq!(unsafe { schedule(wrapper, ptr::null(), 0) }, au::noErr);
+        assert_eq!(
+            unsafe { schedule(wrapper, ptr::null(), 1) },
+            au::kAudioUnitErr_InvalidParameter
+        );
+        assert_eq!(unsafe { schedule(wrapper, &event, 1) }, au::noErr);
+        let this = unsafe { TestWrapper::from_ptr(wrapper) };
+        assert!(unsafe { &*this.plugin.get() }.params.bypass.value());
+        let info = build_parameter_info(&this.params_by_id[0]);
+        assert_eq!(info.flags & au::kAudioUnitParameterFlag_CanRamp, 0);
+        unsafe { au::cf_release(info.cfNameString as *mut c_void) };
+        let off = Event {
+            values: Values {
+                immediate: Immediate {
+                    buffer_offset: 0,
+                    value: 0.0,
+                },
+            },
+            ..event
+        };
+        for bad in [
+            Event {
+                event_type: 2,
+                ..event
+            },
+            Event {
+                parameter: 99,
+                ..event
+            },
+            Event {
+                scope: au::kAudioUnitScope_Input,
+                ..event
+            },
+            Event {
+                element: 1,
+                ..event
+            },
+            Event {
+                values: Values {
+                    immediate: Immediate {
+                        buffer_offset: 0,
+                        value: f32::NAN,
+                    },
+                },
+                ..event
+            },
+        ] {
+            let batch = [off, bad];
+            assert_eq!(
+                unsafe { schedule(wrapper, batch.as_ptr(), 2) },
+                au::kAudioUnitErr_InvalidParameter
+            );
+            assert!(unsafe { &*this.plugin.get() }.params.bypass.value());
+        }
+        assert_eq!(unsafe { schedule(wrapper, &off, 1) }, au::noErr);
+        assert!(!unsafe { &*this.plugin.get() }.params.bypass.value());
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
+    }
+
+    #[test]
+    fn render_notify_selectors_bracket_audio_and_errors_and_allow_self_removal() {
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        struct Observer {
+            wrapper: *mut c_void,
+            events: Vec<(u32, usize, f64, u32, u32)>,
+            remove_on_pre: bool,
+        }
+        unsafe extern "C" fn notify(
+            user_data: *mut c_void,
+            flags: *mut au::AudioUnitRenderActionFlags,
+            time: *const au::AudioTimeStamp,
+            bus: u32,
+            frames: u32,
+            _: *mut au::AudioBufferList,
+        ) -> au::OSStatus {
+            let observer = unsafe { &mut *(user_data as *mut Observer) };
+            let this = unsafe { TestWrapper::from_ptr(observer.wrapper) };
+            let calls = unsafe { &*this.plugin.get() }.calls;
+            observer.events.push((
+                unsafe { *flags },
+                calls,
+                unsafe { (*time).mSampleTime },
+                bus,
+                frames,
+            ));
+            if observer.remove_on_pre
+                && unsafe { *flags } & au::kAudioUnitRenderAction_PreRender != 0
+            {
+                assert_eq!(
+                    unsafe {
+                        TestWrapper::remove_render_notify(observer.wrapper, Some(notify), user_data)
+                    },
+                    au::noErr
+                );
+            }
+            -123 // Render observers cannot replace the audio render's status.
+        }
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let add: render_notify::NotifyProc = unsafe {
+            mem::transmute(
+                TestWrapper::lookup(au::kAudioUnitAddRenderNotifySelect).expect("add selector"),
+            )
+        };
+        assert!(unsafe { TestWrapper::lookup(au::kAudioUnitRemoveRenderNotifySelect) }.is_some());
+        assert_eq!(unsafe { add(wrapper, None, ptr::null_mut()) }, -50);
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        let mut observer = Observer {
+            wrapper,
+            events: Vec::new(),
+            remove_on_pre: false,
+        };
+        let user_data = &mut observer as *mut _ as *mut c_void;
+        assert_eq!(unsafe { add(wrapper, Some(notify), user_data) }, au::noErr);
+        assert_eq!(unsafe { add(wrapper, Some(notify), user_data) }, au::noErr);
+        let mut channels = [[0.5f32; 8]; 2];
+        let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
+        let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
+        unsafe {
+            (*list).mNumberBuffers = 2;
+            for (i, samples) in channels.iter_mut().enumerate() {
+                *(*list).mBuffers.as_mut_ptr().add(i) = au::AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: 32,
+                    mData: samples.as_mut_ptr() as *mut c_void,
+                };
+            }
+        }
+        let mut time: au::AudioTimeStamp = unsafe { mem::zeroed() };
+        time.mSampleTime = 123.0;
+        let mut flags = au::kAudioUnitRenderAction_OutputIsSilence;
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::noErr
+        );
+        assert_eq!(
+            observer.events,
+            vec![(flags | 4, 0, 123.0, 0, 8), (flags | 8, 1, 123.0, 0, 8)]
+        );
+        assert_eq!(flags, au::kAudioUnitRenderAction_OutputIsSilence);
+        unsafe { TestWrapper::from_ptr(wrapper) }
+            .max_frames_per_slice
+            .store(4, Ordering::Relaxed);
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::kAudioUnitErr_TooManyFramesToProcess
+        );
+        assert_eq!(
+            observer.events.last().unwrap().0,
+            flags | 8 | render_notify::POST_RENDER_ERROR
+        );
+        assert_eq!(
+            unsafe { TestWrapper::from_ptr(wrapper) }
+                .last_render_error
+                .load(Ordering::Relaxed),
+            au::kAudioUnitErr_TooManyFramesToProcess
+        );
+        unsafe { TestWrapper::from_ptr(wrapper) }
+            .max_frames_per_slice
+            .store(8, Ordering::Relaxed);
+        observer.remove_on_pre = true;
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::noErr
+        );
+        assert_eq!(observer.events.len(), 6);
+        assert_eq!(
+            unsafe { TestWrapper::render(wrapper, &mut flags, &time, 0, 8, list) },
+            au::noErr
+        );
+        assert_eq!(observer.events.len(), 6);
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
     }
 
     fn bypass_sequence<const OWNED: bool>(via_parameter: bool) -> (Vec<[f32; 2]>, usize) {
