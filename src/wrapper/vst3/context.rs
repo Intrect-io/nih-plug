@@ -7,7 +7,7 @@ use vst3_sys::vst::IComponentHandler;
 
 use crate::prelude::{
     GuiContext, InitContext, ParamPtr, PluginApi, PluginNoteEvent, PluginState, ProcessContext,
-    Transport, Vst3Plugin,
+    ProcessMode, Transport, Vst3Plugin,
 };
 
 use super::inner::{Task, WrapperInner};
@@ -42,6 +42,7 @@ pub(crate) struct WrapperProcessContext<'a, P: Vst3Plugin> {
     pub(super) input_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     pub(super) output_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     pub(super) transport: Transport,
+    pub(super) process_mode: ProcessMode,
 }
 
 /// A [`GuiContext`] implementation for the wrapper. This is passed to the plugin in
@@ -84,6 +85,10 @@ impl<P: Vst3Plugin> InitContext<P> for WrapperInitContext<'_, P> {
 impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Vst3
+    }
+
+    fn host_render_mode(&self) -> Option<ProcessMode> {
+        Some(self.process_mode)
     }
 
     fn execute_background(&self, task: P::BackgroundTask) {
