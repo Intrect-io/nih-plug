@@ -41,8 +41,9 @@ use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroU32;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use au_sys as au;
 use core_foundation::array::CFArray;
@@ -192,12 +193,17 @@ pub struct Wrapper<P: AuPlugin> {
     /// `Uninitialize` / first construction. Render is a no-op when false.
     initialized: AtomicBool,
 
-    /// Set when the host restores `ClassInfo` on an initialized unit. Hosts such as Logic Pro
+    /// Set when a restored `ClassInfo` could not re-initialize the plug-in right away (a render
+    /// held it for too long); the next `Reset` does it instead. Hosts such as Logic Pro
     /// initialize first and restore the saved state afterwards, so a plug-in that reads its
-    /// state in `initialize()` (latency, model choice) would keep running on the defaults.
-    /// VST3/CLAP re-initialize inside their state setters; here `set_class_info` is not
-    /// serialised against render, so the re-initialization waits for the next `Reset`.
+    /// state in `initialize()` (latency, model choice) would otherwise keep running on the
+    /// defaults. VST3/CLAP re-initialize inside their state setters too.
     reinit_pending: AtomicBool,
+
+    /// Excludes render from the re-initialization in `set_class_info`, which, unlike
+    /// `Initialize` and `Reset`, the host does not serialise against render. One of the
+    /// `GATE_*` states; a render that finds the gate taken outputs silence.
+    plugin_gate: AtomicU8,
 
     /// Host-controlled bypass (`kAudioUnitProperty_BypassEffect`). When set,
     /// a declared BYPASS parameter delegates processing to the plugin, which
@@ -455,6 +461,15 @@ struct ParamEntry {
 /// `{ presetNumber: -1, presetName: CFSTR("Untitled") }`.
 const DEFAULT_PRESET_NAME: &str = "Untitled";
 
+/// `Wrapper::plugin_gate` states.
+const GATE_IDLE: u8 = 0;
+const GATE_RENDERING: u8 = 1;
+const GATE_REINIT: u8 = 2;
+
+/// How long a restored `ClassInfo` waits for an in-flight render before leaving the
+/// re-initialization to the next `Reset`.
+const RESTORE_GATE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// `Send` + `Sync` justification:
 ///
 /// - All publicly mutable fields are atomic or behind a `Mutex`.
@@ -546,6 +561,7 @@ impl<P: AuPlugin> Wrapper<P> {
             last_render_error: AtomicI32::new(au::noErr),
             initialized: AtomicBool::new(false),
             reinit_pending: AtomicBool::new(false),
+            plugin_gate: AtomicU8::new(GATE_IDLE),
             bypass: AtomicBool::new(false),
             offline_render: AtomicBool::new(false),
             bypass_param_idx,
@@ -791,7 +807,21 @@ impl<P: AuPlugin> Wrapper<P> {
         unsafe { this.initialize_plugin() }
     }
 
-    /// The body of `Initialize`, shared with the deferred re-initialization in `Reset`.
+    /// Re-run the initialization after a state restore. A plug-in that refuses its restored
+    /// state leaves the unit uninitialized (render outputs silence) until the host initializes
+    /// it again, as after a failed `Initialize`.
+    ///
+    /// SAFETY: same as `initialize_plugin`, or with `plugin_gate` held.
+    unsafe fn reinitialize_after_restore(&self) -> au::OSStatus {
+        let status = unsafe { self.initialize_plugin() };
+        if status != au::noErr && self.initialized.swap(false, Ordering::AcqRel) {
+            unsafe { self.plugin_mut() }.deactivate();
+        }
+        self.midi_input.clear();
+        status
+    }
+
+    /// The body of `Initialize`, shared with the re-initialization after a state restore.
     ///
     /// SAFETY: the caller must be on a path the host serialises against render
     /// (`Initialize` or `Reset`).
@@ -886,15 +916,7 @@ impl<P: AuPlugin> Wrapper<P> {
             // State restored since the last initialization: run it again so the plug-in sees
             // the restored values (this also resets it).
             // SAFETY: AU calls Reset on the main thread, serialised against render.
-            let status = unsafe { this.initialize_plugin() };
-            if status != au::noErr {
-                // The plug-in refused its restored state: render stays silent until the host
-                // initializes it again, as after a failed `Initialize`.
-                this.initialized.store(false, Ordering::Release);
-                unsafe { this.plugin_mut() }.deactivate();
-            }
-            this.midi_input.clear();
-            return status;
+            return unsafe { this.reinitialize_after_restore() };
         }
         // SAFETY: AU calls Reset on the main thread, serialised against render.
         unsafe { this.plugin_mut() }.reset();
@@ -1078,7 +1100,30 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         if self.initialized.load(Ordering::Acquire) {
-            self.reinit_pending.store(true, Ordering::Release);
+            // The plug-in read its state in `initialize()`, before this restore. Re-initialize
+            // now with render shut out; a render already in flight is short, so wait for it.
+            let deadline = Instant::now() + RESTORE_GATE_TIMEOUT;
+            loop {
+                match self.plugin_gate.compare_exchange(
+                    GATE_IDLE,
+                    GATE_REINIT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        // SAFETY: the gate excludes render; the host serialises the other
+                        // lifecycle calls with property sets on its main thread.
+                        let status = unsafe { self.reinitialize_after_restore() };
+                        self.plugin_gate.store(GATE_IDLE, Ordering::Release);
+                        return status;
+                    }
+                    Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+                    Err(_) => {
+                        self.reinit_pending.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
         }
 
         au::noErr
@@ -2108,6 +2153,45 @@ impl<P: AuPlugin> Wrapper<P> {
     }
 
     unsafe fn render_audio(
+        self_ptr: *mut c_void,
+        io_action_flags: *mut au::AudioUnitRenderActionFlags,
+        in_time_stamp: *const au::AudioTimeStamp,
+        in_output_bus_number: au::UInt32,
+        in_number_frames: au::UInt32,
+        io_data: *mut au::AudioBufferList,
+    ) -> au::OSStatus {
+        let this = unsafe { Self::from_ptr(self_ptr) };
+        if this
+            .plugin_gate
+            .compare_exchange(
+                GATE_IDLE,
+                GATE_RENDERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // A restored state is re-initializing the plug-in
+            if !io_data.is_null() {
+                unsafe { zero_buffer_list(io_data, in_number_frames) };
+            }
+            return au::noErr;
+        }
+        let status = unsafe {
+            Self::render_audio_gated(
+                self_ptr,
+                io_action_flags,
+                in_time_stamp,
+                in_output_bus_number,
+                in_number_frames,
+                io_data,
+            )
+        };
+        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
+        status
+    }
+
+    unsafe fn render_audio_gated(
         self_ptr: *mut c_void,
         _io_action_flags: *mut au::AudioUnitRenderActionFlags,
         in_time_stamp: *const au::AudioTimeStamp,
@@ -4138,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_class_info_reinitializes_on_the_next_reset() {
+    fn restored_class_info_reinitializes_the_plugin() {
         type TestWrapper = Wrapper<DelayedBypass<true>>;
         let wrapper = TestWrapper::new() as *mut c_void;
         let inits = || unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.inits;
@@ -4188,23 +4272,64 @@ mod tests {
         assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
         assert_eq!(inits(), 1);
         restore(&saved);
-        assert_eq!(inits(), 1, "ClassInfo is not serialised against render");
-        assert_eq!(reset(), au::noErr);
         assert_eq!(
             inits(),
             2,
-            "the next Reset re-initializes with the restored state"
+            "a restore re-initializes with the restored state"
         );
         assert_eq!(reset(), au::noErr);
         assert_eq!(inits(), 2, "a plain Reset does not");
 
-        // A fresh Initialize consumes a pending restore.
+        // A render holding the plug-in defers the re-initialization to the next Reset.
+        let this = unsafe { TestWrapper::from_ptr(wrapper) };
+        this.plugin_gate.store(GATE_RENDERING, Ordering::Release);
         restore(&saved);
-        assert_eq!(unsafe { TestWrapper::uninitialize(wrapper) }, au::noErr);
-        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(inits(), 2);
+        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
+        assert_eq!(reset(), au::noErr);
         assert_eq!(inits(), 3);
         assert_eq!(reset(), au::noErr);
         assert_eq!(inits(), 3);
+
+        // A render that finds the plug-in re-initializing outputs silence without touching it.
+        let mut channels = [[0.5f32; 8]; 2];
+        let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
+        let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
+        unsafe {
+            (*list).mNumberBuffers = 2;
+            for (i, samples) in channels.iter_mut().enumerate() {
+                *(*list).mBuffers.as_mut_ptr().add(i) = au::AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: (samples.len() * mem::size_of::<f32>()) as u32,
+                    mData: samples.as_mut_ptr() as *mut c_void,
+                };
+            }
+        }
+        let calls = unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.calls;
+        this.plugin_gate.store(GATE_REINIT, Ordering::Release);
+        let time = au::AudioTimeStamp {
+            mSampleTime: 0.0,
+            mFlags: au::kAudioTimeStampSampleTimeValid,
+            ..unsafe { mem::zeroed() }
+        };
+        let status = unsafe { TestWrapper::render(wrapper, ptr::null_mut(), &time, 0, 8, list) };
+        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
+        assert_eq!(status, au::noErr);
+        assert!(channels.iter().flatten().all(|&x| x == 0.0));
+        assert_eq!(
+            unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.calls,
+            calls
+        );
+
+        // A fresh Initialize consumes a pending restore.
+        this.plugin_gate.store(GATE_RENDERING, Ordering::Release);
+        restore(&saved);
+        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
+        assert_eq!(unsafe { TestWrapper::uninitialize(wrapper) }, au::noErr);
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(inits(), 4);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 4);
 
         assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
     }
