@@ -192,6 +192,13 @@ pub struct Wrapper<P: AuPlugin> {
     /// `Uninitialize` / first construction. Render is a no-op when false.
     initialized: AtomicBool,
 
+    /// Set when the host restores `ClassInfo` on an initialized unit. Hosts such as Logic Pro
+    /// initialize first and restore the saved state afterwards, so a plug-in that reads its
+    /// state in `initialize()` (latency, model choice) would keep running on the defaults.
+    /// VST3/CLAP re-initialize inside their state setters; here `set_class_info` is not
+    /// serialised against render, so the re-initialization waits for the next `Reset`.
+    reinit_pending: AtomicBool,
+
     /// Host-controlled bypass (`kAudioUnitProperty_BypassEffect`). When set,
     /// a declared BYPASS parameter delegates processing to the plugin, which
     /// owns its latency-aligned dry path. Without one, render skips processing.
@@ -538,6 +545,7 @@ impl<P: AuPlugin> Wrapper<P> {
             tail_seconds_bits: AtomicU64::new(pack_f64(0.0)),
             last_render_error: AtomicI32::new(au::noErr),
             initialized: AtomicBool::new(false),
+            reinit_pending: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
             offline_render: AtomicBool::new(false),
             bypass_param_idx,
@@ -779,6 +787,17 @@ impl<P: AuPlugin> Wrapper<P> {
     /// from those and forward to `Plugin::initialize`.
     unsafe extern "C" fn initialize(self_ptr: *mut c_void) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        // SAFETY: AU forbids Initialize concurrent with Render.
+        unsafe { this.initialize_plugin() }
+    }
+
+    /// The body of `Initialize`, shared with the deferred re-initialization in `Reset`.
+    ///
+    /// SAFETY: the caller must be on a path the host serialises against render
+    /// (`Initialize` or `Reset`).
+    unsafe fn initialize_plugin(&self) -> au::OSStatus {
+        let this = self;
+        this.reinit_pending.store(false, Ordering::Release);
 
         let n_ch = this.n_channels().max(1);
         let chans = NonZeroU32::new(n_ch).expect("n_ch is clamped to at least one");
@@ -799,7 +818,7 @@ impl<P: AuPlugin> Wrapper<P> {
             sink: this.sink.clone(),
             _marker: PhantomData,
         };
-        // SAFETY: AU forbids Initialize concurrent with Render.
+        // SAFETY: guaranteed by the caller.
         let plugin = unsafe { this.plugin_mut() };
         let ok = plugin.initialize(&selected_layout, &buffer_config, &mut ctx);
         if !ok {
@@ -861,6 +880,22 @@ impl<P: AuPlugin> Wrapper<P> {
         _element: au::AudioUnitElement,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        if this.initialized.load(Ordering::Acquire)
+            && this.reinit_pending.swap(false, Ordering::AcqRel)
+        {
+            // State restored since the last initialization: run it again so the plug-in sees
+            // the restored values (this also resets it).
+            // SAFETY: AU calls Reset on the main thread, serialised against render.
+            let status = unsafe { this.initialize_plugin() };
+            if status != au::noErr {
+                // The plug-in refused its restored state: render stays silent until the host
+                // initializes it again, as after a failed `Initialize`.
+                this.initialized.store(false, Ordering::Release);
+                unsafe { this.plugin_mut() }.deactivate();
+            }
+            this.midi_input.clear();
+            return status;
+        }
         // SAFETY: AU calls Reset on the main thread, serialised against render.
         unsafe { this.plugin_mut() }.reset();
         this.midi_input.clear();
@@ -1040,6 +1075,10 @@ impl<P: AuPlugin> Wrapper<P> {
                     *guard = name;
                 }
             }
+        }
+
+        if self.initialized.load(Ordering::Acquire) {
+            self.reinit_pending.store(true, Ordering::Release);
         }
 
         au::noErr
@@ -3242,6 +3281,7 @@ mod tests {
         history: [[f32; 16]; 2],
         position: usize,
         calls: usize,
+        inits: usize,
     }
 
     impl<const OWNED: bool> Default for DelayedBypass<OWNED> {
@@ -3254,6 +3294,7 @@ mod tests {
                 history: [[0.0; 16]; 2],
                 position: 0,
                 calls: 0,
+                inits: 0,
             }
         }
     }
@@ -3280,6 +3321,7 @@ mod tests {
             _: &BufferConfig,
             context: &mut impl InitContext<Self>,
         ) -> bool {
+            self.inits += 1;
             context.set_latency_samples(16);
             true
         }
@@ -4093,6 +4135,78 @@ mod tests {
             unsafe { Wrapper::<TestInstrument>::close(wrapper) },
             au::noErr
         );
+    }
+
+    #[test]
+    fn restored_class_info_reinitializes_on_the_next_reset() {
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let inits = || unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.inits;
+        let class_info = || {
+            let mut dict_ptr: *mut c_void = ptr::null_mut();
+            let mut size = std::mem::size_of::<*mut c_void>() as u32;
+            assert_eq!(
+                unsafe {
+                    TestWrapper::get_property(
+                        wrapper,
+                        au::kAudioUnitProperty_ClassInfo,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &mut dict_ptr as *mut *mut c_void as *mut c_void,
+                        &mut size,
+                    )
+                },
+                au::noErr
+            );
+            unsafe { CFDictionary::<CFString, CFType>::wrap_under_create_rule(dict_ptr as _) }
+        };
+        let restore = |dict: &CFDictionary<CFString, CFType>| {
+            let ptr = dict.as_concrete_TypeRef() as *const c_void;
+            assert_eq!(
+                unsafe {
+                    TestWrapper::set_property(
+                        wrapper,
+                        au::kAudioUnitProperty_ClassInfo,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &ptr as *const *const c_void as *const c_void,
+                        std::mem::size_of::<*const c_void>() as u32,
+                    )
+                },
+                au::noErr
+            );
+        };
+        let reset = || unsafe { TestWrapper::reset(wrapper, au::kAudioUnitScope_Global, 0) };
+        let saved = class_info();
+
+        // Before Initialize the restored state is read by the first initialization anyway.
+        restore(&saved);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 0);
+
+        // Logic's order: Initialize, then the saved ClassInfo.
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(inits(), 1);
+        restore(&saved);
+        assert_eq!(inits(), 1, "ClassInfo is not serialised against render");
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(
+            inits(),
+            2,
+            "the next Reset re-initializes with the restored state"
+        );
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 2, "a plain Reset does not");
+
+        // A fresh Initialize consumes a pending restore.
+        restore(&saved);
+        assert_eq!(unsafe { TestWrapper::uninitialize(wrapper) }, au::noErr);
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(inits(), 3);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 3);
+
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
     }
 
     #[test]
