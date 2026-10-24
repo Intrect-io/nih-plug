@@ -113,7 +113,7 @@ clap = { version = "4.1.8", features = ["derive", "wrap_help"], optional = true 
 cpal = { version = "0.15", optional = true }
 jack = { version = "0.11.4", optional = true }
 midir = { version = "0.9.1", optional = true }
-rtrb = { version = "0.2.2", optional = true }
+rtrb = { version = "0.3.5", optional = true }
 
 # Used for the `vst3` feature
 vst3-sys = { git = "https://github.com/robbert-vdh/vst3-sys.git", branch = "fix/drop-box-from-raw", optional = true }
