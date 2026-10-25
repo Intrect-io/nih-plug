@@ -1564,9 +1564,18 @@ impl<P: AuPlugin> Wrapper<P> {
         in_data: *const c_void,
         in_data_size: au::UInt32,
     ) -> au::OSStatus {
-        let this = unsafe { Self::from_ptr(self_ptr) };
-        let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
-        // The main-run-loop notifier delivers this after the setter returns.
+        let (status, notifications) = {
+            let this = unsafe { Self::from_ptr(self_ptr) };
+            let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
+            (status, Arc::clone(&this.property_notifications))
+        };
+        // A host that sets a property on the main thread expects its listeners to have run by
+        // the time the call returns: auval (and Logic's validation, which runs it) fails with
+        // "Changing max frames property did not fire off a property changed notification"
+        // when delivery waits for the next timer tick. `drain` only calls out on the main
+        // thread; from any other thread the timer still delivers. The wrapper borrow ended
+        // above, so a listener that disposes the AU leaves nothing here pointing into it.
+        notifications.drain();
         status
     }
 
