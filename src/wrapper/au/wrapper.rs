@@ -41,9 +41,8 @@ use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroU32;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use au_sys as au;
 use core_foundation::array::CFArray;
@@ -192,18 +191,9 @@ pub struct Wrapper<P: AuPlugin> {
     /// Whether `Plugin::initialize()` has run successfully since the last
     /// `Uninitialize` / first construction. Render is a no-op when false.
     initialized: AtomicBool,
-
-    /// Set when a restored `ClassInfo` could not re-initialize the plug-in right away (a render
-    /// held it for too long); the next `Reset` does it instead. Hosts such as Logic Pro
-    /// initialize first and restore the saved state afterwards, so a plug-in that reads its
-    /// state in `initialize()` (latency, model choice) would otherwise keep running on the
-    /// defaults. VST3/CLAP re-initialize inside their state setters too.
+    /// A `ClassInfo` restore arrived while initialized and could not re-initialize right away
+    /// (`processing_gate` held by this thread); the next `Reset` re-initializes.
     reinit_pending: AtomicBool,
-
-    /// Excludes render from the re-initialization in `set_class_info`, which, unlike
-    /// `Initialize` and `Reset`, the host does not serialise against render. One of the
-    /// `GATE_*` states; a render that finds the gate taken outputs silence.
-    plugin_gate: AtomicU8,
 
     /// Host-controlled bypass (`kAudioUnitProperty_BypassEffect`). When set,
     /// a declared BYPASS parameter delegates processing to the plugin, which
@@ -234,12 +224,11 @@ pub struct Wrapper<P: AuPlugin> {
     ///
     /// Wrapped in `UnsafeCell` because `Plugin::initialize` / `process` /
     /// `reset` / `deactivate` take `&mut self`, but we only ever expose `&Self`
-    /// from `from_ptr`. AU's threading model guarantees these methods are not
-    /// concurrent with each other (Initialize/Uninitialize/Reset run on main,
-    /// process runs on audio thread, and the host serialises lifecycle vs.
-    /// render via `Initialize`/`Uninitialize` boundaries — render can only
-    /// happen between them).
+    /// from `from_ptr`. processing_gate excludes lifecycle mutation and
+    /// reentrant render before any mutable reference is constructed.
     plugin: UnsafeCell<Box<P>>,
+    /// Lifecycle and audio must own the same gate before borrowing mutable state.
+    processing_gate: crate::wrapper::util::processing_gate::ProcessingGate,
 
     /// Parameter handles in declaration order. The AU parameter ID is the
     /// index into this vec. Built once in `new()`, then read-only.
@@ -295,8 +284,7 @@ pub struct Wrapper<P: AuPlugin> {
     /// and the persistent `Buffer<'static>` whose channel slot vector is
     /// pre-sized in `Initialize`.
     ///
-    /// `UnsafeCell` because only `render()` touches it after `Initialize`,
-    /// and AU does not re-enter render.
+    /// `UnsafeCell` accesses require processing_gate, including lifecycle calls.
     render_state: UnsafeCell<RenderState<P>>,
 
     /// The plugin's `Editor` instance, if the plugin provides one.
@@ -461,23 +449,14 @@ struct ParamEntry {
 /// `{ presetNumber: -1, presetName: CFSTR("Untitled") }`.
 const DEFAULT_PRESET_NAME: &str = "Untitled";
 
-/// `Wrapper::plugin_gate` states.
-const GATE_IDLE: u8 = 0;
-const GATE_RENDERING: u8 = 1;
-const GATE_REINIT: u8 = 2;
-
-/// How long a restored `ClassInfo` waits for an in-flight render before leaving the
-/// re-initialization to the next `Reset`.
-const RESTORE_GATE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// `Send` + `Sync` justification:
 ///
 /// - All publicly mutable fields are atomic or behind a `Mutex`.
 /// - `plugin` and `input_scratch` are `UnsafeCell`-wrapped, accessed only
 ///   through `&mut` borrows constructed during a single audio-thread render
 ///   call (`input_scratch`) or during main-thread lifecycle calls that AU
-///   serialises against render (`plugin`). The host contract forbids
-///   `Initialize` / `Uninitialize` / `Reset` concurrent with `Render`.
+///   excludes with processing_gate (`plugin`). Lifecycle callbacks and render
+///   must acquire the gate before constructing these mutable references.
 /// - `ParamPtr` in `params_by_id` is built once and read-only thereafter;
 ///   per nih-plug contract, `set_normalized_value` and the value getters
 ///   are themselves thread-safe.
@@ -561,10 +540,10 @@ impl<P: AuPlugin> Wrapper<P> {
             last_render_error: AtomicI32::new(au::noErr),
             initialized: AtomicBool::new(false),
             reinit_pending: AtomicBool::new(false),
-            plugin_gate: AtomicU8::new(GATE_IDLE),
             bypass: AtomicBool::new(false),
             offline_render: AtomicBool::new(false),
             bypass_param_idx,
+            processing_gate: crate::wrapper::util::processing_gate::ProcessingGate::new(),
             plugin: UnsafeCell::new(plugin),
             params_by_id,
             host_callbacks: Mutex::new(None),
@@ -710,6 +689,11 @@ impl<P: AuPlugin> Wrapper<P> {
     unsafe extern "C" fn close(self_ptr: *mut c_void) -> au::OSStatus {
         // Drop editor handle before the wrapper is destroyed.
         let this = unsafe { Self::from_ptr(self_ptr) };
+        // Close is a non-audio lifecycle call; wait for an in-flight render.
+        let Some(processing_guard) = this.processing_gate.lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
+        // Only once Close is known to proceed: a rejected Close keeps notifications running.
         this.property_notifications.stop();
         if this.initialized.swap(false, Ordering::AcqRel) {
             // Hosts are allowed to dispose an initialized AudioUnit without a
@@ -720,6 +704,8 @@ impl<P: AuPlugin> Wrapper<P> {
         let instance = this.instance.swap(0, Ordering::AcqRel) as usize as *mut c_void;
         cocoaui::close_audio_unit_view(instance);
         this.editor_handle.clear();
+        // Release the guard before freeing its mutex. Hosts must not start new calls after Close.
+        drop(processing_guard);
         unsafe {
             let _ = Box::from_raw(self_ptr as *mut Self);
         }
@@ -803,7 +789,10 @@ impl<P: AuPlugin> Wrapper<P> {
     /// from those and forward to `Plugin::initialize`.
     unsafe extern "C" fn initialize(self_ptr: *mut c_void) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
-        // SAFETY: AU forbids Initialize concurrent with Render.
+        let Some(_processing_guard) = this.processing_gate.lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
+        // SAFETY: processing_gate is held.
         unsafe { this.initialize_plugin() }
     }
 
@@ -811,7 +800,7 @@ impl<P: AuPlugin> Wrapper<P> {
     /// state leaves the unit uninitialized (render outputs silence) until the host initializes
     /// it again, as after a failed `Initialize`.
     ///
-    /// SAFETY: same as `initialize_plugin`, or with `plugin_gate` held.
+    /// SAFETY: the caller holds `processing_gate`.
     unsafe fn reinitialize_after_restore(&self) -> au::OSStatus {
         let status = unsafe { self.initialize_plugin() };
         if status != au::noErr && self.initialized.swap(false, Ordering::AcqRel) {
@@ -823,8 +812,7 @@ impl<P: AuPlugin> Wrapper<P> {
 
     /// The body of `Initialize`, shared with the re-initialization after a state restore.
     ///
-    /// SAFETY: the caller must be on a path the host serialises against render
-    /// (`Initialize` or `Reset`).
+    /// SAFETY: the caller holds `processing_gate`.
     unsafe fn initialize_plugin(&self) -> au::OSStatus {
         let this = self;
         this.reinit_pending.store(false, Ordering::Release);
@@ -848,7 +836,7 @@ impl<P: AuPlugin> Wrapper<P> {
             sink: this.sink.clone(),
             _marker: PhantomData,
         };
-        // SAFETY: guaranteed by the caller.
+        // SAFETY: processing_gate excludes Render and other lifecycle callbacks.
         let plugin = unsafe { this.plugin_mut() };
         let ok = plugin.initialize(&selected_layout, &buffer_config, &mut ctx);
         if !ok {
@@ -891,12 +879,15 @@ impl<P: AuPlugin> Wrapper<P> {
 
     unsafe extern "C" fn uninitialize(self_ptr: *mut c_void) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        let Some(_processing_guard) = this.processing_gate.lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
         if this
             .initialized
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // SAFETY: AU forbids Uninitialize concurrent with Render.
+            // SAFETY: processing_gate excludes Render and other lifecycle callbacks.
             unsafe { this.plugin_mut() }.deactivate();
         }
         this.midi_input.clear();
@@ -910,15 +901,18 @@ impl<P: AuPlugin> Wrapper<P> {
         _element: au::AudioUnitElement,
     ) -> au::OSStatus {
         let this = unsafe { Self::from_ptr(self_ptr) };
+        let Some(_processing_guard) = this.processing_gate.try_lock() else {
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
         if this.initialized.load(Ordering::Acquire)
             && this.reinit_pending.swap(false, Ordering::AcqRel)
         {
             // State restored since the last initialization: run it again so the plug-in sees
             // the restored values (this also resets it).
-            // SAFETY: AU calls Reset on the main thread, serialised against render.
+            // SAFETY: processing_gate is held.
             return unsafe { this.reinitialize_after_restore() };
         }
-        // SAFETY: AU calls Reset on the main thread, serialised against render.
+        // SAFETY: processing_gate excludes concurrent mutation.
         unsafe { this.plugin_mut() }.reset();
         this.midi_input.clear();
         unsafe { this.render_state_mut() }.midi.clear();
@@ -1100,29 +1094,14 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         if self.initialized.load(Ordering::Acquire) {
-            // The plug-in read its state in `initialize()`, before this restore. Re-initialize
-            // now with render shut out; a render already in flight is short, so wait for it.
-            let deadline = Instant::now() + RESTORE_GATE_TIMEOUT;
-            loop {
-                match self.plugin_gate.compare_exchange(
-                    GATE_IDLE,
-                    GATE_REINIT,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        // SAFETY: the gate excludes render; the host serialises the other
-                        // lifecycle calls with property sets on its main thread.
-                        let status = unsafe { self.reinitialize_after_restore() };
-                        self.plugin_gate.store(GATE_IDLE, Ordering::Release);
-                        return status;
-                    }
-                    Err(_) if Instant::now() < deadline => std::thread::yield_now(),
-                    Err(_) => {
-                        self.reinit_pending.store(true, Ordering::Release);
-                        break;
-                    }
-                }
+            // Logic initializes the unit and restores `ClassInfo` afterwards, so the plug-in read
+            // its state in `initialize()` before this restore and would keep running on the old
+            // non-automatable choices. Re-initialize now; a render in flight finishes first.
+            match self.processing_gate.lock() {
+                // SAFETY: processing_gate is held.
+                Some(_guard) => return unsafe { self.reinitialize_after_restore() },
+                // Re-entered from a callback on this thread: defer to the next Reset.
+                None => self.reinit_pending.store(true, Ordering::Release),
             }
         }
 
@@ -1564,18 +1543,18 @@ impl<P: AuPlugin> Wrapper<P> {
         in_data: *const c_void,
         in_data_size: au::UInt32,
     ) -> au::OSStatus {
-        let (status, notifications) = {
-            let this = unsafe { Self::from_ptr(self_ptr) };
-            let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
-            (status, Arc::clone(&this.property_notifications))
-        };
-        // A host that sets a property on the main thread expects its listeners to have run by
-        // the time the call returns: auval (and Logic's validation, which runs it) fails with
-        // "Changing max frames property did not fire off a property changed notification"
-        // when delivery waits for the next timer tick. `drain` only calls out on the main
-        // thread; from any other thread the timer still delivers. The wrapper borrow ended
-        // above, so a listener that disposes the AU leaves nothing here pointing into it.
-        notifications.drain();
+        let this = unsafe { Self::from_ptr(self_ptr) };
+        // Own the notification state before the change: a listener may dispose the AU, so the
+        // drain below must not touch `this` (the Wrapper) once host code has run.
+        let notifications = Arc::clone(&this.property_notifications);
+        let status = Self::set_property_impl(this, id, scope, element, in_data, in_data_size);
+        // AUBase::SetProperty notifies its listeners before returning, and hosts and validators
+        // (auval: "Changing max frames property did not fire off a property changed
+        // notification") check right after the call without running the main loop, so the
+        // timer alone is too late here. Apple's validator makes this call off the main thread, so
+        // deliver on the calling thread (a control thread, never render). A delivery already in
+        // progress makes this a no-op; whatever it skips stays pending for the timer.
+        notifications.drain_from_control_call();
         status
     }
 
@@ -2163,45 +2142,6 @@ impl<P: AuPlugin> Wrapper<P> {
 
     unsafe fn render_audio(
         self_ptr: *mut c_void,
-        io_action_flags: *mut au::AudioUnitRenderActionFlags,
-        in_time_stamp: *const au::AudioTimeStamp,
-        in_output_bus_number: au::UInt32,
-        in_number_frames: au::UInt32,
-        io_data: *mut au::AudioBufferList,
-    ) -> au::OSStatus {
-        let this = unsafe { Self::from_ptr(self_ptr) };
-        if this
-            .plugin_gate
-            .compare_exchange(
-                GATE_IDLE,
-                GATE_RENDERING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            // A restored state is re-initializing the plug-in
-            if !io_data.is_null() {
-                unsafe { zero_buffer_list(io_data, in_number_frames) };
-            }
-            return au::noErr;
-        }
-        let status = unsafe {
-            Self::render_audio_gated(
-                self_ptr,
-                io_action_flags,
-                in_time_stamp,
-                in_output_bus_number,
-                in_number_frames,
-                io_data,
-            )
-        };
-        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
-        status
-    }
-
-    unsafe fn render_audio_gated(
-        self_ptr: *mut c_void,
         _io_action_flags: *mut au::AudioUnitRenderActionFlags,
         in_time_stamp: *const au::AudioTimeStamp,
         _in_output_bus_number: au::UInt32,
@@ -2214,6 +2154,12 @@ impl<P: AuPlugin> Wrapper<P> {
             this.set_last_render_error(au::kAudioUnitErr_InvalidParameter);
             return au::kAudioUnitErr_InvalidParameter;
         }
+
+        let Some(_processing_guard) = this.processing_gate.try_lock() else {
+            unsafe { zero_buffer_list(io_data, in_number_frames) };
+            this.set_last_render_error(au::kAudioUnitErr_CannotDoInCurrentContext);
+            return au::kAudioUnitErr_CannotDoInCurrentContext;
+        };
 
         if !this.is_initialized() {
             unsafe { zero_buffer_list(io_data, in_number_frames) };
@@ -2261,8 +2207,8 @@ impl<P: AuPlugin> Wrapper<P> {
             })
             .flatten();
 
-        // SAFETY: render is not re-entered; we are the sole owner of
-        // RenderState for the duration of this call.
+        // SAFETY: processing_gate excludes reentrant render and lifecycle mutation
+        // for the duration of this call.
         let rs = unsafe { this.render_state_mut() };
 
         // ── 1) Pull main input from whichever wiring the host installed. ──
@@ -3449,6 +3395,169 @@ mod tests {
     }
 
     #[test]
+    fn restored_class_info_reinitializes_the_plugin() {
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let inits = || unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.inits;
+        let class_info = || {
+            let mut dict_ptr: *mut c_void = ptr::null_mut();
+            let mut size = std::mem::size_of::<*mut c_void>() as u32;
+            assert_eq!(
+                unsafe {
+                    TestWrapper::get_property(
+                        wrapper,
+                        au::kAudioUnitProperty_ClassInfo,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &mut dict_ptr as *mut *mut c_void as *mut c_void,
+                        &mut size,
+                    )
+                },
+                au::noErr
+            );
+            unsafe { CFDictionary::<CFString, CFType>::wrap_under_create_rule(dict_ptr as _) }
+        };
+        let restore = |dict: &CFDictionary<CFString, CFType>| {
+            let ptr = dict.as_concrete_TypeRef() as *const c_void;
+            assert_eq!(
+                unsafe {
+                    TestWrapper::set_property(
+                        wrapper,
+                        au::kAudioUnitProperty_ClassInfo,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &ptr as *const *const c_void as *const c_void,
+                        std::mem::size_of::<*const c_void>() as u32,
+                    )
+                },
+                au::noErr
+            );
+        };
+        let reset = || unsafe { TestWrapper::reset(wrapper, au::kAudioUnitScope_Global, 0) };
+        let saved = class_info();
+
+        // Before Initialize the restored state is read by the first initialization anyway.
+        restore(&saved);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 0);
+
+        // Logic's order: Initialize, then the saved ClassInfo.
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(inits(), 1);
+        restore(&saved);
+        assert_eq!(inits(), 2, "a restore re-initializes with the restored state");
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 2, "a plain Reset does not");
+
+        // A restore re-entered while this thread holds the processing gate defers the
+        // re-initialization to the next Reset instead of waiting on itself.
+        let this = unsafe { TestWrapper::from_ptr(wrapper) };
+        let held = this.processing_gate.lock();
+        assert!(held.is_some());
+        restore(&saved);
+        assert_eq!(inits(), 2);
+        drop(held);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 3);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 3);
+
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
+    }
+
+    #[test]
+    fn set_property_notifies_its_listener_before_returning() {
+        // Apple's AU validation sets MaximumFramesPerSlice off the main thread and checks its
+        // listener right after the call; a timer-only delivery fails it (AUD-716).
+        type W = Wrapper<DelayedBypass<true>>;
+        static FIRED: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn listener(
+            _: *mut c_void,
+            _: au::AudioUnit,
+            id: au::AudioUnitPropertyID,
+            _: au::AudioUnitScope,
+            _: au::AudioUnitElement,
+        ) {
+            if id == au::kAudioUnitProperty_MaximumFramesPerSlice {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let pointer = W::new() as *mut c_void;
+        // Any non-null handle: delivery only forwards it to the listener.
+        let instance = 0x10 as au::AudioUnit;
+        assert_eq!(unsafe { W::open(pointer, instance) }, au::noErr);
+        assert_eq!(
+            unsafe {
+                W::add_property_listener(
+                    pointer,
+                    au::kAudioUnitProperty_MaximumFramesPerSlice,
+                    listener,
+                    ptr::null_mut(),
+                )
+            },
+            au::noErr
+        );
+        let frames: au::UInt32 = 777;
+        assert_eq!(
+            unsafe {
+                W::set_property(
+                    pointer,
+                    au::kAudioUnitProperty_MaximumFramesPerSlice,
+                    au::kAudioUnitScope_Global,
+                    0,
+                    &frames as *const au::UInt32 as *const c_void,
+                    mem::size_of::<au::UInt32>() as au::UInt32,
+                )
+            },
+            au::noErr
+        );
+        assert_eq!(FIRED.load(Ordering::SeqCst), 1);
+        assert_eq!(unsafe { W::close(pointer) }, au::noErr);
+    }
+
+    #[test]
+    fn lifecycle_contention_rejects_mutation_and_silences_render() {
+        type W = Wrapper<DelayedBypass<true>>;
+        let pointer = W::new() as *mut c_void;
+        let this = unsafe { W::from_ptr(pointer) };
+        let guard = this.processing_gate.lock();
+        assert_eq!(
+            unsafe { W::initialize(pointer) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        assert_eq!(
+            unsafe { W::uninitialize(pointer) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        assert_eq!(
+            unsafe { W::reset(pointer, 0, 0) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        let mut samples = [1.0f32; 8];
+        let mut list = au::AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [au::AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: 32,
+                mData: samples.as_mut_ptr().cast(),
+            }],
+        };
+        let mut flags = 0;
+        // render() rejects a null timestamp before anything else (the SDK declares it nonnull),
+        // so pass a valid one to reach the lifecycle-contention path this test is about.
+        let time: au::AudioTimeStamp = unsafe { mem::zeroed() };
+        assert_eq!(
+            unsafe { W::render(pointer, &mut flags, &time, 0, 8, &mut list) },
+            au::kAudioUnitErr_CannotDoInCurrentContext
+        );
+        assert_eq!(samples, [0.0; 8]);
+        assert!(!this.is_initialized());
+        drop(guard);
+        assert_eq!(unsafe { W::initialize(pointer) }, au::noErr);
+        assert_eq!(unsafe { W::close(pointer) }, au::noErr);
+    }
+
+    #[test]
     fn scheduled_immediate_parameters_apply_and_unsupported_batches_fail_atomically() {
         use parameter_events::{Event, Immediate, Values, IMMEDIATE, SCHEDULE_PARAMETERS_SELECT};
         type TestWrapper = Wrapper<DelayedBypass<true>>;
@@ -4228,119 +4337,6 @@ mod tests {
             unsafe { Wrapper::<TestInstrument>::close(wrapper) },
             au::noErr
         );
-    }
-
-    #[test]
-    fn restored_class_info_reinitializes_the_plugin() {
-        type TestWrapper = Wrapper<DelayedBypass<true>>;
-        let wrapper = TestWrapper::new() as *mut c_void;
-        let inits = || unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.inits;
-        let class_info = || {
-            let mut dict_ptr: *mut c_void = ptr::null_mut();
-            let mut size = std::mem::size_of::<*mut c_void>() as u32;
-            assert_eq!(
-                unsafe {
-                    TestWrapper::get_property(
-                        wrapper,
-                        au::kAudioUnitProperty_ClassInfo,
-                        au::kAudioUnitScope_Global,
-                        0,
-                        &mut dict_ptr as *mut *mut c_void as *mut c_void,
-                        &mut size,
-                    )
-                },
-                au::noErr
-            );
-            unsafe { CFDictionary::<CFString, CFType>::wrap_under_create_rule(dict_ptr as _) }
-        };
-        let restore = |dict: &CFDictionary<CFString, CFType>| {
-            let ptr = dict.as_concrete_TypeRef() as *const c_void;
-            assert_eq!(
-                unsafe {
-                    TestWrapper::set_property(
-                        wrapper,
-                        au::kAudioUnitProperty_ClassInfo,
-                        au::kAudioUnitScope_Global,
-                        0,
-                        &ptr as *const *const c_void as *const c_void,
-                        std::mem::size_of::<*const c_void>() as u32,
-                    )
-                },
-                au::noErr
-            );
-        };
-        let reset = || unsafe { TestWrapper::reset(wrapper, au::kAudioUnitScope_Global, 0) };
-        let saved = class_info();
-
-        // Before Initialize the restored state is read by the first initialization anyway.
-        restore(&saved);
-        assert_eq!(reset(), au::noErr);
-        assert_eq!(inits(), 0);
-
-        // Logic's order: Initialize, then the saved ClassInfo.
-        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
-        assert_eq!(inits(), 1);
-        restore(&saved);
-        assert_eq!(
-            inits(),
-            2,
-            "a restore re-initializes with the restored state"
-        );
-        assert_eq!(reset(), au::noErr);
-        assert_eq!(inits(), 2, "a plain Reset does not");
-
-        // A render holding the plug-in defers the re-initialization to the next Reset.
-        let this = unsafe { TestWrapper::from_ptr(wrapper) };
-        this.plugin_gate.store(GATE_RENDERING, Ordering::Release);
-        restore(&saved);
-        assert_eq!(inits(), 2);
-        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
-        assert_eq!(reset(), au::noErr);
-        assert_eq!(inits(), 3);
-        assert_eq!(reset(), au::noErr);
-        assert_eq!(inits(), 3);
-
-        // A render that finds the plug-in re-initializing outputs silence without touching it.
-        let mut channels = [[0.5f32; 8]; 2];
-        let mut storage = vec![0u64; bl_byte_size(2).div_ceil(mem::size_of::<u64>())];
-        let list = storage.as_mut_ptr() as *mut au::AudioBufferList;
-        unsafe {
-            (*list).mNumberBuffers = 2;
-            for (i, samples) in channels.iter_mut().enumerate() {
-                *(*list).mBuffers.as_mut_ptr().add(i) = au::AudioBuffer {
-                    mNumberChannels: 1,
-                    mDataByteSize: (samples.len() * mem::size_of::<f32>()) as u32,
-                    mData: samples.as_mut_ptr() as *mut c_void,
-                };
-            }
-        }
-        let calls = unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.calls;
-        this.plugin_gate.store(GATE_REINIT, Ordering::Release);
-        let time = au::AudioTimeStamp {
-            mSampleTime: 0.0,
-            mFlags: au::kAudioTimeStampSampleTimeValid,
-            ..unsafe { mem::zeroed() }
-        };
-        let status = unsafe { TestWrapper::render(wrapper, ptr::null_mut(), &time, 0, 8, list) };
-        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
-        assert_eq!(status, au::noErr);
-        assert!(channels.iter().flatten().all(|&x| x == 0.0));
-        assert_eq!(
-            unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.calls,
-            calls
-        );
-
-        // A fresh Initialize consumes a pending restore.
-        this.plugin_gate.store(GATE_RENDERING, Ordering::Release);
-        restore(&saved);
-        this.plugin_gate.store(GATE_IDLE, Ordering::Release);
-        assert_eq!(unsafe { TestWrapper::uninitialize(wrapper) }, au::noErr);
-        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
-        assert_eq!(inits(), 4);
-        assert_eq!(reset(), au::noErr);
-        assert_eq!(inits(), 4);
-
-        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
     }
 
     #[test]
