@@ -191,6 +191,9 @@ pub struct Wrapper<P: AuPlugin> {
     /// Whether `Plugin::initialize()` has run successfully since the last
     /// `Uninitialize` / first construction. Render is a no-op when false.
     initialized: AtomicBool,
+    /// A `ClassInfo` restore arrived while initialized and could not re-initialize right away
+    /// (`processing_gate` held by this thread); the next `Reset` re-initializes.
+    reinit_pending: AtomicBool,
 
     /// Host-controlled bypass (`kAudioUnitProperty_BypassEffect`). When set,
     /// a declared BYPASS parameter delegates processing to the plugin, which
@@ -536,6 +539,7 @@ impl<P: AuPlugin> Wrapper<P> {
             tail_seconds_bits: AtomicU64::new(pack_f64(0.0)),
             last_render_error: AtomicI32::new(au::noErr),
             initialized: AtomicBool::new(false),
+            reinit_pending: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
             offline_render: AtomicBool::new(false),
             bypass_param_idx,
@@ -788,6 +792,30 @@ impl<P: AuPlugin> Wrapper<P> {
         let Some(_processing_guard) = this.processing_gate.lock() else {
             return au::kAudioUnitErr_CannotDoInCurrentContext;
         };
+        // SAFETY: processing_gate is held.
+        unsafe { this.initialize_plugin() }
+    }
+
+    /// Re-run the initialization after a state restore. A plug-in that refuses its restored
+    /// state leaves the unit uninitialized (render outputs silence) until the host initializes
+    /// it again, as after a failed `Initialize`.
+    ///
+    /// SAFETY: the caller holds `processing_gate`.
+    unsafe fn reinitialize_after_restore(&self) -> au::OSStatus {
+        let status = unsafe { self.initialize_plugin() };
+        if status != au::noErr && self.initialized.swap(false, Ordering::AcqRel) {
+            unsafe { self.plugin_mut() }.deactivate();
+        }
+        self.midi_input.clear();
+        status
+    }
+
+    /// The body of `Initialize`, shared with the re-initialization after a state restore.
+    ///
+    /// SAFETY: the caller holds `processing_gate`.
+    unsafe fn initialize_plugin(&self) -> au::OSStatus {
+        let this = self;
+        this.reinit_pending.store(false, Ordering::Release);
 
         let n_ch = this.n_channels().max(1);
         let chans = NonZeroU32::new(n_ch).expect("n_ch is clamped to at least one");
@@ -876,6 +904,14 @@ impl<P: AuPlugin> Wrapper<P> {
         let Some(_processing_guard) = this.processing_gate.try_lock() else {
             return au::kAudioUnitErr_CannotDoInCurrentContext;
         };
+        if this.initialized.load(Ordering::Acquire)
+            && this.reinit_pending.swap(false, Ordering::AcqRel)
+        {
+            // State restored since the last initialization: run it again so the plug-in sees
+            // the restored values (this also resets it).
+            // SAFETY: processing_gate is held.
+            return unsafe { this.reinitialize_after_restore() };
+        }
         // SAFETY: processing_gate excludes concurrent mutation.
         unsafe { this.plugin_mut() }.reset();
         this.midi_input.clear();
@@ -1054,6 +1090,18 @@ impl<P: AuPlugin> Wrapper<P> {
                 if let Ok(mut guard) = self.preset_name.lock() {
                     *guard = name;
                 }
+            }
+        }
+
+        if self.initialized.load(Ordering::Acquire) {
+            // Logic initializes the unit and restores `ClassInfo` afterwards, so the plug-in read
+            // its state in `initialize()` before this restore and would keep running on the old
+            // non-automatable choices. Re-initialize now; a render in flight finishes first.
+            match self.processing_gate.lock() {
+                // SAFETY: processing_gate is held.
+                Some(_guard) => return unsafe { self.reinitialize_after_restore() },
+                // Re-entered from a callback on this thread: defer to the next Reset.
+                None => self.reinit_pending.store(true, Ordering::Release),
             }
         }
 
@@ -3272,6 +3320,7 @@ mod tests {
         history: [[f32; 16]; 2],
         position: usize,
         calls: usize,
+        inits: usize,
     }
 
     impl<const OWNED: bool> Default for DelayedBypass<OWNED> {
@@ -3284,6 +3333,7 @@ mod tests {
                 history: [[0.0; 16]; 2],
                 position: 0,
                 calls: 0,
+                inits: 0,
             }
         }
     }
@@ -3310,6 +3360,7 @@ mod tests {
             _: &BufferConfig,
             context: &mut impl InitContext<Self>,
         ) -> bool {
+            self.inits += 1;
             context.set_latency_samples(16);
             true
         }
@@ -3341,6 +3392,77 @@ mod tests {
         const AU_TYPE: [u8; 4] = *b"aufx";
         const AU_SUBTYPE: [u8; 4] = *b"TByp";
         const AU_MANUFACTURER: [u8; 4] = *b"Test";
+    }
+
+    #[test]
+    fn restored_class_info_reinitializes_the_plugin() {
+        type TestWrapper = Wrapper<DelayedBypass<true>>;
+        let wrapper = TestWrapper::new() as *mut c_void;
+        let inits = || unsafe { TestWrapper::from_ptr(wrapper).plugin_mut() }.inits;
+        let class_info = || {
+            let mut dict_ptr: *mut c_void = ptr::null_mut();
+            let mut size = std::mem::size_of::<*mut c_void>() as u32;
+            assert_eq!(
+                unsafe {
+                    TestWrapper::get_property(
+                        wrapper,
+                        au::kAudioUnitProperty_ClassInfo,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &mut dict_ptr as *mut *mut c_void as *mut c_void,
+                        &mut size,
+                    )
+                },
+                au::noErr
+            );
+            unsafe { CFDictionary::<CFString, CFType>::wrap_under_create_rule(dict_ptr as _) }
+        };
+        let restore = |dict: &CFDictionary<CFString, CFType>| {
+            let ptr = dict.as_concrete_TypeRef() as *const c_void;
+            assert_eq!(
+                unsafe {
+                    TestWrapper::set_property(
+                        wrapper,
+                        au::kAudioUnitProperty_ClassInfo,
+                        au::kAudioUnitScope_Global,
+                        0,
+                        &ptr as *const *const c_void as *const c_void,
+                        std::mem::size_of::<*const c_void>() as u32,
+                    )
+                },
+                au::noErr
+            );
+        };
+        let reset = || unsafe { TestWrapper::reset(wrapper, au::kAudioUnitScope_Global, 0) };
+        let saved = class_info();
+
+        // Before Initialize the restored state is read by the first initialization anyway.
+        restore(&saved);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 0);
+
+        // Logic's order: Initialize, then the saved ClassInfo.
+        assert_eq!(unsafe { TestWrapper::initialize(wrapper) }, au::noErr);
+        assert_eq!(inits(), 1);
+        restore(&saved);
+        assert_eq!(inits(), 2, "a restore re-initializes with the restored state");
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 2, "a plain Reset does not");
+
+        // A restore re-entered while this thread holds the processing gate defers the
+        // re-initialization to the next Reset instead of waiting on itself.
+        let this = unsafe { TestWrapper::from_ptr(wrapper) };
+        let held = this.processing_gate.lock();
+        assert!(held.is_some());
+        restore(&saved);
+        assert_eq!(inits(), 2);
+        drop(held);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 3);
+        assert_eq!(reset(), au::noErr);
+        assert_eq!(inits(), 3);
+
+        assert_eq!(unsafe { TestWrapper::close(wrapper) }, au::noErr);
     }
 
     #[test]
