@@ -166,14 +166,20 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
         match &*self.inner.component_handler.borrow() {
             Some(handler) => match self.inner.param_ptr_to_hash.get(&param) {
                 Some(hash) => {
-                    // Only update the parameters manually if the host is not processing audio. If
-                    // the plugin is currently processing audio, the host will pass this change back
-                    // to the plugin in the audio callback. This also prevents the values from
-                    // changing in the middle of the process callback, which would be unsound.
-                    // FIXME: So this doesn't work for REAPER, because they just silently stop
-                    //        processing audio when you bypass the plugin. Great. We can add a time
-                    //        based heuristic to work around this in the meantime.
-                    if !self.inner.is_processing.load(Ordering::SeqCst) {
+                    // Only update the parameters directly if the host is not processing audio.
+                    // Otherwise the value must not change in the middle of a process call, so the
+                    // edit is held and applied at the start of the next process call (or when
+                    // processing stops). The held value is also what `getParamNormalized()`
+                    // reports until then: Cubase 15 and Nuendo read the controller value back
+                    // during `endEdit()` and send it to the processor after the edit, so reporting
+                    // the old value would undo the edit. It is held before `performEdit()` because
+                    // a host may read the value back from within that call. This also covers hosts
+                    // that never echo the edit, like REAPER when it bypasses the plugin.
+                    if self.inner.is_processing.load(Ordering::SeqCst) {
+                        self.inner.hold_edit(*hash, normalized);
+                    } else {
+                        // An older held value must not be applied over this edit later
+                        self.inner.clear_held_edit(*hash);
                         self.inner.set_normalized_value_by_hash(
                             *hash,
                             normalized,

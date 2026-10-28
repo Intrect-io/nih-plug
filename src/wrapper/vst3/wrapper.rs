@@ -709,6 +709,11 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn get_param_normalized(&self, id: u32) -> f64 {
+        // An editor edit that has not been applied yet is the controller's current value
+        if let Some(value) = self.inner.held_edit(id).and_then(|held| held.get()) {
+            return value as f64;
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.modulated_normalized_value() as f64,
             _ => 0.5,
@@ -719,6 +724,17 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
         // If the plugin is currently processing audio, then this parameter change will also be sent
         // to the process function
         if self.inner.is_processing.load(Ordering::SeqCst) {
+            // A host may echo the editor's own edit here, possibly from within `performEdit()`.
+            // That must keep the edit held, or `getParamNormalized()` would report the old value
+            // again when the host reads it back during `endEdit()`. Any other value is the host
+            // telling us about a newer value, so the held edit is discarded to make sure it cannot
+            // be applied over the value the host sends to the processor.
+            if let Some(held) = self.inner.held_edit(id) {
+                if held.get() != Some(value as f32) {
+                    held.pending.store(false, Ordering::Release);
+                }
+            }
+
             return kResultOk;
         }
 
@@ -943,6 +959,19 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
         self.inner.last_process_status.store(ProcessStatus::Normal);
         self.inner.is_processing.store(state, Ordering::SeqCst);
 
+        // Editor edits held while processing would otherwise only be applied by the next process
+        // call. This waits for an in-flight process call, like `set_active()` does. The gate is
+        // only unavailable on synchronous reentry, in which case no process call can be running.
+        if !state {
+            let _processing_guard = self.inner.processing_gate.lock();
+            self.inner.apply_held_edits(
+                self.inner
+                    .current_buffer_config
+                    .load()
+                    .map(|c| c.sample_rate),
+            );
+        }
+
         // This function is also used to reset buffers on the plugin, so we should do the same
         // thing. We don't call `reset()` in `setup_processing()` for that same reason.
         if state {
@@ -1033,6 +1062,10 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
             // and now. We'll also need to store the note events in the same vector because MIDI CC
             // messages are sent through parameter changes. This vector gets sorted at the end so we
             // can treat it as a sort of queue.
+            // Editor edits held since the last call are applied first, so the host's own
+            // parameter changes in this call (automation, or the edit sent back) come after them
+            self.inner.apply_held_edits(Some(sample_rate));
+
             let mut process_events = self.inner.process_events.borrow_mut();
             process_events.clear();
 
@@ -2058,6 +2091,10 @@ mod aux_bus_tests {
         assert_eq!(channel_pointers[0].map(|p| p.num_channels), Some(0));
     }
 }
+
+#[cfg(test)]
+#[path = "held_edit_tests.rs"]
+mod held_edit_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {

@@ -138,6 +138,51 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// having to add a setter function to the parameter (or even worse, have it be completely
     /// untyped).
     pub param_ptr_to_hash: HashMap<ParamPtr, u32>,
+
+    /// Editor edits made while the host is processing audio, one slot per parameter in
+    /// [`param_hashes`][Self::param_hashes] order. See [`HeldEdit`].
+    pub held_edits: Vec<HeldEdit>,
+    /// Maps a parameter hash to its index in [`held_edits`][Self::held_edits].
+    pub held_edit_idx_by_hash: HashMap<u32, usize>,
+    /// Set after any slot in [`held_edits`][Self::held_edits] has been marked pending, so the audio
+    /// thread can skip scanning the slots when nothing has been edited.
+    pub any_held_edit: AtomicBool,
+}
+
+/// An edit made in the plugin's editor while the host is processing audio.
+///
+/// Such an edit is not applied to the parameter right away, since that could change a value in the
+/// middle of a process call. Previously the wrapper relied entirely on the host to echo the
+/// `performEdit()` value back through the process call's parameter changes. Until that happened
+/// `IEditController::getParamNormalized()` reported the old value, and Cubase 15 (and Nuendo) read
+/// the controller value back during `endEdit()` and send what they read to the processor after the
+/// edit, undoing it. The edit is now held here instead: the controller reports it, and it is applied
+/// at the start of the next process call (before the host's own parameter changes) or when
+/// processing stops.
+pub struct HeldEdit {
+    /// Whether `value` holds an edit that has not yet been applied. Stored after `value` with
+    /// release semantics.
+    pub pending: AtomicBool,
+    /// The held normalized value, as `f32` bits.
+    pub value: AtomicU32,
+}
+
+impl HeldEdit {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            value: AtomicU32::new(0),
+        }
+    }
+
+    /// The held value, if there is one.
+    pub fn get(&self) -> Option<f32> {
+        if self.pending.load(Ordering::Acquire) {
+            Some(f32::from_bits(self.value.load(Ordering::Acquire)))
+        } else {
+            None
+        }
+    }
 }
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
@@ -248,9 +293,15 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
         }
 
-        let param_hashes = param_id_hashes_ptrs_groups
+        let param_hashes: Vec<u32> = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, _, _)| *hash)
+            .collect();
+        let held_edits = param_hashes.iter().map(|_| HeldEdit::new()).collect();
+        let held_edit_idx_by_hash = param_hashes
+            .iter()
+            .enumerate()
+            .map(|(idx, hash)| (*hash, idx))
             .collect();
         let param_by_hash = param_id_hashes_ptrs_groups
             .iter()
@@ -320,6 +371,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             param_units,
             param_id_to_hash,
             param_ptr_to_hash,
+
+            held_edits,
+            held_edit_idx_by_hash,
+            any_held_edit: AtomicBool::new(false),
         });
 
         // FIXME: Right now this is safe, but if we are going to have a singleton main thread queue
@@ -435,6 +490,62 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .get(&param)
             .and_then(|hash| self.param_id_by_hash.get(hash))
             .map(|s| s.as_str())
+    }
+
+    /// The [`HeldEdit`] slot for a parameter hash, if the hash belongs to one of the plugin's
+    /// parameters.
+    pub fn held_edit(&self, hash: u32) -> Option<&HeldEdit> {
+        self.held_edit_idx_by_hash
+            .get(&hash)
+            .map(|idx| &self.held_edits[*idx])
+    }
+
+    /// Hold an editor edit made while the host is processing audio until the next process call or
+    /// until processing stops. A later edit of the same parameter replaces it.
+    pub fn hold_edit(&self, hash: u32, normalized_value: f32) {
+        if let Some(held) = self.held_edit(hash) {
+            // The value is published before the flags so a reader that sees the flags also sees
+            // this value
+            held.value
+                .store(normalized_value.to_bits(), Ordering::Release);
+            held.pending.store(true, Ordering::Release);
+            self.any_held_edit.store(true, Ordering::Release);
+        }
+    }
+
+    /// Discard a parameter's held edit, if any, so it can no longer override a value that was set
+    /// after it.
+    pub fn clear_held_edit(&self, hash: u32) {
+        if let Some(held) = self.held_edit(hash) {
+            held.pending.store(false, Ordering::Release);
+        }
+    }
+
+    /// Discard every held edit. Used when restoring state.
+    pub fn clear_held_edits(&self) {
+        for held in &self.held_edits {
+            held.pending.store(false, Ordering::Release);
+        }
+    }
+
+    /// Apply every held edit. Called at the start of a process call before the host's parameter
+    /// changes are read, so the host's changes in the same call still take precedence, and when
+    /// processing stops. The caller must own `processing_gate`. Does not allocate or lock.
+    ///
+    /// Between clearing a slot's flag and applying its value `getParamNormalized()` briefly
+    /// reports the old value. An edit made during that window sets the flags again and is applied
+    /// on the next call, so no edit is ever lost.
+    pub fn apply_held_edits(&self, sample_rate: Option<f32>) {
+        if !self.any_held_edit.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        for (held, hash) in self.held_edits.iter().zip(&self.param_hashes) {
+            if held.pending.swap(false, Ordering::AcqRel) {
+                let value = f32::from_bits(held.value.load(Ordering::Acquire));
+                self.set_normalized_value_by_hash(*hash, value, sample_rate);
+            }
+        }
     }
 
     /// Convenience function for setting a value for a parameter as triggered by a VST3 parameter
@@ -603,6 +714,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             success,
             "Plugin returned false when reinitializing after loading state"
         );
+
+        // An editor edit held from before the restore must not override the restored values on the
+        // next process call
+        self.clear_held_edits();
 
         // Reinitialize the plugin after loading state so it can respond to the new parameter values
         let task_posted = self.schedule_gui(Task::ParameterValuesChanged);
