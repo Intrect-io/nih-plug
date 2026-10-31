@@ -193,6 +193,15 @@ impl Transport {
         }
     }
 
+    /// Convert a host's floating-point sample time to a sample position, rounding to the nearest
+    /// sample. Hosts that keep their timeline in `f64` samples (Audio Unit hosts through
+    /// `transportStateProc` and `AudioTimeStamp::mSampleTime`) can report an integer position as
+    /// a value just below it (`11775.999…` for `11776`), and truncating it would report the
+    /// position one sample early. Returns `None` for values that are not a valid `i64`.
+    pub fn samples_from_host_time(sample_time: f64) -> Option<i64> {
+        f64_to_i64(sample_time.round())
+    }
+
     /// The sample rate as an `f64`, but only if the host reported a value that can be divided by or
     /// multiplied with. Hosts have been known to report zero before the plugin is activated.
     #[inline]
@@ -550,5 +559,17 @@ mod tests {
         let mut transport = Transport::new(0.0);
         transport.loop_range_seconds = Some((1.0, 3.0));
         assert_eq!(transport.loop_range_samples(), None);
+    }
+
+    #[test]
+    fn host_sample_times_round_to_the_nearest_sample() {
+        // A float timeline one ulp-ish below an integer is that integer, not the one before
+        assert_eq!(Transport::samples_from_host_time(11_775.999_999_9), Some(11_776));
+        assert_eq!(Transport::samples_from_host_time(11_776.000_000_1), Some(11_776));
+        assert_eq!(Transport::samples_from_host_time(13_823.6), Some(13_824));
+        assert_eq!(Transport::samples_from_host_time(-14.000_000_1), Some(-14));
+        assert_eq!(Transport::samples_from_host_time(0.0), Some(0));
+        assert_eq!(Transport::samples_from_host_time(f64::NAN), None);
+        assert_eq!(Transport::samples_from_host_time(f64::INFINITY), None);
     }
 }
