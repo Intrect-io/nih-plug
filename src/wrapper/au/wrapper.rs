@@ -2453,10 +2453,12 @@ impl<P: AuPlugin> Wrapper<P> {
                     } == au::noErr
                     {
                         transport.playing = playing != 0;
-                        transport.pos_samples = Some(sample_pos as i64);
+                        transport.pos_samples = Transport::samples_from_host_time(sample_pos);
                         if cycling != 0 {
-                            transport.loop_range_samples =
-                                Some((cycle_start as i64, cycle_end as i64));
+                            transport.loop_range_samples = Transport::samples_from_host_time(
+                                cycle_start,
+                            )
+                            .zip(Transport::samples_from_host_time(cycle_end));
                         }
                     }
                 }
@@ -2469,7 +2471,7 @@ impl<P: AuPlugin> Wrapper<P> {
         if transport.pos_samples.is_none() && !in_time_stamp.is_null() {
             let ts = unsafe { &*in_time_stamp };
             if ts.mFlags & au::kAudioTimeStampSampleTimeValid != 0 {
-                transport.pos_samples = Some(ts.mSampleTime as i64);
+                transport.pos_samples = Transport::samples_from_host_time(ts.mSampleTime);
                 // Without transportStateProc we can't know playing state, so
                 // assume the engine is running if a valid timestamp is present.
                 transport.playing = true;
